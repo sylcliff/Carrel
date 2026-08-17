@@ -1,0 +1,66 @@
+name: carrel
+
+services:
+  # PostgreSQL 16 with pgvector extension
+  # Used as the primary store: papers, chunks (with vectors), subscriptions, jobs
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: carrel-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: carrel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-carrel_dev}
+      POSTGRES_DB: carrel
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U carrel -d carrel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinerU is OPTIONAL for M1. It only matters from M3 (PDF→Markdown).
+  # MinerU has no official Docker Hub image; the official approach is:
+  #   1. clone https://github.com/opendatalab/MinerU
+  #   2. docker build -t mineru:latest -f docker/global/Dockerfile .
+  # We mirror that flow in Makefile (`make mineru-build`) rather than via this compose,
+  # to keep the main `docker compose up` fast and GPU-agnostic.
+  #
+  # If you have already built `mineru:latest` locally and want to start the API
+  # service, run:
+  #   make mineru-up
+  # which calls docker compose --profile mineru up -d
+  mineru:
+    image: mineru:latest
+    container_name: carrel-mineru
+    profiles: ["mineru"]           # not started by default
+    restart: unless-stopped
+    ports:
+      - "${MINERU_PORT:-8000}:8000"
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-api
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    # GPU passthrough — uncomment on a machine with NVIDIA GPU
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           device_ids: ["0"]
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  postgres_data:

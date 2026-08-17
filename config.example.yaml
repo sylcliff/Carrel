@@ -1,0 +1,65 @@
+# =============================================================================
+# Carrel — single-file user configuration
+# Copy to data/config.yaml and edit. All paths are read from this file.
+# Anything sensitive (API keys) lives in .env, not here.
+# =============================================================================
+
+storage:
+  root: ./data                         # paper PDFs / markdown / images live here (NAS-ready)
+  papers_subdir: papers                # data/papers/<work_id>/...
+  attachments_subdir: attachments      # data/attachments/...
+
+http:
+  host: 127.0.0.1
+  port: 8787
+
+cors:
+  origins:
+    - http://127.0.0.1:5173
+    - http://localhost:5173
+
+openalex:
+  mailto: you@example.com             # polite-pool email; recommended
+  api_key: null                       # optional, raises rate limit
+  request_timeout_seconds: 30
+  max_retries: 3
+
+arxiv:
+  request_timeout_seconds: 30
+  max_retries: 3
+  max_results_per_query: 200
+  delay_between_requests_seconds: 3.0  # arXiv asks for >=3s between calls
+
+llm:
+  summarize_provider: deepseek        # litellm provider id
+  summarize_model: deepseek/deepseek-chat
+  fallback_provider: volcengine
+  fallback_model: volcengine/doubao-pro-32k
+  temperature: 0.2
+  request_timeout_seconds: 60
+
+embeddings:
+  provider: volcengine
+  model: volcengine/doubao-embedding-large-text-240915
+  dim: 2048                           # MUST match the chosen embedding model's output
+
+mineru:
+  base_url: http://127.0.0.1:8000
+  request_timeout_seconds: 600        # PDF parsing can take minutes
+
+chunking:
+  target_tokens: 900
+  overlap_tokens: 150
+  min_tokens: 200
+
+schedule:
+  enabled: false                       # flip to true in M6
+  sync_cron: "0 8 * * *"              # 08:00 every day (local time)
+
+# ----- Subscriptions (M2) -----
+# Each entry is one of:
+#   - { kind: keyword, value: "retrieval augmented generation", label: "RAG" }
+#   - { kind: author,  value: "A5013214678", label: "Yann LeCun" }   # OpenAlex Author ID
+#   - { kind: venue,   value: "S123...",   label: "Nature" }         # OpenAlex Source ID
+#   - { kind: arxiv_category, value: "cs.CL", label: "Computation & Language" }
+subscriptions: []
