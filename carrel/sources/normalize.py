@@ -84,11 +84,18 @@ def from_arxiv(entry: ArxivEntry) -> PaperRecord:
 
 def from_openalex(work: dict[str, Any]) -> PaperRecord:
     wid = oa.work_id(work)
-    arxiv_id = oa.work_arxiv_id(work)
+    raw_arxiv = oa.work_arxiv_id(work)
+    arxiv_id = _strip_arxiv_version(raw_arxiv) if raw_arxiv else None
     pdf_url, oa_status = oa.work_pdf_url(work)
+    if wid:
+        rec_id, id_kind = wid, "openalex"
+    elif arxiv_id:
+        rec_id, id_kind = f"arxiv:{arxiv_id}", "arxiv"
+    else:
+        rec_id, id_kind = "", "openalex"
     return PaperRecord(
-        id=wid or (f"arxiv:{arxiv_id}" if arxiv_id else ""),
-        id_kind="openalex" if wid else ("arxiv" if arxiv_id else "openalex"),
+        id=rec_id,
+        id_kind=id_kind,
         title=oa.work_title(work),
         abstract=oa.work_abstract(work),
         publication_date=oa.work_publication_date(work),
@@ -123,9 +130,10 @@ def enrich_with_openalex(rec: PaperRecord) -> PaperRecord:
     wid = oa.work_id(work)
     arxiv_id = _strip_arxiv_version(oa.work_arxiv_id(work) or rec.arxiv_id)
     pdf_url, oa_status = oa.work_pdf_url(work)
-    if not pdf_url:
+    # If OpenAlex has no direct PDF (closed or HTML-only) but arXiv does,
+    # keep the arXiv PDF and mark the record oa — we have something to parse.
+    if not pdf_url and rec.pdf_url:
         pdf_url = rec.pdf_url
-    if oa_status == "none" and rec.oa_status == "oa":
         oa_status = "oa"
 
     return PaperRecord(

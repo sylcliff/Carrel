@@ -30,6 +30,11 @@ arxiv:
   max_results_per_query: 200
   delay_between_requests_seconds: 3.0  # arXiv asks for >=3s between calls
 
+download:
+  request_timeout_seconds: 60
+  max_bytes: 83886080                  # 80 MiB; larger PDFs are skipped
+  user_agent: "Carrel/0.1 (+https://github.com/)"
+
 llm:
   summarize_provider: deepseek        # litellm provider id
   summarize_model: deepseek/deepseek-chat
@@ -45,7 +50,12 @@ embeddings:
 
 mineru:
   base_url: http://127.0.0.1:8000
-  request_timeout_seconds: 600        # PDF parsing can take minutes
+  request_timeout_seconds: 900        # CPU parsing can take minutes per paper
+  backend: pipeline                   # pipeline | vlm-engine | hybrid-engine
+  parse_method: auto                  # auto | txt | ocr
+  lang_list: [en]                     # add "ch" for Chinese papers
+  formula_enable: true
+  table_enable: true
 
 chunking:
   target_tokens: 900

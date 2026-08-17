@@ -5,14 +5,13 @@ JSONB columns are typed as `dict | list | None` and serialized by SQLModel.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from enum import Enum
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Column, Date, DateTime, Index, String, Text
-from sqlmodel import Field, JSON, SQLModel
-
+from sqlmodel import JSON, Field, SQLModel
 
 # Make the Vector column a no-op on non-PostgreSQL dialects (so M1 can run
 # against SQLite for smoke testing). On PostgreSQL it is a real vector column.
@@ -98,11 +97,11 @@ class Paper(SQLModel, table=True):
     authors: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
 
     created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
     updated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -133,7 +132,7 @@ class Subscription(SQLModel, table=True):
     label: str | None = None
     enabled: bool = True
     created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )
 
@@ -155,6 +154,6 @@ class Job(SQLModel, table=True):
         default=None, sa_column=Column(DateTime(timezone=True))
     )
     created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )

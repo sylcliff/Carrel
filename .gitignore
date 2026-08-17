@@ -16,11 +16,15 @@ config.yaml
 __pycache__/
 *.py[cod]
 .venv/
+.venv-mineru/
 venv/
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# MinerU API per-task working dir (results are copied into data/papers/); auto-cleaned after 24h
+output/
 
 # Node / 前端
 node_modules/
@@ -32,3 +36,8 @@ dist/
 .vscode/
 *.swp
 .DS_Store
+
+# tsc composite / stray build outputs
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

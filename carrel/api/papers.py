@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from carrel.db import get_session_dep
-from carrel.models import Paper, PaperStatus
+from carrel.models import Paper
 from carrel.schemas import PaperDetail, PaperSummary
 
 router = APIRouter(prefix="/papers", tags=["papers"])
@@ -86,8 +86,11 @@ def get_paper_markdown(
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
-    if p.status != PaperStatus.ready.value and p.md_path is None:
-        raise HTTPException(status_code=409, detail=f"paper not ready (status={p.status})")
+    if p.md_path is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"paper not parsed yet (status={p.status})",
+        )
 
     body: str | None = None
     if p.md_path:

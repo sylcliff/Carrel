@@ -18,11 +18,12 @@ the politeness pool (faster, more reliable). We read it from the YAML config.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
-from typing import Any, Iterable
+import re
+from datetime import date, datetime
+from typing import Any
 
 import pyalex
-from pyalex import Authors, Sources, Works
+from pyalex import Authors, Sources, Works, invert_abstract
 
 from carrel.config import CarrelYAML
 
@@ -64,7 +65,9 @@ def lookup_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
     except Exception as e:
         logger.debug("DOI lookup failed for %s: %s", arxiv_id, e)
 
-    # 2. Search fallback — most arXiv papers are indexed by title string
+    # 2. Search fallback — find a work whose ids actually reference this arXiv ID.
+    #    We do NOT return a top search hit on a weak match: attaching the wrong
+    #    canonical Work ID would corrupt authorship/venue data for a paper.
     try:
         candidates = (
             Works()
@@ -75,12 +78,13 @@ def lookup_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
         for w in candidates:
             d = dict(w)
             ids = d.get("ids") or {}
-            arxiv_field = (ids.get("arxiv") or "").split("/")[-1]
+            arxiv_field = (ids.get("arxiv") or "").split("/")[-1].lower()
+            # strip a possible version suffix on both sides for the comparison
+            arxiv_field = re.sub(r"v\d+$", "", arxiv_field)
+            target = re.sub(r"v\d+$", "", arxiv_id.lower())
             doi_field = (d.get("doi") or "").lower()
-            if arxiv_field == arxiv_id or doi_field.endswith(arxiv_id.lower()):
+            if arxiv_field == target or doi_field.endswith(f"arxiv.{target}"):
                 return d
-        if candidates:
-            return dict(candidates[0])
     except Exception as e:
         logger.debug("Search lookup failed for %s: %s", arxiv_id, e)
 
@@ -271,10 +275,18 @@ def work_title(work: dict[str, Any] | None) -> str:
 
 
 def work_abstract(work: dict[str, Any] | None) -> str | None:
-    """OpenAlex stores abstracts as an inverted index; pyalex restores plain text."""
+    """Restore the abstract from OpenAlex's inverted index.
+
+    pyalex (>=0.15) leaves abstracts as `abstract_inverted_index`; the flat
+    `abstract` field is empty. We invert it here into readable text.
+    """
     if not work:
         return None
-    return work.get("abstract")
+    restored = invert_abstract(work.get("abstract_inverted_index"))
+    if restored:
+        return restored
+    flat = work.get("abstract")
+    return flat or None
 
 
 def work_publication_date(work: dict[str, Any] | None) -> date | None:
@@ -316,38 +328,60 @@ def work_venue(work: dict[str, Any] | None) -> str | None:
 
 
 def work_arxiv_id(work: dict[str, Any] | None) -> str | None:
-    """Best-effort: arXiv DOI is 10.48550/arXiv.XXXX.YYYYY."""
+    """Extract a bare arXiv ID (e.g. '2401.00001') from an OpenAlex work.
+
+    OpenAlex stores DOIs as full URLs ('https://doi.org/10.48550/arxiv.X.Y'),
+    and sometimes exposes an `ids.arxiv` URL. We check both.
+    """
     if not work:
         return None
-    doi = work_doi(work)
-    if doi and doi.lower().startswith("10.48550/arxiv."):
-        tail = doi.split("/")[-1]  # "arXiv.XXXX.YYYYY"
-        if "." in tail:
-            return tail.split(".", 1)[1]  # "XXXX.YYYYY"
+
+    def _from_doi(doi: str | None) -> str | None:
+        if not doi:
+            return None
+        tail = doi.rsplit("/", 1)[-1]  # 'arxiv.2401.00001'
+        if tail.lower().startswith("arxiv."):
+            candidate = tail.split(".", 1)[1]
+            return candidate or None
         return None
-    # Fallback: look in ids
+
+    found = _from_doi(work_doi(work))
+    if found:
+        return found
+
     ids = work.get("ids") or {}
-    for key in ("arxiv", "doi"):
-        v = ids.get(key)
-        if v and key == "arxiv":
-            # sometimes looks like a URL; strip
-            return v.split("/")[-1] if "/" in v else v
-        if v and key == "doi" and v.lower().startswith("10.48550/arxiv."):
-            return v.split(".", 1)[1] if "." in v.split("/")[-1] else None
-    return None
+    arxiv_field = ids.get("arxiv")
+    if arxiv_field:
+        return arxiv_field.rstrip("/").rsplit("/", 1)[-1]
+    return _from_doi(ids.get("doi"))
 
 
 def work_pdf_url(work: dict[str, Any] | None) -> tuple[str | None, str]:
-    """Return (pdf_url, oa_status) where oa_status is 'oa' | 'closed' | 'none'."""
+    """Return (pdf_url, oa_status).
+
+    `pdf_url` is only set to a direct PDF URL (best_oa_location.pdf_url, or any
+    OA location's pdf_url) — a landing-page HTML URL is not a PDF and would make
+    the M3 downloader save an HTML page. oa_status is 'oa' only when a direct
+    PDF is available, 'closed' when the work is paywalled, 'none' when it is OA
+    but we could not find a direct PDF (e.g. HTML-only OA).
+    """
     if not work:
         return None, "none"
-    if not (work.get("open_access") or {}).get("is_oa"):
+    oa = work.get("open_access") or {}
+    if not oa.get("is_oa"):
         return None, "closed"
+
     best = work.get("best_oa_location") or {}
-    url = best.get("pdf_url") or best.get("landing_page_url")
-    if not url:
+    pdf_url = best.get("pdf_url")
+    if not pdf_url:
+        for loc in work.get("locations") or []:
+            if loc.get("pdf_url"):
+                pdf_url = loc["pdf_url"]
+                break
+    if not pdf_url:
+        # OA but HTML-only / landing-page-only — no direct PDF to download.
         return None, "none"
-    return url, "oa"
+    return pdf_url, "oa"
 
 
 # ---------------------------------------------------------------------------

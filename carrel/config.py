@@ -13,7 +13,6 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ----------------------------- YAML sub-schemas -----------------------------
 
 
@@ -67,9 +66,21 @@ class EmbeddingsConfig(BaseModel):
     dim: int = 2048
 
 
+class DownloadConfig(BaseModel):
+    request_timeout_seconds: int = 60
+    max_bytes: int = 80 * 1024 * 1024  # reject PDFs larger than this (80 MiB)
+    user_agent: str = "Carrel/0.1 (+https://github.com/)"
+
+
 class MinerUConfig(BaseModel):
     base_url: str = "http://127.0.0.1:8000"
-    request_timeout_seconds: int = 600
+    request_timeout_seconds: int = 900  # CPU parsing can take minutes per paper
+    # MinerU parse options (see mineru/cli/api_request.py)
+    backend: str = "pipeline"  # pipeline | vlm-engine | hybrid-engine | ...
+    parse_method: str = "auto"  # auto | txt | ocr
+    lang_list: list[str] = Field(default_factory=lambda: ["en"])
+    formula_enable: bool = True
+    table_enable: bool = True
 
 
 class ChunkingConfig(BaseModel):
@@ -100,6 +111,7 @@ class CarrelYAML(BaseModel):
     cors: CorsConfig = Field(default_factory=CorsConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
     arxiv: ArxivConfig = Field(default_factory=ArxivConfig)
+    download: DownloadConfig = Field(default_factory=DownloadConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
     mineru: MinerUConfig = Field(default_factory=MinerUConfig)

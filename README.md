@@ -13,17 +13,19 @@ one place. Built as one user, one machine, one Postgres.
 
 ## Status
 
-This is **M1 (skeleton)** of the [plan](./PLAN.md). The app boots against a
-local Postgres; the rest of the pipeline lands in M2–M6.
+M1–M3 are done. The app boots against a local Postgres, pulls papers from
+arXiv + OpenAlex (normalized/deduped onto an OpenAlex Work ID, arXiv ID
+fallback), shows them in the library, and can download OA PDFs and parse them
+to Markdown via a self-hosted MinerU service. LLM summaries land in M4.
 
 | Milestone | Status |
 |---|---|
-| M1 骨架 (this commit) | ✅ Postgres+pgvector, FastAPI, React+Vite+TS+Tailwind, health & paper list pages |
-| M2 抓取 + 库页 | ⏳ arXiv + OpenAlex fetchers, normalize, dedup |
-| M3 PDF + MinerU | ⏳ |
+| M1 骨架 | ✅ Postgres+pgvector, FastAPI, React+Vite+TS+Tailwind, health & paper list pages |
+| M2 抓取 + 库页 | ✅ arXiv + OpenAlex fetchers, normalize, dedup, subscription CRUD, sync jobs, library page |
+| M3 PDF + MinerU | ✅ OA PDF download (content-validated), MinerU HTTP client, `pending→pdf_ready→parsed`, Markdown reader, `/process` jobs |
 | M4 LLM 摘要 | ⏳ |
 | M5 检索 | ⏳ |
-| M6 定时 + 订阅 UI | ⏳ |
+| M6 定时 + 订阅 UI (enhance) | ⏳ APScheduler + sync log page (subscription CRUD already ships) |
 | M7 打磨 | ⏳ |
 
 ---
@@ -32,13 +34,14 @@ local Postgres; the rest of the pipeline lands in M2–M6.
 
 Prereqs:
 - Docker Desktop (Windows/macOS) or Docker Engine on Linux
-- Python ≥ 3.11
+- Python ≥ 3.11 (the Makefile uses [uv](https://docs.astral.sh/uv/); it falls
+  back to `pip` if uv is absent)
 - Node.js ≥ 20
 
 ```bash
 # 1. secrets (edit values, do not commit)
 cp .env.example .env
-cp config.example.yaml data/config.yaml   # path-relative config
+mkdir -p data && cp config.example.yaml data/config.yaml   # path-relative config
 
 # 2. start Postgres + pgvector
 make up
@@ -54,8 +57,40 @@ make install-frontend
 make frontend         # http://127.0.0.1:5173
 ```
 
-Open <http://127.0.0.1:5173> — you should see the "Today" page with a "Sync
-now" button (it just queues a job in M1; actual fetching ships in M2).
+Open <http://127.0.0.1:5173>, add a subscription on the Subscriptions page
+(a keyword or `cs.CL`), then hit **Sync now (72h)**. Fetched papers appear
+in the library with status `pending`.
+
+### Parsing PDFs to Markdown (M3)
+
+M3 downloads an OA PDF and sends it to a self-hosted MinerU API.
+
+**CPU machines (including Apple Silicon):** MinerU has no CPU Docker image (the
+official Docker image is NVIDIA-GPU only), so install it natively into a
+dedicated venv and run `mineru-api`:
+
+```bash
+make mineru-install   # one-time: pip install mineru[core] + pipeline models (~2.5 GB)
+make mineru-up        # start MinerU on http://127.0.0.1:8000
+```
+
+**Linux + NVIDIA GPU:** use the official image instead: `make mineru-build-gpu`
+then `docker compose --profile mineru up -d`.
+
+Then on a paper's detail page click **Download & parse**, or use **Process
+pending** on the Today page to parse the backlog. Papers move
+`pending → pdf_ready → parsed`; failures are recorded on the paper and can be
+retried. The parsed Markdown (with formulas, tables, and images) renders in
+the detail page; the original PDF is kept on disk. MinerU options
+(`backend`, `lang_list`, …) live under the `mineru:` block of `config.yaml`.
+
+### Development
+
+```bash
+# Tests run fully on SQLite — no Docker required.
+.venv/bin/python -m pytest          # 65 tests
+.venv/bin/ruff check carrel/ tests/
+```
 
 ---
 

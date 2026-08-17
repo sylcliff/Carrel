@@ -36,11 +36,13 @@ def make_engine(database_url: str) -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables and the pgvector extension.
+    """Create all tables and the pgvector extension (startup bootstrap).
 
-    M1 only needs this for ad-hoc debugging. M2 will switch to Alembic.
+    This is intentionally simple — a single-user local app on a fresh database
+    can create its schema directly. Alembic migrations can be introduced before
+    a release that needs to upgrade an existing database.
     The pgvector extension is only requested on PostgreSQL; SQLite (used in
-    tests/smoke) will silently skip it.
+    tests) silently skips it.
     """
     # Import models so SQLModel.metadata sees them before create_all.
     from carrel import models  # noqa: F401

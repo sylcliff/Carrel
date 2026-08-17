@@ -70,6 +70,25 @@ export const listPapers = (params?: { limit?: number; offset?: number; status?: 
 
 export const getPaper = (id: string) => request<PaperDetail>(`/papers/${encodeURIComponent(id)}`);
 
+export const getPaperMarkdown = (id: string) =>
+  request<{ id: string; body: string | null; md_path: string | null }>(
+    `/papers/${encodeURIComponent(id)}/markdown`
+  );
+
+// ---- Processing (download PDF + parse with MinerU) ----
+
+export const processPaper = (paperId: string, background = false) =>
+  request<Job>("/process", {
+    method: "POST",
+    body: JSON.stringify({ paper_id: paperId, background }),
+  });
+
+export const processPending = (limit = 10, background = false) =>
+  request<Job>("/process", {
+    method: "POST",
+    body: JSON.stringify({ limit, background }),
+  });
+
 // ---- Subscriptions ----
 
 export interface Subscription {

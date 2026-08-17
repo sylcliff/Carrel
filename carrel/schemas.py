@@ -6,7 +6,6 @@ from typing import Any
 
 from pydantic import BaseModel
 
-
 # -------- Health / meta --------
 
 
@@ -84,3 +83,15 @@ class SyncRequest(BaseModel):
     lookback_hours: int = 24
     sources: list[str] | None = None  # None = all enabled
     background: bool = False  # if true, fire-and-forget; else wait for result
+
+
+class ProcessRequest(BaseModel):
+    """Trigger PDF download + MinerU parse.
+
+    If ``paper_id`` is given, only that paper is processed; otherwise up to
+    ``limit`` pending/failed papers are processed in a batch.
+    """
+
+    paper_id: str | None = None
+    limit: int = 10
+    background: bool = False

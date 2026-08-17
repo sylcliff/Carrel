@@ -14,7 +14,6 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable
 from urllib.parse import urlencode
 from xml.etree import ElementTree as ET
 

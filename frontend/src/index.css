@@ -42,3 +42,68 @@
       Arial, "Noto Sans", "Noto Sans SC", "PingFang SC", sans-serif;
   }
 }
+
+/* Markdown reading view (parsed paper body) */
+@layer components {
+  .md-body {
+    @apply text-[15px] leading-7 text-foreground;
+  }
+  .md-body h1 {
+    @apply mb-4 mt-8 text-2xl font-bold;
+  }
+  .md-body h2 {
+    @apply mb-3 mt-7 border-b pb-1 text-xl font-semibold;
+  }
+  .md-body h3 {
+    @apply mb-2 mt-6 text-lg font-semibold;
+  }
+  .md-body h4 {
+    @apply mb-2 mt-5 text-base font-semibold;
+  }
+  .md-body p {
+    @apply my-3;
+  }
+  .md-body a {
+    @apply text-primary underline underline-offset-2;
+  }
+  .md-body ul {
+    @apply my-3 list-disc pl-6;
+  }
+  .md-body ol {
+    @apply my-3 list-decimal pl-6;
+  }
+  .md-body li {
+    @apply my-1;
+  }
+  .md-body blockquote {
+    @apply my-4 border-l-4 border-border pl-4 italic text-muted-foreground;
+  }
+  .md-body code {
+    @apply rounded bg-muted px-1.5 py-0.5 font-mono text-[0.85em];
+  }
+  .md-body pre {
+    @apply my-4 overflow-x-auto rounded-md bg-muted p-3 text-sm;
+  }
+  .md-body pre code {
+    @apply bg-transparent p-0;
+  }
+  .md-body table {
+    @apply my-4 w-full border-collapse text-sm;
+  }
+  .md-body th,
+  .md-body td {
+    @apply border border-border px-3 py-1.5 text-left;
+  }
+  .md-body th {
+    @apply bg-muted font-semibold;
+  }
+  .md-body figure {
+    @apply my-5;
+  }
+  .md-body figcaption {
+    @apply mt-1 text-xs text-muted-foreground;
+  }
+  .md-body .katex-display {
+    @apply my-4 overflow-x-auto;
+  }
+}

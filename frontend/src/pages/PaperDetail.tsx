@@ -1,27 +1,130 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { getPaper, type PaperDetail as PaperDetailT } from "@/api/client";
+import MarkdownReader from "@/components/MarkdownReader";
+import {
+  getJob,
+  getPaper,
+  getPaperMarkdown,
+  processPaper,
+  type Job,
+  type PaperDetail as PaperDetailT,
+} from "@/api/client";
 
-export default function PaperDetail() {
+type Props = {
+  onProcessed?: () => void;
+};
+
+const TERMINAL = new Set(["done", "failed"]);
+
+function elapsed(startedAt: string | null, now: number): string {
+  if (!startedAt) return "";
+  const secs = Math.max(0, Math.floor((now - new Date(startedAt).getTime()) / 1000));
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return `${m}m${s.toString().padStart(2, "0")}s`;
+}
+
+export default function PaperDetail({ onProcessed }: Props) {
   const { id } = useParams<{ id: string }>();
   const [p, setP] = useState<PaperDetailT | null>(null);
+  const [md, setMd] = useState<string | null>(null);
+  const [processing, setProcessing] = useState(false);
+  const [job, setJob] = useState<Job | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const timer = useRef<number | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(async () => {
     if (!id) return;
-    getPaper(id).then(setP).catch((e) => setErr(String(e)));
+    const paper = await getPaper(id);
+    setP(paper);
+    if (paper.md_path) {
+      try {
+        const r = await getPaperMarkdown(id);
+        setMd(r.body);
+      } catch {
+        setMd(null);
+      }
+    } else {
+      setMd(null);
+    }
   }, [id]);
 
-  if (err) return <main className="container py-8 text-sm text-red-600">{err}</main>;
-  if (!p) return <main className="container py-8 text-sm text-muted-foreground">Loading…</main>;
+  useEffect(() => {
+    load().catch((e) => setErr(String(e)));
+  }, [load]);
+
+  // Tick every second while processing so the elapsed counter updates.
+  useEffect(() => {
+    if (!processing) return;
+    const id2 = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id2);
+  }, [processing]);
+
+  async function onParse() {
+    if (!id) return;
+    setProcessing(true);
+    setErr(null);
+    setJob(null);
+    try {
+      const started = await processPaper(id, true);
+      setJob(started);
+      timer.current = window.setInterval(async () => {
+        try {
+          const j = await getJob(started.id);
+          setJob(j);
+          if (TERMINAL.has(j.status)) {
+            if (timer.current) window.clearInterval(timer.current);
+            setProcessing(false);
+            if (j.status === "failed") {
+              setErr(j.message || "Processing failed");
+            }
+            await load();
+            onProcessed?.();
+          }
+        } catch (e) {
+          if (timer.current) window.clearInterval(timer.current);
+          setProcessing(false);
+          setErr(String(e));
+        }
+      }, 1500);
+    } catch (e) {
+      setProcessing(false);
+      setErr(String(e));
+    }
+  }
+
+  useEffect(
+    () => () => {
+      if (timer.current) window.clearInterval(timer.current);
+    },
+    []
+  );
+
+  if (err && !p)
+    return <main className="container py-8 text-sm text-red-600">{err}</main>;
+  if (!p)
+    return (
+      <main className="container py-8 text-sm text-muted-foreground">Loading…</main>
+    );
+
+  const canParse =
+    Boolean(p.pdf_url) && p.status !== "parsed" && p.status !== "summarized";
+  const stage = (job?.stats?.stage as string | undefined) ?? "";
+  const detail = (job?.stats?.detail as string | undefined) ?? job?.message ?? "";
+  const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
 
   return (
     <main className="container max-w-3xl space-y-6 py-8">
       <div>
-        <Link to="/" className="text-sm text-muted-foreground hover:underline">← Back</Link>
+        <Link to="/" className="text-sm text-muted-foreground hover:underline">
+          ← Back
+        </Link>
       </div>
+
       <header className="space-y-2">
         <h1 className="text-2xl font-bold">{p.title}</h1>
         <div className="text-sm text-muted-foreground">
@@ -37,26 +140,100 @@ export default function PaperDetail() {
         </div>
       </header>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Abstract</CardTitle>
-        </CardHeader>
-        <CardContent className="text-sm leading-relaxed">
-          {p.abstract || <span className="text-muted-foreground">No abstract available.</span>}
-        </CardContent>
-      </Card>
-
-      {p.pdf_url && (
-        <div>
-          <Button onClick={() => window.open(p.pdf_url!, "_blank", "noopener")}>
-            Open PDF
+      <div className="flex flex-wrap gap-2">
+        {canParse && (
+          <Button onClick={onParse} disabled={running}>
+            {running
+              ? "Processing…"
+              : p.status === "failed"
+                ? "Retry parse"
+                : "Download & parse"}
           </Button>
-        </div>
+        )}
+        {p.pdf_url && (
+          <Button
+            variant="outline"
+            onClick={() => window.open(p.pdf_url!, "_blank", "noopener")}
+          >
+            Open original PDF
+          </Button>
+        )}
+        {p.pdf_path && (
+          <Button
+            variant="outline"
+            onClick={() => window.open(`/storage/${p.pdf_path}`, "_blank", "noopener")}
+          >
+            Open saved PDF
+          </Button>
+        )}
+      </div>
+
+      {running && (
+        <Card>
+          <CardContent className="flex items-center gap-3 pt-5 text-sm">
+            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
+            <span className="flex-1">
+              <span className="font-medium">{detail || "Working…"}</span>
+              {stage && stage !== "queued" && stage !== "done" && (
+                <span className="ml-2 text-xs uppercase tracking-wide text-muted-foreground">
+                  {stage}
+                </span>
+              )}
+            </span>
+            {job?.started_at && (
+              <span className="tabular-nums text-muted-foreground">
+                {elapsed(job.started_at, now)}
+              </span>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {job?.status === "done" && !err && (
+        <Card>
+          <CardContent className="pt-5 text-sm text-green-700">
+            Parsed successfully.
+          </CardContent>
+        </Card>
       )}
 
       {p.error && (
         <Card className="border-red-300">
-          <CardContent className="pt-5 text-sm text-red-600">{p.error}</CardContent>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm text-red-700">Processing error</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm text-red-600">{p.error}</CardContent>
+        </Card>
+      )}
+
+      {!p.pdf_url && (
+        <Card>
+          <CardContent className="pt-5 text-sm text-muted-foreground">
+            No open-access PDF is available for this paper — only metadata and the abstract
+            are stored. Use “Open original PDF” if a publisher link exists.
+          </CardContent>
+        </Card>
+      )}
+
+      {md ? (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Full text</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <MarkdownReader body={md} mdPath={p.md_path} />
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Abstract</CardTitle>
+          </CardHeader>
+          <CardContent className="text-sm leading-relaxed">
+            {p.abstract || (
+              <span className="text-muted-foreground">No abstract available.</span>
+            )}
+          </CardContent>
         </Card>
       )}
     </main>

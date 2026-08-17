@@ -13,13 +13,13 @@ to hundreds of papers; we don't need Celery/RQ.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 
 from sqlmodel import Session, select
 
 from carrel.config import CarrelYAML
-from carrel.models import Job, JobKind, JobStatus, Paper, PaperStatus, Subscription
+from carrel.models import Job, JobStatus, Paper, PaperStatus, Subscription
 from carrel.sources import arxiv as arxiv_src
 from carrel.sources import openalex_client as oa
 from carrel.sources.normalize import (
@@ -74,43 +74,39 @@ def fetch_candidates(
 ) -> list[PaperRecord]:
     """Run all enabled subscriptions and return deduped PaperRecord list."""
     oa.configure(cfg)
-    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    since = datetime.now(UTC) - timedelta(hours=lookback_hours)
     keywords, authors, venues, arxiv_cats = partition_subscriptions(subs)
 
     records: dict[str, PaperRecord] = {}  # keyed by normalized id
 
     # --- arXiv category + keyword subscriptions --------------------------------
+    # Categories and keywords are independent subscription types: a keyword
+    # search is NOT restricted to subscribed categories (PLAN §3), so we run
+    # them as two arXiv sweeps and merge results by id.
     arxiv_cats_str = [s.value for s in arxiv_cats]
     arxiv_queries = [s.value for s in keywords]
-    if arxiv_cats_str or arxiv_queries:
-        # Pull from arXiv with a generous cap; per-source dedup happens after.
-        cat_part = arxiv_cats_str or None
-        if not arxiv_queries and cat_part:
-            # Category-only sweep
-            entries = arxiv_src.fetch_recent(
-                lookback_hours=lookback_hours,
-                categories=cat_part,
-                max_results=cfg.arxiv.max_results_per_query,
-                timeout=cfg.arxiv.request_timeout_seconds,
-                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-            )
-        else:
-            entries = arxiv_src.fetch_recent(
-                lookback_hours=lookback_hours,
-                categories=cat_part,
-                queries=arxiv_queries or None,
-                max_results=cfg.arxiv.max_results_per_query,
-                timeout=cfg.arxiv.request_timeout_seconds,
-                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-            )
+    if arxiv_cats_str:
+        entries = arxiv_src.fetch_recent(
+            lookback_hours=lookback_hours,
+            categories=arxiv_cats_str,
+            max_results=cfg.arxiv.max_results_per_query,
+            timeout=cfg.arxiv.request_timeout_seconds,
+            delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+        )
         for e in entries:
-            rec = from_arxiv(e)
-            rec = enrich_with_openalex(rec)
-            key = rec.id
-            # If we already have a stronger record, keep it
-            existing = records.get(key)
-            if existing is None or _is_stronger(rec, existing):
-                records[key] = rec
+            rec = enrich_with_openalex(from_arxiv(e))
+            _merge_record(records, rec)
+    if arxiv_queries:
+        entries = arxiv_src.fetch_recent(
+            lookback_hours=lookback_hours,
+            queries=arxiv_queries,
+            max_results=cfg.arxiv.max_results_per_query,
+            timeout=cfg.arxiv.request_timeout_seconds,
+            delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+        )
+        for e in entries:
+            rec = enrich_with_openalex(from_arxiv(e))
+            _merge_record(records, rec)
 
     # --- OpenAlex: author subscriptions -----------------------------------------
     for s in authors:
@@ -118,11 +114,7 @@ def fetch_candidates(
             s.value, since=since, max_results=50
         )
         for w in works:
-            rec = from_openalex(w)
-            key = rec.id or f"arxiv:{rec.arxiv_id}" if rec.arxiv_id else f"doi:{rec.doi}"
-            existing = records.get(key)
-            if existing is None or _is_stronger(rec, existing):
-                records[key] = rec
+            _merge_record(records, from_openalex(w))
 
     # --- OpenAlex: venue subscriptions ------------------------------------------
     for s in venues:
@@ -130,34 +122,51 @@ def fetch_candidates(
             s.value, since=since, max_results=100
         )
         for w in works:
-            rec = from_openalex(w)
-            key = rec.id or (f"arxiv:{rec.arxiv_id}" if rec.arxiv_id else f"doi:{rec.doi}")
-            existing = records.get(key)
-            if existing is None or _is_stronger(rec, existing):
-                records[key] = rec
+            _merge_record(records, from_openalex(w))
 
     # --- OpenAlex: keyword subscriptions (in addition to arXiv) ---------------
     keyword_strs = {s.value for s in keywords}
     for q in keyword_strs:
         works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
         for w in works:
-            rec = from_openalex(w)
-            key = rec.id or (f"arxiv:{rec.arxiv_id}" if rec.arxiv_id else f"doi:{rec.doi}")
-            existing = records.get(key)
-            if existing is None or _is_stronger(rec, existing):
-                records[key] = rec
+            _merge_record(records, from_openalex(w))
 
     return list(records.values())
 
 
+def _merge_record(records: dict[str, PaperRecord], rec: PaperRecord) -> None:
+    """Merge `rec` into the in-memory dedup map.
+
+    A paper can arrive twice — once from arXiv (keyed `arxiv:<id>` when OpenAlex
+    enrichment failed) and once from an OpenAlex author/venue/keyword search
+    (keyed `W...`). When an OpenAlex record carries an arXiv id we also evict
+    the weaker `arxiv:` placeholder so the same paper is not inserted twice.
+    """
+    if not rec.id:
+        logger.warning("Skipping candidate with no id: %r", rec.title)
+        return
+
+    # If this canonical record supersedes an earlier arxiv:<id> placeholder,
+    # drop the placeholder so it isn't upserted as a separate row.
+    if rec.id_kind == "openalex" and rec.arxiv_id:
+        records.pop(f"arxiv:{rec.arxiv_id}", None)
+
+    existing = records.get(rec.id)
+    if existing is None or _is_stronger(rec, existing):
+        records[rec.id] = rec
+
+
 def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
     """'Stronger' = has OpenAlex ID, or has more complete fields."""
-    score = lambda r: (
-        (r.id_kind == "openalex"),
-        bool(r.venue),
-        bool(r.doi),
-        bool(r.abstract),
-    )
+
+    def score(r: PaperRecord) -> tuple[bool, bool, bool, bool]:
+        return (
+            r.id_kind == "openalex",
+            bool(r.venue),
+            bool(r.doi),
+            bool(r.abstract),
+        )
+
     return score(a) > score(b)
 
 
@@ -168,7 +177,7 @@ def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
 
 def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, int]:
     """Insert or update each record. Returns counters {new, updated, skipped}."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     new_count = 0
     updated_count = 0
     skipped_count = 0
@@ -180,6 +189,25 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, in
             continue
 
         existing = session.get(Paper, rec.id)
+        if existing is None and rec.id_kind == "openalex" and rec.arxiv_id:
+            # A previous sync may have stored this paper under `arxiv:<id>`
+            # because OpenAlex enrichment failed then. Promote the placeholder
+            # to the canonical OpenAlex ID rather than inserting a duplicate.
+            # No chunks/notes exist for a pending placeholder, so delete+insert
+            # is safe; preserve any fields (e.g. the arXiv PDF URL) the
+            # canonical record lacks.
+            placeholder = session.get(Paper, f"arxiv:{rec.arxiv_id}")
+            if placeholder is not None:
+                logger.info(
+                    "promoting placeholder arxiv:%s -> %s", rec.arxiv_id, rec.id
+                )
+                if not rec.pdf_url and placeholder.pdf_url:
+                    rec.pdf_url = placeholder.pdf_url
+                    rec.oa_status = "oa"
+                if not rec.abstract and placeholder.abstract:
+                    rec.abstract = placeholder.abstract
+                session.delete(placeholder)
+
         if existing is None:
             paper = Paper(
                 id=rec.id,
@@ -248,7 +276,7 @@ def run_sync(
     """Run a single sync pass; update job record (if provided) in-place."""
     if job is not None:
         job.status = JobStatus.running.value
-        job.started_at = datetime.now(timezone.utc)
+        job.started_at = datetime.now(UTC)
         session.add(job)
         session.commit()
 
@@ -270,7 +298,7 @@ def run_sync(
         )
         if job is not None:
             job.status = JobStatus.done.value
-            job.finished_at = datetime.now(timezone.utc)
+            job.finished_at = datetime.now(UTC)
             job.message = "ok"
             job.stats = counts
             session.add(job)
@@ -280,7 +308,7 @@ def run_sync(
         logger.exception("sync failed: %s", e)
         if job is not None:
             job.status = JobStatus.failed.value
-            job.finished_at = datetime.now(timezone.utc)
+            job.finished_at = datetime.now(UTC)
             job.message = f"{type(e).__name__}: {e}"
             session.add(job)
             session.commit()

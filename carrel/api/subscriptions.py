@@ -1,7 +1,7 @@
 """Subscription CRUD (M2; stubs in M1)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
@@ -40,7 +40,7 @@ def create_subscription(
         value=body.value.strip(),
         label=body.label,
         enabled=body.enabled,
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
     session.add(row)
     session.commit()
@@ -56,7 +56,9 @@ def create_subscription(
 
 
 @router.delete("/{sub_id}")
-def delete_subscription(sub_id: int, session: Session = Depends(get_session_dep)) -> dict[str, bool]:
+def delete_subscription(
+    sub_id: int, session: Session = Depends(get_session_dep)
+) -> dict[str, bool]:
     row = session.get(Subscription, sub_id)
     if row is None:
         raise HTTPException(status_code=404, detail="subscription not found")

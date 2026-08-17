@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { listPapers, getHealth, triggerSync, listSubscriptions, type Health, type Job, type PaperSummary, type Subscription } from "@/api/client";
+import { listPapers, getHealth, triggerSync, processPending, getJob, listSubscriptions, type Health, type Job, type PaperSummary, type Subscription } from "@/api/client";
 
 function StatusDot({ s }: { s: string }) {
   const color =
@@ -19,7 +19,9 @@ export default function Home() {
   const [papers, setPapers] = useState<PaperSummary[]>([]);
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [syncing, setSyncing] = useState(false);
+  const [processing, setProcessing] = useState(false);
   const [lastJob, setLastJob] = useState<Job | null>(null);
+  const [processJob, setProcessJob] = useState<Job | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   async function refresh() {
@@ -36,6 +38,24 @@ export default function Home() {
     refresh();
   }, []);
 
+  // Poll a background process job until it finishes, then refresh the list.
+  useEffect(() => {
+    if (!processJob || !["queued", "running"].includes(processJob.status)) return;
+    const t = setInterval(async () => {
+      try {
+        const j = await getJob(processJob.id);
+        setProcessJob(j);
+        if (!["queued", "running"].includes(j.status)) {
+          clearInterval(t);
+          await refresh();
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 3000);
+    return () => clearInterval(t);
+  }, [processJob]);
+
   async function onSync() {
     setSyncing(true);
     setErr(null);
@@ -47,6 +67,21 @@ export default function Home() {
       setErr(String(e));
     } finally {
       setSyncing(false);
+    }
+  }
+
+  async function onProcessPending() {
+    setProcessing(true);
+    setErr(null);
+    try {
+      // MinerU can take minutes/paper; run in background and poll jobs.
+      const job = await processPending(10, true);
+      setProcessJob(job);
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setProcessing(false);
     }
   }
 
@@ -68,10 +103,40 @@ export default function Home() {
             )}
           </p>
         </div>
-        <Button onClick={onSync} disabled={syncing}>
-          {syncing ? "Syncing…" : "Sync now (72h)"}
-        </Button>
+        <div className="flex gap-2">
+          <Button onClick={onProcessPending} disabled={processing} variant="outline">
+            {processing ? "Queuing…" : "Process pending"}
+          </Button>
+          <Button onClick={onSync} disabled={syncing}>
+            {syncing ? "Syncing…" : "Sync now (72h)"}
+          </Button>
+        </div>
       </section>
+
+      {processJob && ["queued", "running"].includes(processJob.status) && (
+        <Card>
+          <CardContent className="flex items-center gap-3 pt-5 text-sm text-muted-foreground">
+            <span className="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
+            <span className="flex-1">
+              {processJob.message && processJob.message !== "ok"
+                ? processJob.message
+                : "⏳ Parsing queued papers in the background (this can take a few minutes per paper)…"}
+            </span>
+          </CardContent>
+        </Card>
+      )}
+
+      {processJob && processJob.status === "done" && processJob.stats && (
+        <Card>
+          <CardContent className="pt-5 text-sm">
+            Parsing done: <b className="text-blue-600">{String(processJob.stats.parsed ?? 0)}</b> parsed
+            {processJob.stats.failed ? (
+              <>, <b className="text-red-600">{String(processJob.stats.failed)}</b> failed</>
+            ) : null}
+            .
+          </CardContent>
+        </Card>
+      )}
 
       {err && (
         <Card className="border-red-300">

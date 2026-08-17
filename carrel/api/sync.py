@@ -1,8 +1,13 @@
-"""Sync trigger + job status endpoints. M1 only returns the stub; logic comes in M2."""
+"""Sync trigger + job status endpoints (M2).
+
+A POST /sync runs the fetch → normalize → dedup → upsert pipeline, either
+inline (default, returns final stats) or as a BackgroundTask. Each run is
+recorded as a Job and listed via GET /sync/jobs.
+"""
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session, select
@@ -39,7 +44,7 @@ def trigger_sync(
         status=JobStatus.queued.value,
         message=f"queued (lookback_hours={body.lookback_hours})",
         stats={"lookback_hours": body.lookback_hours, "sources": body.sources},
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
     session.add(job)
     session.commit()
@@ -74,7 +79,12 @@ def _run_in_background(job_id: int, lookback_hours: int) -> None:
     engine = get_app_engine()
     with SqlSession(engine) as session:
         try:
-            run_sync(session, app_config, lookback_hours=lookback_hours, job=session.get(Job, job_id))
+            run_sync(
+                session,
+                app_config,
+                lookback_hours=lookback_hours,
+                job=session.get(Job, job_id),
+            )
         except Exception as e:
             logger.exception("background sync failed: %s", e)
 
