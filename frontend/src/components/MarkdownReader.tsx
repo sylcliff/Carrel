@@ -1,6 +1,10 @@
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import rehypeRaw from "rehype-raw";
 import rehypeKatex from "rehype-katex";
+import rehypeRawMath from "./rehypeRawMath";
+import rehypeCitations from "./rehypeCitations";
 import "katex/dist/katex.min.css";
 
 // Resolve MinerU's relative image links (e.g. "images/fig1.png") against the
@@ -23,9 +27,20 @@ export default function MarkdownReader({
   return (
     <div className="md-body">
       <ReactMarkdown
-        remarkPlugins={[remarkMath]}
-        rehypePlugins={[rehypeKatex]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeCitations, rehypeKatex]}
         components={{
+          a: ({ href, children, ...rest }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-primary underline underline-offset-2 hover:opacity-80"
+              {...rest}
+            >
+              {children}
+            </a>
+          ),
           img: ({ src, alt }) => (
             <img
               src={resolveImageSrc(src, mdPath)}
@@ -33,6 +48,26 @@ export default function MarkdownReader({
               loading="lazy"
               className="my-4 h-auto max-w-full rounded-md border"
             />
+          ),
+          // MinerU emits tables as inline HTML; without these overrides they
+          // render with the browser's default borderless styling and overflow.
+          table: ({ children }) => (
+            <div className="my-4 overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                {children}
+              </table>
+            </div>
+          ),
+          thead: ({ children }) => <thead className="bg-muted/50">{children}</thead>,
+          th: ({ children }) => (
+            <th className="border border-border px-3 py-1.5 text-left font-semibold">
+              {children}
+            </th>
+          ),
+          td: ({ children, ...rest }) => (
+            <td className="border border-border px-3 py-1.5 align-top" {...rest}>
+              {children}
+            </td>
           ),
         }}
       >

@@ -46,7 +46,12 @@
 /* Markdown reading view (parsed paper body) */
 @layer components {
   .md-body {
-    @apply text-[15px] leading-7 text-foreground;
+    @apply text-[15px] leading-7 text-foreground text-justify;
+    /* CJK-friendly justification: no word gaps on Chinese text, hang punctuation */
+    text-justify: inter-ideograph;
+    word-break: normal;
+    overflow-wrap: break-word;
+    hyphens: auto;
   }
   .md-body h1 {
     @apply mb-4 mt-8 text-2xl font-bold;
@@ -65,6 +70,20 @@
   }
   .md-body a {
     @apply text-primary underline underline-offset-2;
+  }
+  /* Intra-document references: less visually loud than external links. */
+  .md-body a.cite,
+  .md-body a.xref {
+    @apply no-underline;
+    color: hsl(var(--primary));
+    background-color: hsl(var(--primary) / 0.08);
+    border-radius: 3px;
+    padding: 0 3px;
+  }
+  .md-body a.cite:hover,
+  .md-body a.xref:hover {
+    @apply underline;
+    background-color: hsl(var(--primary) / 0.16);
   }
   .md-body ul {
     @apply my-3 list-disc pl-6;

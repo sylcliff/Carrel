@@ -82,7 +82,9 @@ def process_paper(
 
     def _emit(progress: dict) -> None:
         if on_progress is not None:
-            on_progress({"paper_id": paper.id, **progress})
+            on_progress(
+                {"paper_id": paper.id, "paper_title": paper.title, **progress}
+            )
 
     try:
         _emit({"stage": "download", "detail": "Downloading PDF…"})

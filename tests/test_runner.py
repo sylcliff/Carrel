@@ -163,6 +163,33 @@ def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
     assert len(session.exec(select(Paper)).all()) == 1
 
 
+# ---- Zenodo records are filtered out at the source ----
+
+
+def test_from_openalex_skips_zenodo_by_doi():
+    from carrel.sources.normalize import from_openalex
+
+    work = {
+        "id": "https://openalex.org/W9001",
+        "title": "A Tool, Not a Paper",
+        "doi": "https://doi.org/10.5281/zenodo.1000001",
+        "primary_location": {"source": {"display_name": "Some venue"}},
+    }
+    assert from_openalex(work) is None
+
+
+def test_from_openalex_skips_zenodo_by_venue():
+    from carrel.sources.normalize import from_openalex
+
+    work = {
+        "id": "https://openalex.org/W9002",
+        "title": "Another Deposit",
+        "doi": "https://doi.org/10.1000/xyz",
+        "primary_location": {"source": {"display_name": "Zenodo"}},
+    }
+    assert from_openalex(work) is None
+
+
 # ---- run_sync (with mocked sources) ----
 
 def _sub(kind, value):

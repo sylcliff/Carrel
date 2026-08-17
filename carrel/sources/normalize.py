@@ -12,12 +12,16 @@ to `arxiv:<id>` so the same paper is never inserted twice.
 """
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
 from carrel.sources import openalex_client as oa
 from carrel.sources.arxiv import ArxivEntry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -82,7 +86,21 @@ def from_arxiv(entry: ArxivEntry) -> PaperRecord:
 # ---------------------------------------------------------------------------
 
 
-def from_openalex(work: dict[str, Any]) -> PaperRecord:
+def from_openalex(work: dict[str, Any]) -> PaperRecord | None:
+    """Normalize an OpenAlex Work, or return None if it should be skipped.
+
+    Zenodo deposits are filtered out: they're software/dataset deposits, not
+    papers, and their concept/version DOI pair used to create duplicate rows.
+    """
+    doi = oa.work_doi(work)
+    venue = (oa.work_venue(work) or "").strip().lower()
+    if _is_zenodo(doi, venue):
+        logger.debug(
+            "skipping Zenodo work %s (doi=%s venue=%s)",
+            oa.work_id(work), doi, oa.work_venue(work),
+        )
+        return None
+
     wid = oa.work_id(work)
     raw_arxiv = oa.work_arxiv_id(work)
     arxiv_id = _strip_arxiv_version(raw_arxiv) if raw_arxiv else None
@@ -101,13 +119,26 @@ def from_openalex(work: dict[str, Any]) -> PaperRecord:
         publication_date=oa.work_publication_date(work),
         venue=oa.work_venue(work),
         authors=oa.work_authors(work),
-        doi=oa.work_doi(work),
+        doi=doi,
         arxiv_id=arxiv_id,
         pdf_url=pdf_url,
         oa_status=oa_status,
         source="openalex",
         raw_meta=work,
     )
+
+
+def _is_zenodo(doi: str | None, venue_lower: str) -> bool:
+    # OpenAlex returns "Zenodo" or "Zenodo (CERN European Organization for
+    # Nuclear Research)" depending on the record; match either.
+    if venue_lower == "zenodo" or venue_lower.startswith("zenodo "):
+        return True
+    if not doi:
+        return False
+    d = doi.strip().lower()
+    # DOIs arrive as full URLs (https://doi.org/10.5281/zenodo.12345); also
+    # tolerate the bare form.
+    return "10.5281/zenodo." in d
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +186,6 @@ def enrich_with_openalex(rec: PaperRecord) -> PaperRecord:
 
 def _strip_arxiv_version(arxiv_id: str) -> str:
     """Strip trailing version (v1, v2) so identity is stable across revisions."""
-    import re
-
     return re.sub(r"v\d+$", "", arxiv_id)
+
+

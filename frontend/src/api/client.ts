@@ -78,13 +78,13 @@ export const getPaperMarkdown = (id: string) =>
 // ---- Processing (download PDF + parse with MinerU) ----
 
 export const processPaper = (paperId: string, background = false) =>
-  request<Job>("/process", {
+  request<Job[]>("/process", {
     method: "POST",
     body: JSON.stringify({ paper_id: paperId, background }),
   });
 
 export const processPending = (limit = 10, background = false) =>
-  request<Job>("/process", {
+  request<Job[]>("/process", {
     method: "POST",
     body: JSON.stringify({ limit, background }),
   });

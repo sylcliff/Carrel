@@ -114,7 +114,9 @@ def fetch_candidates(
             s.value, since=since, max_results=50
         )
         for w in works:
-            _merge_record(records, from_openalex(w))
+            rec = from_openalex(w)
+            if rec is not None:
+                _merge_record(records, rec)
 
     # --- OpenAlex: venue subscriptions ------------------------------------------
     for s in venues:
@@ -122,14 +124,18 @@ def fetch_candidates(
             s.value, since=since, max_results=100
         )
         for w in works:
-            _merge_record(records, from_openalex(w))
+            rec = from_openalex(w)
+            if rec is not None:
+                _merge_record(records, rec)
 
     # --- OpenAlex: keyword subscriptions (in addition to arXiv) ---------------
     keyword_strs = {s.value for s in keywords}
     for q in keyword_strs:
         works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
         for w in works:
-            _merge_record(records, from_openalex(w))
+            rec = from_openalex(w)
+            if rec is not None:
+                _merge_record(records, rec)
 
     return list(records.values())
 
@@ -169,10 +175,6 @@ def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
 
     return score(a) > score(b)
 
-
-# ---------------------------------------------------------------------------
-# Upsert
-# ---------------------------------------------------------------------------
 
 
 def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, int]:

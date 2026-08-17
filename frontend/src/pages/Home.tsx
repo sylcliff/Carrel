@@ -2,17 +2,9 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { listPapers, getHealth, triggerSync, processPending, getJob, listSubscriptions, type Health, type Job, type PaperSummary, type Subscription } from "@/api/client";
-
-function StatusDot({ s }: { s: string }) {
-  const color =
-    s === "ready" || s === "summarized" ? "bg-green-500" :
-    s === "parsed" ? "bg-blue-500" :
-    s === "pdf_ready" ? "bg-yellow-500" :
-    s === "failed" ? "bg-red-500" :
-    "bg-gray-400";
-  return <span className={`inline-block h-2 w-2 rounded-full ${color}`} title={s} />;
-}
+import { listPapers, getHealth, triggerSync, processPending, listSubscriptions, type Health, type PaperSummary, type Subscription } from "@/api/client";
+import { StatusDot } from "@/components/StatusDot";
+import { TaskList } from "@/components/TaskList";
 
 export default function Home() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -20,8 +12,8 @@ export default function Home() {
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [processing, setProcessing] = useState(false);
-  const [lastJob, setLastJob] = useState<Job | null>(null);
-  const [processJob, setProcessJob] = useState<Job | null>(null);
+  const [lastSync, setLastSync] = useState<{ fetched: number; new: number; updated: number; subscriptions: number } | null>(null);
+  const [taskNonce, setTaskNonce] = useState(0);
   const [err, setErr] = useState<string | null>(null);
 
   async function refresh() {
@@ -38,30 +30,20 @@ export default function Home() {
     refresh();
   }, []);
 
-  // Poll a background process job until it finishes, then refresh the list.
-  useEffect(() => {
-    if (!processJob || !["queued", "running"].includes(processJob.status)) return;
-    const t = setInterval(async () => {
-      try {
-        const j = await getJob(processJob.id);
-        setProcessJob(j);
-        if (!["queued", "running"].includes(j.status)) {
-          clearInterval(t);
-          await refresh();
-        }
-      } catch {
-        /* keep polling */
-      }
-    }, 3000);
-    return () => clearInterval(t);
-  }, [processJob]);
-
   async function onSync() {
     setSyncing(true);
     setErr(null);
     try {
       const job = await triggerSync(72, false); // inline so we get final stats
-      setLastJob(job);
+      if (job.stats) {
+        setLastSync({
+          fetched: Number(job.stats.fetched ?? 0),
+          new: Number(job.stats.new ?? 0),
+          updated: Number(job.stats.updated ?? 0),
+          subscriptions: Number(job.stats.subscriptions ?? subs.length),
+        });
+      }
+      setTaskNonce((n) => n + 1);
       await refresh();
     } catch (e) {
       setErr(String(e));
@@ -74,10 +56,8 @@ export default function Home() {
     setProcessing(true);
     setErr(null);
     try {
-      // MinerU can take minutes/paper; run in background and poll jobs.
-      const job = await processPending(10, true);
-      setProcessJob(job);
-      await refresh();
+      await processPending(10, true);
+      setTaskNonce((n) => n + 1);
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -93,7 +73,7 @@ export default function Home() {
   });
 
   return (
-    <main className="container space-y-6 py-8">
+    <main className="container py-8">
       <section className="flex items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold">Today</h1>
@@ -113,125 +93,119 @@ export default function Home() {
         </div>
       </section>
 
-      {processJob && ["queued", "running"].includes(processJob.status) && (
-        <Card>
-          <CardContent className="flex items-center gap-3 pt-5 text-sm text-muted-foreground">
-            <span className="inline-block h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
-            <span className="flex-1">
-              {processJob.message && processJob.message !== "ok"
-                ? processJob.message
-                : "⏳ Parsing queued papers in the background (this can take a few minutes per paper)…"}
-            </span>
-          </CardContent>
-        </Card>
-      )}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_400px]">
+        <div className="min-w-0 space-y-6">
+          {err && (
+            <Card className="border-red-300">
+              <CardContent className="pt-5 text-sm text-red-600">{err}</CardContent>
+            </Card>
+          )}
 
-      {processJob && processJob.status === "done" && processJob.stats && (
-        <Card>
-          <CardContent className="pt-5 text-sm">
-            Parsing done: <b className="text-blue-600">{String(processJob.stats.parsed ?? 0)}</b> parsed
-            {processJob.stats.failed ? (
-              <>, <b className="text-red-600">{String(processJob.stats.failed)}</b> failed</>
-            ) : null}
-            .
-          </CardContent>
-        </Card>
-      )}
-
-      {err && (
-        <Card className="border-red-300">
-          <CardContent className="pt-5 text-sm text-red-600">{err}</CardContent>
-        </Card>
-      )}
-
-      {lastJob && lastJob.stats && (
-        <Card>
-          <CardContent className="pt-5 text-sm">
-            Last sync:{" "}
-            <b>{String(lastJob.stats.fetched ?? 0)}</b> fetched,{" "}
-            <b className="text-green-600">{String(lastJob.stats.new ?? 0)}</b> new,{" "}
-            <b className="text-blue-600">{String(lastJob.stats.updated ?? 0)}</b> updated
-            {subs.length > 0 && (
-              <> across <b>{String(lastJob.stats.subscriptions ?? 0)}</b> subscription(s)</>
-            )}
-            .
-          </CardContent>
-        </Card>
-      )}
-
-      {subs.length === 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle>No subscriptions</CardTitle>
-            <CardDescription>
-              Without subscriptions, "Sync now" has nothing to fetch. Add a keyword,
-              arXiv category, author or venue on the Subscriptions page.
-            </CardDescription>
-          </CardHeader>
-        </Card>
-      )}
-
-      <section>
-        <h2 className="mb-3 text-lg font-semibold">
-          Recently fetched <span className="text-sm font-normal text-muted-foreground">({today.length})</span>
-        </h2>
-        <div className="grid gap-3">
-          {today.length === 0 && subs.length > 0 && (
+          {lastSync && (
             <Card>
-              <CardContent className="pt-5 text-sm text-muted-foreground">
-                Nothing in the last 72h. Try a longer sync or a different keyword.
+              <CardContent className="pt-5 text-sm">
+                Last sync:{" "}
+                <b>{lastSync.fetched}</b> fetched,{" "}
+                <b className="text-green-600">{lastSync.new}</b> new,{" "}
+                <b className="text-blue-600">{lastSync.updated}</b> updated
+                {subs.length > 0 && (
+                  <> across <b>{lastSync.subscriptions}</b> subscription(s)</>
+                )}
+                .
               </CardContent>
             </Card>
           )}
-          {today.map((p) => (
-            <Card key={p.id}>
-              <CardContent className="flex items-start gap-3 p-4">
-                <div className="pt-1.5"><StatusDot s={p.status} /></div>
-                <div className="min-w-0 flex-1">
-                  <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
-                    {p.title}
-                  </Link>
-                  <div className="text-xs text-muted-foreground">
-                    {p.authors.slice(0, 4).join(", ")}
-                    {p.authors.length > 4 ? " et al." : ""} · {p.venue ?? p.source}
-                    {p.publication_date && <> · {p.publication_date}</>}
-                  </div>
-                </div>
-                <div className="text-xs text-muted-foreground">{p.status}</div>
-              </CardContent>
-            </Card>
-          ))}
-        </div>
-      </section>
 
-      <section>
-        <h2 className="mb-3 text-lg font-semibold">
-          Library <span className="text-sm font-normal text-muted-foreground">({papers.length})</span>
-        </h2>
-        <div className="grid gap-3">
-          {papers.slice(0, 10).map((p) => (
-            <Card key={p.id}>
-              <CardContent className="flex items-start gap-3 p-4">
-                <div className="pt-1.5"><StatusDot s={p.status} /></div>
-                <div className="min-w-0 flex-1">
-                  <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
-                    {p.title}
-                  </Link>
-                  <div className="text-xs text-muted-foreground">
-                    {p.venue ?? p.source}{p.publication_date && <> · {p.publication_date}</>}
-                  </div>
-                </div>
-              </CardContent>
+          {subs.length === 0 && (
+            <Card>
+              <CardHeader>
+                <CardTitle>No subscriptions</CardTitle>
+                <CardDescription>
+                  Without subscriptions, "Sync now" has nothing to fetch. Add a keyword,
+                  arXiv category, author or venue on the Subscriptions page.
+                </CardDescription>
+              </CardHeader>
             </Card>
-          ))}
+          )}
+
+          <section>
+            <h2 className="mb-3 text-lg font-semibold">
+              Recently fetched <span className="text-sm font-normal text-muted-foreground">({today.length})</span>
+            </h2>
+            <div className="grid gap-3">
+              {today.length === 0 && subs.length > 0 && (
+                <Card>
+                  <CardContent className="pt-5 text-sm text-muted-foreground">
+                    Nothing in the last 72h. Try a longer sync or a different keyword.
+                  </CardContent>
+                </Card>
+              )}
+              {today.map((p, i) => (
+                <Card key={p.id}>
+                  <CardContent className="flex items-start gap-3 p-4">
+                    <div className="pt-1.5"><StatusDot s={p.status} /></div>
+                    <span className="w-7 shrink-0 select-none pt-1 text-right text-sm tabular-nums text-muted-foreground">
+                      {i + 1}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
+                        {p.title}
+                      </Link>
+                      <div className="text-xs text-muted-foreground">
+                        {p.authors.slice(0, 4).join(", ")}
+                        {p.authors.length > 4 ? " et al." : ""} · {p.venue ?? p.source}
+                        {p.publication_date && <> · {p.publication_date}</>}
+                      </div>
+                    </div>
+                    <div className="text-xs text-muted-foreground">{p.status}</div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          </section>
+
+          <section>
+            <h2 className="mb-3 text-lg font-semibold">
+              Library <span className="text-sm font-normal text-muted-foreground">({papers.length})</span>
+            </h2>
+            <div className="grid gap-3">
+              {papers.slice(0, 10).map((p, i) => (
+                <Card key={p.id}>
+                  <CardContent className="flex items-start gap-3 p-4">
+                    <div className="pt-1.5"><StatusDot s={p.status} /></div>
+                    <span className="w-7 shrink-0 select-none pt-1 text-right text-sm tabular-nums text-muted-foreground">
+                      {i + 1}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
+                        {p.title}
+                      </Link>
+                      <div className="text-xs text-muted-foreground">
+                        {p.venue ?? p.source}{p.publication_date && <> · {p.publication_date}</>}
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+            <div className="mt-3 text-sm">
+              <Link to="/library" className="underline">View full library →</Link>
+            </div>
+          </section>
         </div>
-        <div className="mt-3 text-sm">
-          <Link to="/library" className="underline">View full library →</Link>
-        </div>
-      </section>
+
+        <aside className="min-w-0 lg:sticky lg:top-6 lg:self-start">
+          <TaskList
+            refreshNonce={taskNonce}
+            onProcessed={() => {
+              void refresh();
+            }}
+          />
+        </aside>
+      </div>
 
       {health && (
-        <footer className="text-xs text-muted-foreground">
+        <footer className="mt-8 text-xs text-muted-foreground">
           backend v{health.version} · db {health.db} · mineru {health.mineru}
         </footer>
       )}

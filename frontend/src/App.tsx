@@ -1,4 +1,5 @@
 import { Link, Route, Routes } from "react-router-dom";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import Home from "@/pages/Home";
 import Library from "@/pages/Library";
 import PaperDetail from "@/pages/PaperDetail";
@@ -23,14 +24,16 @@ function Header() {
 
 export default function App() {
   return (
-    <div className="min-h-screen bg-background">
-      <Header />
-      <Routes>
-        <Route path="/" element={<Home />} />
-        <Route path="/library" element={<Library />} />
-        <Route path="/subscriptions" element={<Subscriptions />} />
-        <Route path="/papers/:id" element={<PaperDetail />} />
-      </Routes>
-    </div>
+    <TooltipProvider delayDuration={150}>
+      <div className="min-h-screen bg-background">
+        <Header />
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/library" element={<Library />} />
+          <Route path="/subscriptions" element={<Subscriptions />} />
+          <Route path="/papers/:id" element={<PaperDetail />} />
+        </Routes>
+      </div>
+    </TooltipProvider>
   );
 }

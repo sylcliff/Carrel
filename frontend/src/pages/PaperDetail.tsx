@@ -71,10 +71,12 @@ export default function PaperDetail({ onProcessed }: Props) {
     setJob(null);
     try {
       const started = await processPaper(id, true);
-      setJob(started);
+      const firstJob = started[0];
+      if (!firstJob) throw new Error("No job returned");
+      setJob(firstJob);
       timer.current = window.setInterval(async () => {
         try {
-          const j = await getJob(started.id);
+          const j = await getJob(firstJob.id);
           setJob(j);
           if (TERMINAL.has(j.status)) {
             if (timer.current) window.clearInterval(timer.current);
@@ -130,11 +132,29 @@ export default function PaperDetail({ onProcessed }: Props) {
         <div className="text-sm text-muted-foreground">
           {p.authors.join(", ") || "—"}
         </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
           {p.venue && <span>📰 {p.venue}</span>}
           {p.publication_date && <span>📅 {p.publication_date}</span>}
-          {p.doi && <span>DOI: {p.doi}</span>}
-          {p.arxiv_id && <span>arXiv: {p.arxiv_id}</span>}
+          {p.doi && (
+            <a
+              href={p.doi}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline-offset-2 hover:text-foreground hover:underline"
+            >
+              DOI: {p.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")}
+            </a>
+          )}
+          {p.arxiv_id && (
+            <a
+              href={`https://arxiv.org/abs/${p.arxiv_id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline-offset-2 hover:text-foreground hover:underline"
+            >
+              arXiv:{p.arxiv_id}
+            </a>
+          )}
           <span>status: {p.status}</span>
           <span>oa: {p.oa_status}</span>
         </div>
