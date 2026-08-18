@@ -33,6 +33,7 @@ class PaperSummary(BaseModel):
     tldr_en: str | None = None
     keywords: list[str] = []
     source: str
+    citation_count: int | None = None
 
 
 class PaperDetail(PaperSummary):
@@ -44,8 +45,40 @@ class PaperDetail(PaperSummary):
     md_path: str | None = None
     summary_zh: str | None = None
     error: str | None = None
+    influential_citation_count: int | None = None
+    reference_count: int | None = None
+    citations_updated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# -------- Citations (Semantic Scholar) --------
+
+
+class CitationItem(BaseModel):
+    """One citing paper, with library-membership resolved by the API."""
+
+    title: str | None = None
+    year: int | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+    s2_paper_id: str | None = None
+    in_library: bool = False
+    paper_id: str | None = None  # Carrel Paper.id when in_library
+
+
+class CitationListOut(BaseModel):
+    paper_id: str
+    citation_count: int | None = None
+    influential_citation_count: int | None = None
+    reference_count: int | None = None
+    updated_at: datetime | None = None
+    truncated: bool = False  # stored list hit the citations_limit cap
+    citing: list[CitationItem] = []
+
+
+class CitationRefreshRequest(BaseModel):
+    background: bool = False
 
 
 # -------- Subscriptions --------

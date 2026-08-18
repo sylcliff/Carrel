@@ -51,6 +51,16 @@ class ArxivConfig(BaseModel):
     delay_between_requests_seconds: float = 3.0
 
 
+class SemanticScholarConfig(BaseModel):
+    base_url: str = "https://api.semanticscholar.org"
+    api_key: str | None = None  # optional x-api-key; raises rate limit
+    request_timeout_seconds: int = 30
+    max_retries: int = 3
+    delay_between_requests_seconds: float = 1.5  # politeness between papers
+    citations_limit: int = 500  # cap on stored citing-paper list
+    fetch_on_sync: bool = True  # look up citations for newly synced papers
+
+
 class LLMConfig(BaseModel):
     summarize_provider: str = "deepseek"
     summarize_model: str = "deepseek/deepseek-chat"
@@ -111,6 +121,7 @@ class CarrelYAML(BaseModel):
     cors: CorsConfig = Field(default_factory=CorsConfig)
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
     arxiv: ArxivConfig = Field(default_factory=ArxivConfig)
+    semantic_scholar: SemanticScholarConfig = Field(default_factory=SemanticScholarConfig)
     download: DownloadConfig = Field(default_factory=DownloadConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
@@ -137,6 +148,7 @@ class EnvSettings(BaseSettings):
     volcano_api_key: str | None = None
     openalex_api_key: str | None = None
     openalex_mailto: str | None = None
+    s2_api_key: str | None = None
     summarize_model: str = "deepseek/deepseek-chat"
     fallback_model: str = "volcengine/doubao-pro-32k"
     embedding_model: str = "volcengine/doubao-embedding-large-text-240915"
@@ -173,6 +185,8 @@ def load_settings(
         cfg.openalex.mailto = env.openalex_mailto
     if env.openalex_api_key:
         cfg.openalex.api_key = env.openalex_api_key
+    if env.s2_api_key:
+        cfg.semantic_scholar.api_key = env.s2_api_key
     if env.summarize_model:
         cfg.llm.summarize_model = env.summarize_model
     if env.fallback_model:

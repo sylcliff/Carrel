@@ -177,12 +177,18 @@ def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
 
 
 
-def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, int]:
-    """Insert or update each record. Returns counters {new, updated, skipped}."""
+def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, object]:
+    """Insert or update each record.
+
+    Returns counters ``{new, updated, skipped, new_ids}`` where ``new_ids`` is
+    the list of paper IDs inserted in this pass (used by downstream enrichment
+    such as citation lookups).
+    """
     now = datetime.now(UTC)
     new_count = 0
     updated_count = 0
     skipped_count = 0
+    new_ids: list[str] = []
 
     for rec in records:
         if not rec.id:
@@ -231,6 +237,7 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, in
             )
             session.add(paper)
             new_count += 1
+            new_ids.append(rec.id)
         else:
             # Refresh metadata if our new record is stronger
             changed = False
@@ -260,7 +267,12 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, in
                 skipped_count += 1
 
     session.commit()
-    return {"new": new_count, "updated": updated_count, "skipped": skipped_count}
+    return {
+        "new": new_count,
+        "updated": updated_count,
+        "skipped": skipped_count,
+        "new_ids": new_ids,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +286,7 @@ def run_sync(
     *,
     lookback_hours: int = 24,
     job: Job | None = None,
-) -> dict[str, int]:
+) -> dict[str, object]:
     """Run a single sync pass; update job record (if provided) in-place."""
     if job is not None:
         job.status = JobStatus.running.value
@@ -291,6 +303,29 @@ def run_sync(
         counts = upsert_records(session, records)
         counts["fetched"] = len(records)
         counts["subscriptions"] = len(subs)
+
+        # Best-effort citation enrichment for newly inserted papers. Failures
+        # here (rate limits, S2 downtime) must not fail the whole sync.
+        new_ids = counts.get("new_ids") or []
+        if cfg.semantic_scholar.fetch_on_sync and new_ids:
+            from carrel.pipeline import citations as cite_pipe
+
+            def _cite_progress(progress: dict) -> None:
+                if job is not None:
+                    job.stats = {**(job.stats or {}), **progress, **counts}
+                    session.add(job)
+                    session.commit()
+
+            cite_counts = cite_pipe.enrich_papers(
+                session, cfg, list(new_ids), on_progress=_cite_progress
+            )
+            counts["citations_enriched"] = cite_counts["enriched"]
+            counts["citations_failed"] = cite_counts["failed"]
+            logger.info(
+                "citation enrichment: enriched=%d failed=%d",
+                cite_counts["enriched"], cite_counts["failed"],
+            )
+
         logger.info(
             "sync done: fetched=%d new=%d updated=%d skipped=%d",
             counts["fetched"],

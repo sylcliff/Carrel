@@ -3,6 +3,7 @@ import { useParams, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
+import CitationsCard from "@/components/CitationsCard";
 import {
   getJob,
   getPaper,
@@ -155,6 +156,9 @@ export default function PaperDetail({ onProcessed }: Props) {
               arXiv:{p.arxiv_id}
             </a>
           )}
+          {p.citation_count !== null && p.citation_count !== undefined && (
+            <span>🏆 {p.citation_count.toLocaleString()} cited</span>
+          )}
           <span>status: {p.status}</span>
           <span>oa: {p.oa_status}</span>
         </div>
@@ -187,6 +191,8 @@ export default function PaperDetail({ onProcessed }: Props) {
           </Button>
         )}
       </div>
+
+      <CitationsCard paper={p} onChanged={load} />
 
       {running && (
         <Card>

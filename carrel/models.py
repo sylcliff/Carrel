@@ -48,6 +48,7 @@ class JobKind(str, Enum):
     parse = "parse"
     summarize = "summarize"
     embed = "embed"
+    citations = "citations"  # refresh Semantic Scholar citation count + citing list
 
 
 class JobStatus(str, Enum):
@@ -95,6 +96,18 @@ class Paper(SQLModel, table=True):
 
     # Authors as [{name, openalex_author_id, affiliation}]
     authors: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
+
+    # Citations (Semantic Scholar). `citing_papers` is a capped list of
+    # {title, year, doi, arxiv_id, s2_paper_id}; the authoritative count is
+    # `citation_count` (may exceed the stored list length).
+    s2_paper_id: str | None = Field(default=None, index=True, max_length=64)
+    citation_count: int | None = None
+    influential_citation_count: int | None = None
+    reference_count: int | None = None
+    citing_papers: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
+    citations_updated_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
 
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),

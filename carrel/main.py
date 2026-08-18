@@ -11,9 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from carrel import __version__
-from carrel.api import health, papers, process, subscriptions, sync
+from carrel.api import citations, health, papers, process, subscriptions, sync
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
+from carrel.sources import semanticscholar_client as s2
 
 logger = logging.getLogger("carrel")
 
@@ -47,6 +48,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Always make sure pgvector exists; SQLModel.create_all will create the
     # tables on first run so the frontend can boot against a fresh DB.
     init_db(engine)
+
+    # Shared HTTP clients for external metadata sources.
+    s2.configure(
+        base_url=cfg.semantic_scholar.base_url,
+        api_key=cfg.semantic_scholar.api_key,
+        timeout=cfg.semantic_scholar.request_timeout_seconds,
+    )
 
     app_config = cfg
     app_env = env
@@ -89,6 +97,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(papers.router)
+    app.include_router(citations.router)
     app.include_router(subscriptions.router)
     app.include_router(sync.router)
     app.include_router(process.router)

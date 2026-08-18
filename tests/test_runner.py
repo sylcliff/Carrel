@@ -108,14 +108,14 @@ def test_merge_skips_record_with_no_id(caplog):
 
 def test_upsert_inserts_new(session):
     counts = upsert_records(session, [_rec(), _rec(id="W2", title="Two")])
-    assert counts == {"new": 2, "updated": 0, "skipped": 0}
+    assert counts == {"new": 2, "updated": 0, "skipped": 0, "new_ids": ["W1", "W2"]}
     assert session.get(Paper, "W1").title == "Paper One"
     assert session.get(Paper, "W2").status == PaperStatus.pending.value
 
 
 def test_upsert_skips_no_id(session):
     counts = upsert_records(session, [_rec(id="")])
-    assert counts == {"new": 0, "updated": 0, "skipped": 1}
+    assert counts == {"new": 0, "updated": 0, "skipped": 1, "new_ids": []}
     assert len(session.exec(select(Paper)).all()) == 0
 
 
@@ -137,7 +137,7 @@ def test_upsert_backfills_missing_fields_on_existing(session):
 def test_upsert_counts_skip_when_nothing_new(session):
     upsert_records(session, [_rec()])
     counts = upsert_records(session, [_rec()])
-    assert counts == {"new": 0, "updated": 0, "skipped": 1}
+    assert counts == {"new": 0, "updated": 0, "skipped": 1, "new_ids": []}
 
 
 def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
@@ -213,7 +213,9 @@ def test_run_sync_persists_papers_and_updates_job(session, cfg):
 
     with patch("carrel.pipeline.runner.arxiv_src.fetch_recent", return_value=[entry]), \
          patch("carrel.pipeline.runner.oa.lookup_by_arxiv_id", return_value=None), \
-         patch("carrel.pipeline.runner.oa.configure"):
+         patch("carrel.pipeline.runner.oa.configure"), \
+         patch("carrel.pipeline.citations.enrich_papers",
+               return_value={"enriched": 0, "failed": 0, "skipped": 0}):
         session.add(_sub("arxiv_category", "cs.CL"))
         session.commit()
         counts = run_sync(session, cfg, lookback_hours=24, job=job)

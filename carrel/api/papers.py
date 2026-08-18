@@ -24,6 +24,7 @@ def _to_summary(p: Paper) -> PaperSummary:
         tldr_en=p.tldr_en,
         keywords=p.keywords or [],
         source=p.source,
+        citation_count=p.citation_count,
     )
 
 
@@ -40,6 +41,7 @@ def _to_detail(p: Paper) -> PaperDetail:
         tldr_en=p.tldr_en,
         keywords=p.keywords or [],
         source=p.source,
+        citation_count=p.citation_count,
         abstract=p.abstract,
         doi=p.doi,
         arxiv_id=p.arxiv_id,
@@ -48,6 +50,9 @@ def _to_detail(p: Paper) -> PaperDetail:
         md_path=p.md_path,
         summary_zh=p.summary_zh,
         error=p.error,
+        influential_citation_count=p.influential_citation_count,
+        reference_count=p.reference_count,
+        citations_updated_at=p.citations_updated_at,
         created_at=p.created_at,
         updated_at=p.updated_at,
     )

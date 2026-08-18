@@ -44,6 +44,7 @@ export interface PaperSummary {
   tldr_en: string | null;
   keywords: string[];
   source: string;
+  citation_count: number | null;
 }
 
 export interface PaperDetail extends PaperSummary {
@@ -55,8 +56,31 @@ export interface PaperDetail extends PaperSummary {
   md_path: string | null;
   summary_zh: string | null;
   error: string | null;
+  influential_citation_count: number | null;
+  reference_count: number | null;
+  citations_updated_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface CitationItem {
+  title: string | null;
+  year: number | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  s2_paper_id: string | null;
+  in_library: boolean;
+  paper_id: string | null;
+}
+
+export interface CitationList {
+  paper_id: string;
+  citation_count: number | null;
+  influential_citation_count: number | null;
+  reference_count: number | null;
+  updated_at: string | null;
+  truncated: boolean;
+  citing: CitationItem[];
 }
 
 export const listPapers = (params?: { limit?: number; offset?: number; status?: string }) => {
@@ -74,6 +98,15 @@ export const getPaperMarkdown = (id: string) =>
   request<{ id: string; body: string | null; md_path: string | null }>(
     `/papers/${encodeURIComponent(id)}/markdown`
   );
+
+export const getPaperCitations = (id: string) =>
+  request<CitationList>(`/papers/${encodeURIComponent(id)}/citations`);
+
+export const refreshPaperCitations = (id: string, background = true) =>
+  request<Job>(`/papers/${encodeURIComponent(id)}/refresh-citations`, {
+    method: "POST",
+    body: JSON.stringify({ background }),
+  });
 
 // ---- Processing (download PDF + parse with MinerU) ----
 

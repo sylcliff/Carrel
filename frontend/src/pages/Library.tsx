@@ -39,7 +39,12 @@ export default function Library() {
                   {p.publication_date && <> · {p.publication_date}</>}
                 </div>
               </div>
-              <div className="text-xs text-muted-foreground">{p.status}</div>
+              <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground">
+                {p.citation_count !== null && p.citation_count !== undefined && (
+                  <span title="Citations (Semantic Scholar)">🏆 {p.citation_count}</span>
+                )}
+                <span>{p.status}</span>
+              </div>
             </CardContent>
           </Card>
         ))}
