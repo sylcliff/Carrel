@@ -4,7 +4,6 @@ from __future__ import annotations
 from datetime import UTC, date, datetime
 from unittest.mock import patch
 
-import pytest
 from carrel.models import Job, JobKind, JobStatus, Paper, PaperStatus, Subscription
 from carrel.pipeline.runner import (
     _is_stronger,
@@ -229,7 +228,10 @@ def test_run_sync_persists_papers_and_updates_job(session, cfg):
     assert job.stats["new"] == 1
 
 
-def test_run_sync_marks_job_failed_on_error(session, cfg):
+def test_run_sync_swallows_per_source_errors_and_records_them(session, cfg):
+    """A single source's failure must not fail the whole sync; the error is
+    recorded in the job stats under `source_errors` so the UI can surface it.
+    """
     job = Job(kind=JobKind.sync.value, status=JobStatus.queued.value,
               created_at=datetime.now(UTC))
     session.add(job)
@@ -239,12 +241,11 @@ def test_run_sync_marks_job_failed_on_error(session, cfg):
     with patch("carrel.pipeline.runner.arxiv_src.fetch_recent",
                side_effect=RuntimeError("boom")), \
          patch("carrel.pipeline.runner.oa.configure"):
-        with pytest.raises(RuntimeError):
-            run_sync(session, cfg, lookback_hours=24, job=job)
+        run_sync(session, cfg, lookback_hours=24, job=job)
 
     session.refresh(job)
-    assert job.status == JobStatus.failed.value
-    assert "boom" in (job.message or "")
+    assert job.status == JobStatus.done.value
+    assert job.stats.get("source_errors", {}).get("arxiv_keywords", "").endswith("boom")
 
 
 def test_fetch_candidates_dedups_arxiv_and_openalert_same_paper(session, cfg):
@@ -279,7 +280,8 @@ def test_fetch_candidates_dedups_arxiv_and_openalert_same_paper(session, cfg):
          patch("carrel.pipeline.runner.oa.lookup_by_arxiv_id", return_value=None), \
          patch("carrel.pipeline.runner.oa.fetch_recent_by_keyword", return_value=[oa_work]), \
          patch("carrel.pipeline.runner.oa.configure"):
-        records = fetch_candidates(cfg, subs, lookback_hours=24)
+        records, errors = fetch_candidates(cfg, subs, lookback_hours=24)
 
+    assert errors == {}
     ids = {r.id for r in records}
     assert ids == {"W999"}, f"expected single canonical record, got {ids}"

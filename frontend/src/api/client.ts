@@ -69,6 +69,7 @@ export interface CitationItem {
   doi: string | null;
   arxiv_id: string | null;
   s2_paper_id: string | null;
+  openalex_id: string | null;
   in_library: boolean;
   paper_id: string | null;
 }
@@ -81,13 +82,17 @@ export interface CitationList {
   updated_at: string | null;
   truncated: boolean;
   citing: CitationItem[];
+  next_offset: number | null;
+  source: "cache" | "openalex";
+  cached_count: number;
 }
 
-export const listPapers = (params?: { limit?: number; offset?: number; status?: string }) => {
+export const listPapers = (params?: { limit?: number; offset?: number; status?: string; venue?: string }) => {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
   if (params?.offset) q.set("offset", String(params.offset));
   if (params?.status) q.set("status", params.status);
+  if (params?.venue) q.set("venue", params.venue);
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
 };
@@ -99,8 +104,17 @@ export const getPaperMarkdown = (id: string) =>
     `/papers/${encodeURIComponent(id)}/markdown`
   );
 
-export const getPaperCitations = (id: string) =>
-  request<CitationList>(`/papers/${encodeURIComponent(id)}/citations`);
+export const getPaperCitations = (
+  id: string,
+  opts?: { sort?: "year_asc" | "year_desc" | "cited_desc"; offset?: number; limit?: number },
+) => {
+  const q = new URLSearchParams();
+  if (opts?.sort) q.set("sort", opts.sort);
+  if (opts?.offset !== undefined) q.set("offset", String(opts.offset));
+  if (opts?.limit !== undefined) q.set("limit", String(opts.limit));
+  const qs = q.toString();
+  return request<CitationList>(`/papers/${encodeURIComponent(id)}/citations${qs ? `?${qs}` : ""}`);
+};
 
 export const refreshPaperCitations = (id: string, background = true) =>
   request<Job>(`/papers/${encodeURIComponent(id)}/refresh-citations`, {
@@ -135,6 +149,9 @@ export interface Subscription {
 
 export const listSubscriptions = () => request<Subscription[]>("/subscriptions");
 
+export const addTopJournals = () =>
+  request<Subscription[]>("/subscriptions/top-journals", { method: "POST" });
+
 export const createSubscription = (body: {
   kind: Subscription["kind"];
   value: string;
@@ -168,6 +185,120 @@ export const triggerSync = (lookbackHours = 24, background = false) =>
     body: JSON.stringify({ lookback_hours: lookbackHours, background }),
   });
 
-export const listJobs = () => request<Job[]>("/sync/jobs");
+export interface JobFilter {
+  kind?: string;
+  status?: string;
+  limit?: number;
+}
+
+export const listJobs = (filter: JobFilter = {}) => {
+  const params = new URLSearchParams();
+  if (filter.kind) params.set("kind", filter.kind);
+  if (filter.status) params.set("status", filter.status);
+  if (filter.limit) params.set("limit", String(filter.limit));
+  const q = params.toString();
+  return request<Job[]>(`/sync/jobs${q ? `?${q}` : ""}`);
+};
 
 export const getJob = (id: number) => request<Job>(`/sync/jobs/${id}`);
+
+// -------- Search (M5) --------
+
+export interface LocalSearchResult {
+  id: string;
+  title: string;
+  abstract: string | null;
+  authors: string[];
+  venue: string | null;
+  publication_date: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  citation_count: number | null;
+  status: string | null;
+  snippet: string | null;
+}
+
+export interface ExternalSearchResult {
+  openalex_id: string;
+  title: string;
+  abstract: string | null;
+  authors: string[];
+  venue: string | null;
+  publication_date: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  citation_count: number | null;
+  cited_by_url: string | null;
+  in_library: boolean;
+  library_id: string | null;
+  pdf_url: string | null;
+  snippet: string | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  corrected_from: string | null;
+  local: LocalSearchResult[];
+  external: ExternalSearchResult[];
+}
+
+export const searchPapers = (q: string, limit = 20, correct = true) =>
+  request<SearchResponse>(
+    `/search?q=${encodeURIComponent(q)}&limit=${limit}&correct=${correct ? "true" : "false"}`,
+  );
+
+export interface SemanticHit {
+  paper_id: string;
+  chunk_index: number;
+  heading: string | null;
+  snippet: string;
+  score: number;
+}
+
+export interface SemanticSearchResult {
+  id: string;
+  title: string;
+  venue: string | null;
+  publication_date: string | null;
+  authors: string[];
+  doi: string | null;
+  arxiv_id: string | null;
+  status: string | null;
+  best_score: number;
+  hits: SemanticHit[];
+}
+
+export interface SemanticSearchResponse {
+  query: string;
+  corrected_from: string | null;
+  results: SemanticSearchResult[];
+}
+
+export const searchSemantic = (q: string, limit = 10, correct = true) =>
+  request<SemanticSearchResponse>(
+    `/search/semantic?q=${encodeURIComponent(q)}&limit=${limit}&correct=${correct ? "true" : "false"}`,
+  );
+
+// ---- Embedding (M5: chunk + embed parsed papers) ----
+
+export const embedPaper = (paperId: string, background = false) =>
+  request<Job[]>("/embed", {
+    method: "POST",
+    body: JSON.stringify({ paper_id: paperId, background }),
+  });
+
+export const embedPending = (limit = 20, background = false) =>
+  request<Job[]>("/embed", {
+    method: "POST",
+    body: JSON.stringify({ limit, background }),
+  });
+
+export const importPaper = (body: {
+  openalex_id?: string;
+  doi?: string;
+  arxiv_id?: string;
+}) =>
+  request<{ id: string; created: boolean }>("/import", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });

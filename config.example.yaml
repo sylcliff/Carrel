@@ -56,6 +56,8 @@ embeddings:
   provider: volcengine
   model: volcengine/doubao-embedding-large-text-240915
   dim: 2048                           # MUST match the chosen embedding model's output
+  request_timeout_seconds: 60
+  batch_size: 50
 
 mineru:
   base_url: http://127.0.0.1:8000
@@ -72,8 +74,8 @@ chunking:
   min_tokens: 200
 
 schedule:
-  enabled: false                       # flip to true in M6
-  sync_cron: "0 8 * * *"              # 08:00 every day (local time)
+  enabled: false                       # set true to enable daily auto-sync (APScheduler, in-process)
+  sync_cron: "0 8 * * *"              # 5-field crontab (minute hour dom month dow), local time. Default: 08:00 daily
 
 # ----- Subscriptions (M2) -----
 # Each entry is one of:

@@ -11,9 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from carrel import __version__
-from carrel.api import citations, health, papers, process, subscriptions, sync
+from carrel.api import citations, embed, health, papers, process, search, subscriptions, sync
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
+from carrel.scheduler import start_scheduler, stop_scheduler
 from carrel.sources import semanticscholar_client as s2
 
 logger = logging.getLogger("carrel")
@@ -58,11 +59,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     app_config = cfg
     app_env = env
+    start_scheduler(cfg)
     logger.info(
         "Carrel %s started. db=%s mineru=%s",
         __version__, env.database_url, cfg.mineru.base_url,
     )
     yield
+    stop_scheduler()
 
 
 def create_app() -> FastAPI:
@@ -101,6 +104,8 @@ def create_app() -> FastAPI:
     app.include_router(subscriptions.router)
     app.include_router(sync.router)
     app.include_router(process.router)
+    app.include_router(embed.router)
+    app.include_router(search.router)
 
     # Serve parsed markdown images (and PDFs) straight from storage. The
     # bootstrap step above created the directory, so StaticFiles can mount it.

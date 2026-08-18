@@ -64,10 +64,13 @@ def list_papers(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     status: str | None = Query(None, description="Filter by paper status"),
+    venue: str | None = Query(None, description="Case-insensitive substring match on venue name"),
 ) -> list[PaperSummary]:
     stmt = select(Paper).order_by(Paper.created_at.desc()).offset(offset).limit(limit)
     if status:
         stmt = stmt.where(Paper.status == status)
+    if venue:
+        stmt = stmt.where(Paper.venue.ilike(f"%{venue}%"))
     return [_to_summary(p) for p in session.exec(stmt).all()]
 
 

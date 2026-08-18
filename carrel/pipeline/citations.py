@@ -1,8 +1,10 @@
-"""Citation enrichment pipeline (Semantic Scholar).
+"""Citation enrichment pipeline (Semantic Scholar + OpenAlex).
 
 For each paper we fetch the citation count, influential/reference counts, and a
-capped list of citing papers, then persist them on the ``Paper`` row. This
-module is synchronous and mirrors :mod:`carrel.pipeline.process`:
+capped list of citing papers from S2, then merge in any additional citing
+papers OpenAlex knows about that S2 missed. The merged list is deduped by
+DOI / arXiv id / S2 paper id / OpenAlex id / normalized title. This module is
+synchronous and mirrors :mod:`carrel.pipeline.process`:
 
   - :func:`enrich_paper` enriches one paper and reports progress via a callback
     shaped like process.py's (a dict with ``stage`` / ``detail``).
@@ -16,6 +18,7 @@ catch and continue so one bad lookup never aborts a sync run.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -24,11 +27,84 @@ from sqlmodel import Session, select
 
 from carrel.config import CarrelYAML
 from carrel.models import Paper
+from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
 
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[dict], None]
+
+# OpenAlex paginates at 200/page; a single cites: query is bounded by that.
+_OPENALEX_CITES_LIMIT = 200
+
+
+def _norm_title(t: str | None) -> str:
+    return re.sub(r"\s+", " ", (t or "").strip().lower())
+
+
+def _openalex_to_citing(work: dict) -> dict:
+    """Normalize an OpenAlex Work dict to the {title,year,doi,arxiv_id,...} shape
+    stored on Paper.citing_papers."""
+    return {
+        "title": (work.get("title") or work.get("display_name") or "").strip() or None,
+        "year": work.get("publication_year"),
+        "doi": oa.work_doi(work),
+        "arxiv_id": oa.work_arxiv_id(work),
+        "s2_paper_id": None,
+        "openalex_id": oa.work_id(work) or None,
+    }
+
+
+def _merge_citing(s2_list: list[dict], oa_list: list[dict]) -> list[dict]:
+    """Merge S2 and OpenAlex citing-paper dicts, dedup by (doi, arxiv_id, s2_id,
+    openalex_id, normalized title). S2 entries win on conflict (richer fields)."""
+    out: list[dict] = []
+    seen_doi: set[str] = set()
+    seen_arxiv: set[str] = set()
+    seen_s2: set[str] = set()
+    seen_oa: set[str] = set()
+    seen_title: set[str] = set()
+
+    def _add(d: dict) -> bool:
+        doi = (d.get("doi") or "").lower() or None
+        arxiv = d.get("arxiv_id") or None
+        s2id = d.get("s2_paper_id") or None
+        oaid = d.get("openalex_id") or None
+        title = _norm_title(d.get("title"))
+        if doi and doi in seen_doi: return False
+        if arxiv and arxiv in seen_arxiv: return False
+        if s2id and s2id in seen_s2: return False
+        if oaid and oaid in seen_oa: return False
+        if title and title in seen_title: return False
+        if doi: seen_doi.add(doi)
+        if arxiv: seen_arxiv.add(arxiv)
+        if s2id: seen_s2.add(s2id)
+        if oaid: seen_oa.add(oaid)
+        if title: seen_title.add(title)
+        return True
+
+    for d in s2_list:
+        if _add(d):
+            out.append(d)
+    for d in oa_list:
+        if _add(d):
+            out.append(d)
+    return out
+
+
+def _openalex_identifier(paper: Paper) -> str | None:
+    """Pick the best identifier for the OpenAlex `cites:` filter.
+
+    OpenAlex prefers W-ids; for arxiv-only papers we fall back to the arXiv id
+    since OpenAlex's `cites` filter accepts external ids.
+    """
+    if paper.id_kind == "openalex" or paper.id.startswith("W"):
+        return paper.id
+    if paper.doi:
+        return oa.work_doi({"doi": paper.doi}) or paper.doi
+    if paper.arxiv_id:
+        return paper.arxiv_id
+    return None
 
 
 def enrich_paper(
@@ -71,29 +147,44 @@ def enrich_paper(
         limit=limit,
     )
 
+    # OpenAlex merge — best-effort, never blocks the S2 result from being saved.
+    oa_works: list[dict] = []
+    oa_id = _openalex_identifier(paper)
+    if oa_id:
+        try:
+            oa_works = oa.fetch_citing_works(oa_id, limit=_OPENALEX_CITES_LIMIT)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("openalex citing fetch failed for %s: %s", paper.id, e)
+    oa_citing = [_openalex_to_citing(w) for w in oa_works]
+
     now = datetime.now(UTC)
-    if result is None:
-        # S2 has no record; stamp so we don't keep retrying.
+    if result is None and not oa_citing:
+        # Neither source has a record; stamp so we don't keep retrying.
         paper.citations_updated_at = now
         session.add(paper)
         session.commit()
-        _progress("Not found on Semantic Scholar", paper_id=paper.id)
+        _progress("Not found on Semantic Scholar or OpenAlex", paper_id=paper.id)
         return False
 
-    paper.s2_paper_id = result.s2_paper_id or paper.s2_paper_id
-    paper.citation_count = result.citation_count
-    paper.influential_citation_count = result.influential_count
-    paper.reference_count = result.reference_count
-    paper.citing_papers = result.citing_papers
+    s2_list = result.citing_papers if result is not None else []
+    merged = _merge_citing(s2_list, oa_citing)
+
+    if result is not None:
+        paper.s2_paper_id = result.s2_paper_id or paper.s2_paper_id
+        # S2 count is authoritative when present; bump to OA page-count if higher.
+        paper.citation_count = max(result.citation_count or 0, len(oa_citing)) or result.citation_count
+        paper.influential_citation_count = result.influential_count
+        paper.reference_count = result.reference_count
+    else:
+        # No S2 result — fall back to OA page count as a lower bound.
+        paper.citation_count = len(oa_citing)
+    paper.citing_papers = merged
     paper.citations_updated_at = now
     session.add(paper)
     session.commit()
 
-    n = len(result.citing_papers)
-    _progress(
-        f"{result.citation_count if result.citation_count is not None else n} citations",
-        paper_id=paper.id,
-    )
+    total = paper.citation_count if paper.citation_count is not None else len(merged)
+    _progress(f"{total} citations ({len(merged)} listed)", paper_id=paper.id)
     return True
 
 

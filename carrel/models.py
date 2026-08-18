@@ -10,12 +10,13 @@ from enum import Enum
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, Date, DateTime, Index, String, Text
+from sqlalchemy import Column, Date, DateTime, Index, Text
 from sqlmodel import JSON, Field, SQLModel
 
 # Make the Vector column a no-op on non-PostgreSQL dialects (so M1 can run
-# against SQLite for smoke testing). On PostgreSQL it is a real vector column.
-VectorType = Vector(2048).with_variant(String(), "sqlite")
+# against SQLite for smoke testing). On PostgreSQL it is a real vector column;
+# on SQLite we use JSON so lists round-trip through sqlite3.
+VectorType = Vector(2048).with_variant(JSON(), "sqlite")
 
 
 # ------------------ Enums (stored as VARCHAR) ------------------

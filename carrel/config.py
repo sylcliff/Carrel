@@ -74,6 +74,8 @@ class EmbeddingsConfig(BaseModel):
     provider: str = "volcengine"
     model: str = "volcengine/doubao-embedding-large-text-240915"
     dim: int = 2048
+    request_timeout_seconds: int = 60
+    batch_size: int = 50
 
 
 class DownloadConfig(BaseModel):

@@ -2,9 +2,21 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { listPapers, getHealth, triggerSync, processPending, listSubscriptions, type Health, type PaperSummary, type Subscription } from "@/api/client";
+import {
+  embedPending,
+  getHealth,
+  listPapers,
+  listSubscriptions,
+  processPending,
+  triggerSync,
+  type Health,
+  type PaperSummary,
+  type Subscription,
+} from "@/api/client";
 import { StatusDot } from "@/components/StatusDot";
 import { TaskList } from "@/components/TaskList";
+import { OaBadge } from "@/components/OaBadge";
+import { TopJournalSection } from "@/components/TopJournalSection";
 
 export default function Home() {
   const [health, setHealth] = useState<Health | null>(null);
@@ -12,6 +24,7 @@ export default function Home() {
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [embedding, setEmbedding] = useState(false);
   const [lastSync, setLastSync] = useState<{ fetched: number; new: number; updated: number; subscriptions: number } | null>(null);
   const [taskNonce, setTaskNonce] = useState(0);
   const [err, setErr] = useState<string | null>(null);
@@ -65,6 +78,19 @@ export default function Home() {
     }
   }
 
+  async function onEmbedPending() {
+    setEmbedding(true);
+    setErr(null);
+    try {
+      await embedPending(20, true);
+      setTaskNonce((n) => n + 1);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setEmbedding(false);
+    }
+  }
+
   const today = papers.filter((p) => {
     if (!p.publication_date) return false;
     const d = new Date(p.publication_date);
@@ -86,6 +112,9 @@ export default function Home() {
         <div className="flex gap-2">
           <Button onClick={onProcessPending} disabled={processing} variant="outline">
             {processing ? "Queuing…" : "Process pending"}
+          </Button>
+          <Button onClick={onEmbedPending} disabled={embedding} variant="outline">
+            {embedding ? "Queuing…" : "Embed parsed"}
           </Button>
           <Button onClick={onSync} disabled={syncing}>
             {syncing ? "Syncing…" : "Sync now (72h)"}
@@ -161,7 +190,7 @@ export default function Home() {
                       {p.citation_count !== null && p.citation_count !== undefined && (
                         <span title="Citations (Semantic Scholar)">🏆 {p.citation_count}</span>
                       )}
-                      <span>{p.status}</span>
+                      <OaBadge oaStatus={p.oa_status} status={p.status} />
                     </div>
                   </CardContent>
                 </Card>
@@ -169,34 +198,7 @@ export default function Home() {
             </div>
           </section>
 
-          <section>
-            <h2 className="mb-3 text-lg font-semibold">
-              Library <span className="text-sm font-normal text-muted-foreground">({papers.length})</span>
-            </h2>
-            <div className="grid gap-3">
-              {papers.slice(0, 10).map((p, i) => (
-                <Card key={p.id}>
-                  <CardContent className="flex items-start gap-3 p-4">
-                    <div className="pt-1.5"><StatusDot s={p.status} /></div>
-                    <span className="w-7 shrink-0 select-none pt-1 text-right text-sm tabular-nums text-muted-foreground">
-                      {i + 1}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
-                        {p.title}
-                      </Link>
-                      <div className="text-xs text-muted-foreground">
-                        {p.venue ?? p.source}{p.publication_date && <> · {p.publication_date}</>}
-                      </div>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-            <div className="mt-3 text-sm">
-              <Link to="/library" className="underline">View full library →</Link>
-            </div>
-          </section>
+          <TopJournalSection />
         </div>
 
         <aside className="min-w-0 lg:sticky lg:top-6 lg:self-start">

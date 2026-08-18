@@ -103,6 +103,28 @@ def lookup_by_doi(doi: str) -> dict[str, Any] | None:
     return dict(w) if w else None
 
 
+def fetch_citing_works(
+    identifier: str,
+    *,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return works that cite `identifier` (OpenAlex W-id, DOI, or arXiv id).
+
+    The OpenAlex `cites` filter accepts any of those forms. Returned dicts are
+    raw Work records (same shape as ``fetch_recent_by_*``); callers normalize
+    to the schema they need.
+    """
+    identifier = (identifier or "").strip()
+    if not identifier:
+        return []
+    try:
+        results = Works().filter(cites=identifier).get(per_page=min(limit, 200))
+    except Exception as e:
+        logger.warning("OpenAlex cites=%s fetch failed: %s", identifier, e)
+        return []
+    return [dict(w) for w in results]
+
+
 # ---------------------------------------------------------------------------
 # Recent papers by author / venue / keyword
 # ---------------------------------------------------------------------------

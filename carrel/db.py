@@ -52,6 +52,17 @@ def init_db(engine: Engine) -> None:
             conn.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector;")
     SQLModel.metadata.create_all(engine)
 
+    # HNSW index for cosine similarity over chunk embeddings. Built once at
+    # startup (IF NOT EXISTS makes it idempotent). ponytail: no IVFFLAT lists
+    # tuning — HNSW defaults (m=16, ef_construction=64) are fine for <100k
+    # chunks; revisit if recall drops or build time grows.
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_chunks_embedding_hnsw "
+                "ON chunks USING hnsw (embedding vector_cosine_ops)"
+            )
+
 
 def get_session_factory(engine: Engine) -> type[Session]:
     # SQLModel's Session is a thin wrapper; we just bind a default.

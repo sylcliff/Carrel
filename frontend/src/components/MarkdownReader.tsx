@@ -25,7 +25,7 @@ export default function MarkdownReader({
   mdPath: string | null;
 }) {
   return (
-    <div className="md-body">
+    <div className="md-body text-justify">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeCitations, rehypeKatex]}

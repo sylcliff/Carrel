@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { createSubscription, deleteSubscription, listSubscriptions, type Subscription } from "@/api/client";
+import { addTopJournals, createSubscription, deleteSubscription, listSubscriptions, type Subscription } from "@/api/client";
 
 const KINDS: { value: Subscription["kind"]; label: string; placeholder: string; help: string }[] = [
   { value: "keyword", label: "Keyword", placeholder: "retrieval augmented generation", help: "Searches arXiv and OpenAlex" },
@@ -44,6 +44,19 @@ export default function Subscriptions() {
     }
   }
 
+  async function onAddTopJournals() {
+    setBusy(true);
+    setErr(null);
+    try {
+      await addTopJournals();
+      await refresh();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onDelete(id: number) {
     setBusy(true);
     try {
@@ -59,12 +72,27 @@ export default function Subscriptions() {
   const current = KINDS.find((k) => k.value === kind)!;
 
   return (
-    <main className="container max-w-3xl space-y-6 py-8">
+    <main className="container space-y-6 py-8">
       <h1 className="text-2xl font-bold">Subscriptions</h1>
       <p className="text-sm text-muted-foreground">
         Tell Carrel what you want it to fetch. You can mix keywords, arXiv categories,
         authors, and venues — all run on every sync.
       </p>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Quick add: top journals</CardTitle>
+        </CardHeader>
+        <CardContent className="flex items-center justify-between gap-4">
+          <p className="text-xs text-muted-foreground">
+            One-click subscribe to Nature, Cell, and Science. Open-access papers get
+            downloaded and parsed; the rest are stored with title + abstract.
+          </p>
+          <Button variant="outline" onClick={onAddTopJournals} disabled={busy}>
+            Add Nature / Cell / Science
+          </Button>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

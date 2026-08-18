@@ -13,6 +13,54 @@ from carrel.schemas import SubscriptionIn, SubscriptionOut
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
 
+# Curated "top journals" one-click subscription. IDs resolved via OpenAlex
+# Sources search; verify with `openalex_client.search_venues(name)` if needed.
+TOP_JOURNALS: list[tuple[str, str]] = [
+    ("S137773608", "Nature"),
+    ("S110447773", "Cell"),
+    ("S3880285", "Science"),
+]
+
+
+@router.post("/top-journals", response_model=list[SubscriptionOut])
+def add_top_journals(session: Session = Depends(get_session_dep)) -> list[SubscriptionOut]:
+    """One-click add Nature / Cell / Science. Skips ones already subscribed."""
+    out: list[SubscriptionOut] = []
+    for source_id, label in TOP_JOURNALS:
+        existing = session.exec(
+            select(Subscription).where(
+                Subscription.kind == "venue",
+                Subscription.value == source_id,
+            )
+        ).first()
+        if existing:
+            out.append(_to_out(existing))
+            continue
+        row = Subscription(
+            kind="venue",
+            value=source_id,
+            label=label,
+            enabled=True,
+            created_at=datetime.now(UTC),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        out.append(_to_out(row))
+    return out
+
+
+def _to_out(r: Subscription) -> SubscriptionOut:
+    return SubscriptionOut(
+        id=r.id or 0,
+        kind=r.kind,
+        value=r.value,
+        label=r.label,
+        enabled=r.enabled,
+        created_at=r.created_at,
+    )
+
+
 @router.get("", response_model=list[SubscriptionOut])
 def list_subscriptions(session: Session = Depends(get_session_dep)) -> list[SubscriptionOut]:
     rows = session.exec(select(Subscription).order_by(Subscription.id)).all()

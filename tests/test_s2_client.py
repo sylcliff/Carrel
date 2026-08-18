@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-
 from carrel.sources import semanticscholar_client as s2
 from carrel.sources.semanticscholar_client import S2Error, fetch_citations
 

@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
 import {
+  embedPaper,
   getJob,
   getPaper,
   getPaperMarkdown,
@@ -65,6 +66,29 @@ export default function PaperDetail({ onProcessed }: Props) {
     return () => window.clearInterval(id2);
   }, [processing]);
 
+  function watchJob(firstJob: Job) {
+    setJob(firstJob);
+    timer.current = window.setInterval(async () => {
+      try {
+        const j = await getJob(firstJob.id);
+        setJob(j);
+        if (TERMINAL.has(j.status)) {
+          if (timer.current) window.clearInterval(timer.current);
+          setProcessing(false);
+          if (j.status === "failed") {
+            setErr(j.message || "Job failed");
+          }
+          await load();
+          onProcessed?.();
+        }
+      } catch (e) {
+        if (timer.current) window.clearInterval(timer.current);
+        setProcessing(false);
+        setErr(String(e));
+      }
+    }, 1500);
+  }
+
   async function onParse() {
     if (!id) return;
     setProcessing(true);
@@ -74,26 +98,23 @@ export default function PaperDetail({ onProcessed }: Props) {
       const started = await processPaper(id, true);
       const firstJob = started[0];
       if (!firstJob) throw new Error("No job returned");
-      setJob(firstJob);
-      timer.current = window.setInterval(async () => {
-        try {
-          const j = await getJob(firstJob.id);
-          setJob(j);
-          if (TERMINAL.has(j.status)) {
-            if (timer.current) window.clearInterval(timer.current);
-            setProcessing(false);
-            if (j.status === "failed") {
-              setErr(j.message || "Processing failed");
-            }
-            await load();
-            onProcessed?.();
-          }
-        } catch (e) {
-          if (timer.current) window.clearInterval(timer.current);
-          setProcessing(false);
-          setErr(String(e));
-        }
-      }, 1500);
+      watchJob(firstJob);
+    } catch (e) {
+      setProcessing(false);
+      setErr(String(e));
+    }
+  }
+
+  async function onEmbed() {
+    if (!id) return;
+    setProcessing(true);
+    setErr(null);
+    setJob(null);
+    try {
+      const started = await embedPaper(id, true);
+      const firstJob = started[0];
+      if (!firstJob) throw new Error("No job returned");
+      watchJob(firstJob);
     } catch (e) {
       setProcessing(false);
       setErr(String(e));
@@ -115,7 +136,12 @@ export default function PaperDetail({ onProcessed }: Props) {
     );
 
   const canParse =
-    Boolean(p.pdf_url) && p.status !== "parsed" && p.status !== "summarized";
+    Boolean(p.pdf_url) && p.status !== "parsed" && p.status !== "summarized" && p.status !== "ready";
+  // Embed is available when the paper is parsed/summarized but not yet ready,
+  // or when a previous embed failed.
+  const canEmbed =
+    p.status === "parsed" || p.status === "summarized" ||
+    (p.status === "failed" && Boolean(p.md_path));
   const stage = (job?.stats?.stage as string | undefined) ?? "";
   const detail = (job?.stats?.detail as string | undefined) ?? job?.message ?? "";
   const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
@@ -174,6 +200,11 @@ export default function PaperDetail({ onProcessed }: Props) {
                 : "Download & parse"}
           </Button>
         )}
+        {canEmbed && (
+          <Button onClick={onEmbed} disabled={running} variant="outline">
+            {running ? "Embedding…" : "Chunk & embed"}
+          </Button>
+        )}
         {p.pdf_url && (
           <Button
             variant="outline"
@@ -192,7 +223,7 @@ export default function PaperDetail({ onProcessed }: Props) {
         )}
       </div>
 
-      <CitationsCard paper={p} onChanged={load} />
+
 
       {running && (
         <Card>
@@ -218,7 +249,7 @@ export default function PaperDetail({ onProcessed }: Props) {
       {job?.status === "done" && !err && (
         <Card>
           <CardContent className="pt-5 text-sm text-green-700">
-            Parsed successfully.
+            {job.kind === "embed" ? "Embedded successfully." : "Parsed successfully."}
           </CardContent>
         </Card>
       )}
@@ -262,6 +293,8 @@ export default function PaperDetail({ onProcessed }: Props) {
           </CardContent>
         </Card>
       )}
+
+      <CitationsCard paper={p} onChanged={load} />
     </main>
   );
 }

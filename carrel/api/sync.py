@@ -92,9 +92,16 @@ def _run_in_background(job_id: int, lookback_hours: int) -> None:
 @router.get("/jobs", response_model=list[JobOut])
 def list_jobs(
     session: Session = Depends(get_session_dep),
-    limit: int = 50,
+    limit: int = 200,
+    kind: str | None = None,
+    status: str | None = None,
 ) -> list[JobOut]:
-    rows = session.exec(select(Job).order_by(Job.id.desc()).limit(limit)).all()
+    stmt = select(Job).order_by(Job.id.desc()).limit(limit)
+    if kind:
+        stmt = stmt.where(Job.kind == kind)
+    if status:
+        stmt = stmt.where(Job.status == status)
+    rows = session.exec(stmt).all()
     return [_to_out(r) for r in rows]
 
 

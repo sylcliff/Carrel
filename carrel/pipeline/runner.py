@@ -71,13 +71,22 @@ def fetch_candidates(
     subs: list[Subscription],
     *,
     lookback_hours: int = 24,
-) -> list[PaperRecord]:
-    """Run all enabled subscriptions and return deduped PaperRecord list."""
+) -> tuple[list[PaperRecord], dict[str, str]]:
+    """Run all enabled subscriptions and return (records, per_source_errors).
+
+    Per-source errors are collected, not raised, so a single upstream failure
+    (e.g. arXiv 429/503) does not kill the rest of the sync. The caller can
+    surface them in job stats.
+    """
     oa.configure(cfg)
     since = datetime.now(UTC) - timedelta(hours=lookback_hours)
     keywords, authors, venues, arxiv_cats = partition_subscriptions(subs)
 
     records: dict[str, PaperRecord] = {}  # keyed by normalized id
+
+    # ponytail: isolate each source so a single upstream failure (e.g. arXiv
+    # 429/503, OpenAlex rate-limit) doesn't kill the whole sync.
+    errors: dict[str, str] = {}
 
     # --- arXiv category + keyword subscriptions --------------------------------
     # Categories and keywords are independent subscription types: a keyword
@@ -86,33 +95,48 @@ def fetch_candidates(
     arxiv_cats_str = [s.value for s in arxiv_cats]
     arxiv_queries = [s.value for s in keywords]
     if arxiv_cats_str:
-        entries = arxiv_src.fetch_recent(
-            lookback_hours=lookback_hours,
-            categories=arxiv_cats_str,
-            max_results=cfg.arxiv.max_results_per_query,
-            timeout=cfg.arxiv.request_timeout_seconds,
-            delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-        )
+        try:
+            entries = arxiv_src.fetch_recent(
+                lookback_hours=lookback_hours,
+                categories=arxiv_cats_str,
+                max_results=cfg.arxiv.max_results_per_query,
+                timeout=cfg.arxiv.request_timeout_seconds,
+                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+            )
+        except Exception as e:  # noqa: BLE001 - log and continue
+            logger.warning("arxiv category fetch failed: %s", e)
+            errors["arxiv_categories"] = f"{type(e).__name__}: {e}"
+            entries = []
         for e in entries:
             rec = enrich_with_openalex(from_arxiv(e))
             _merge_record(records, rec)
     if arxiv_queries:
-        entries = arxiv_src.fetch_recent(
-            lookback_hours=lookback_hours,
-            queries=arxiv_queries,
-            max_results=cfg.arxiv.max_results_per_query,
-            timeout=cfg.arxiv.request_timeout_seconds,
-            delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-        )
+        try:
+            entries = arxiv_src.fetch_recent(
+                lookback_hours=lookback_hours,
+                queries=arxiv_queries,
+                max_results=cfg.arxiv.max_results_per_query,
+                timeout=cfg.arxiv.request_timeout_seconds,
+                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("arxiv keyword fetch failed: %s", e)
+            errors["arxiv_keywords"] = f"{type(e).__name__}: {e}"
+            entries = []
         for e in entries:
             rec = enrich_with_openalex(from_arxiv(e))
             _merge_record(records, rec)
 
     # --- OpenAlex: author subscriptions -----------------------------------------
     for s in authors:
-        works = oa.fetch_recent_by_author(
-            s.value, since=since, max_results=50
-        )
+        try:
+            works = oa.fetch_recent_by_author(
+                s.value, since=since, max_results=50
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("openalex author fetch failed for %s: %s", s.value, e)
+            errors[f"openalex_author:{s.value}"] = f"{type(e).__name__}: {e}"
+            works = []
         for w in works:
             rec = from_openalex(w)
             if rec is not None:
@@ -120,9 +144,14 @@ def fetch_candidates(
 
     # --- OpenAlex: venue subscriptions ------------------------------------------
     for s in venues:
-        works = oa.fetch_recent_by_venue(
-            s.value, since=since, max_results=100
-        )
+        try:
+            works = oa.fetch_recent_by_venue(
+                s.value, since=since, max_results=100
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("openalex venue fetch failed for %s: %s", s.value, e)
+            errors[f"openalex_venue:{s.value}"] = f"{type(e).__name__}: {e}"
+            works = []
         for w in works:
             rec = from_openalex(w)
             if rec is not None:
@@ -131,13 +160,18 @@ def fetch_candidates(
     # --- OpenAlex: keyword subscriptions (in addition to arXiv) ---------------
     keyword_strs = {s.value for s in keywords}
     for q in keyword_strs:
-        works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
+        try:
+            works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("openalex keyword fetch failed for %s: %s", q, e)
+            errors[f"openalex_keyword:{q}"] = f"{type(e).__name__}: {e}"
+            works = []
         for w in works:
             rec = from_openalex(w)
             if rec is not None:
                 _merge_record(records, rec)
 
-    return list(records.values())
+    return list(records.values()), errors
 
 
 def _merge_record(records: dict[str, PaperRecord], rec: PaperRecord) -> None:
@@ -298,11 +332,13 @@ def run_sync(
     logger.info("sync start: subs=%d lookback_h=%d", len(subs), lookback_hours)
 
     try:
-        records = fetch_candidates(cfg, subs, lookback_hours=lookback_hours)
+        records, fetch_errors = fetch_candidates(cfg, subs, lookback_hours=lookback_hours)
         logger.info("fetched %d candidate records", len(records))
         counts = upsert_records(session, records)
         counts["fetched"] = len(records)
         counts["subscriptions"] = len(subs)
+        if fetch_errors:
+            counts["source_errors"] = fetch_errors
 
         # Best-effort citation enrichment for newly inserted papers. Failures
         # here (rate limits, S2 downtime) must not fail the whole sync.

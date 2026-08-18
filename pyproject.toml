@@ -20,6 +20,7 @@ dependencies = [
     "pyalex>=0.16",
     "apscheduler>=3.10",
     "python-multipart>=0.0.9",
+    "symspellpy>=6.7",
 ]
 
 [project.optional-dependencies]

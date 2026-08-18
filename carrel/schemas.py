@@ -63,6 +63,7 @@ class CitationItem(BaseModel):
     doi: str | None = None
     arxiv_id: str | None = None
     s2_paper_id: str | None = None
+    openalex_id: str | None = None
     in_library: bool = False
     paper_id: str | None = None  # Carrel Paper.id when in_library
 
@@ -73,12 +74,71 @@ class CitationListOut(BaseModel):
     influential_citation_count: int | None = None
     reference_count: int | None = None
     updated_at: datetime | None = None
-    truncated: bool = False  # stored list hit the citations_limit cap
+    truncated: bool = False  # true when more pages are available
     citing: list[CitationItem] = []
+    next_offset: int | None = None  # absolute offset for the next page; null = end
+    source: str = "cache"  # "cache" (sorted DB list) or "openalex" (live page)
+    cached_count: int = 0  # size of the in-DB citation list at request time
 
 
 class CitationRefreshRequest(BaseModel):
     background: bool = False
+
+
+# -------- Search (M5) --------
+
+
+class LocalSearchResult(BaseModel):
+    """A library paper matched by the local DB."""
+
+    id: str
+    title: str
+    abstract: str | None = None
+    authors: list[str] = []
+    venue: str | None = None
+    publication_date: str | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+    citation_count: int | None = None
+    status: str | None = None
+    snippet: str | None = None  # abstract excerpt around the match
+
+
+class ExternalSearchResult(BaseModel):
+    """An OpenAlex work not yet in the local library."""
+
+    openalex_id: str
+    title: str
+    abstract: str | None = None
+    authors: list[str] = []
+    venue: str | None = None
+    publication_date: str | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+    citation_count: int | None = None
+    cited_by_url: str | None = None
+    in_library: bool = False
+    library_id: str | None = None
+    pdf_url: str | None = None
+    snippet: str | None = None
+
+
+class SearchResponse(BaseModel):
+    query: str  # the query we actually searched with (post-correction)
+    corrected_from: str | None = None  # original user query if we spell-fixed it
+    local: list[LocalSearchResult] = []
+    external: list[ExternalSearchResult] = []
+
+
+class ImportPaperIn(BaseModel):
+    openalex_id: str | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+
+
+class ImportPaperOut(BaseModel):
+    id: str
+    created: bool  # True if newly inserted, False if already existed
 
 
 # -------- Subscriptions --------
@@ -128,3 +188,45 @@ class ProcessRequest(BaseModel):
     paper_id: str | None = None
     limit: int = 10
     background: bool = False
+
+
+class EmbedRequest(BaseModel):
+    """Trigger chunk + embed for one paper or a batch (M5)."""
+
+    paper_id: str | None = None
+    limit: int = 20
+    background: bool = False
+
+
+# -------- Search (M5) full-text --------
+
+
+class SemanticSearchHit(BaseModel):
+    """One chunk match from the full-text vector index."""
+
+    paper_id: str
+    chunk_index: int
+    heading: str | None = None
+    snippet: str  # matched chunk excerpt (or excerpt around the query)
+    score: float  # cosine similarity, 0..1
+
+
+class SemanticSearchResult(BaseModel):
+    """A library paper with the chunks that matched the query."""
+
+    id: str
+    title: str
+    venue: str | None = None
+    publication_date: str | None = None
+    authors: list[str] = []
+    doi: str | None = None
+    arxiv_id: str | None = None
+    status: str | None = None
+    best_score: float
+    hits: list[SemanticSearchHit] = []  # top-3 chunks per paper
+
+
+class SemanticSearchResponse(BaseModel):
+    query: str  # post-correction query we embedded and searched with
+    corrected_from: str | None = None  # original if spelling was fixed
+    results: list[SemanticSearchResult] = []
