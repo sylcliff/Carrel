@@ -21,13 +21,19 @@ import logging
 import re
 from datetime import date, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import pyalex
+import pyalex.api as _pyalex_api
 from pyalex import Authors, Sources, Works, invert_abstract
 
 from carrel.config import CarrelYAML
 
 logger = logging.getLogger(__name__)
+
+# Saved once so repeated configure() calls don't re-wrap an already wrapped
+# session factory.
+_ORIG_SESSION_FACTORY = _pyalex_api._get_requests_session
 
 
 def configure(cfg: CarrelYAML) -> None:
@@ -37,6 +43,28 @@ def configure(cfg: CarrelYAML) -> None:
     pyalex.config.max_retries = cfg.openalex.max_retries
     pyalex.config.retry_backoff_factor = 0.5
     pyalex.config.retry_http_codes = [429, 500, 503]
+
+    # pyalex's requests session has no timeout, so a hung connection blocks
+    # forever (and retries multiply that into tens of minutes). The YAML defines
+    # request_timeout_seconds but pyalex never reads it; inject it by wrapping
+    # the per-request session factory. Use a (connect, read) tuple so a dead
+    # proxy fails fast on connect while slow-but-live responses get the full
+    # read budget.
+    timeout = cfg.openalex.request_timeout_seconds
+    connect_timeout = min(10, timeout)
+
+    def _timed_session() -> Any:
+        session = _ORIG_SESSION_FACTORY()
+        original_get = session.get
+
+        def get_with_timeout(url: str, **kwargs: Any) -> Any:
+            kwargs.setdefault("timeout", (connect_timeout, timeout))
+            return original_get(url, **kwargs)
+
+        session.get = get_with_timeout
+        return session
+
+    _pyalex_api._get_requests_session = _timed_session
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +247,57 @@ def fetch_recent_by_arxiv_category(
     return [dict(w) for w in results]
 
 
+def search_work(
+    query: str,
+    *,
+    limit: int = 20,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    min_citations: int | None = None,
+    open_access_only: bool = False,
+    sort: str = "relevance",
+) -> list[dict[str, Any]]:
+    """Search OpenAlex Works with faceted filters.
+
+    Assembles one AND-joined filter string:
+      ``from_publication_date`` / ``to_publication_date`` (YYYY-MM-DD),
+      ``is_oa:true``, ``cited_by_count:>N``.
+    ``sort`` maps to ``relevance_score:desc`` / ``cited_by_count:desc`` /
+    ``publication_date:desc``. Returns raw Work dicts; callers extract fields
+    via the ``work_*`` helpers.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    filters: dict[str, Any] = {}
+    if year_from is not None:
+        filters["from_publication_date"] = f"{year_from}-01-01"
+    if year_to is not None:
+        filters["to_publication_date"] = f"{year_to}-12-31"
+    if open_access_only:
+        filters["is_oa"] = "true"
+    if min_citations is not None and min_citations > 0:
+        filters["cited_by_count"] = f">{min_citations}"
+
+    sort_map = {
+        "relevance": {"relevance_score": "desc"},
+        "citations": {"cited_by_count": "desc"},
+        "date": {"publication_date": "desc"},
+    }
+    sort_kwargs = sort_map.get(sort, {"relevance_score": "desc"})
+
+    try:
+        q = Works().search(query)
+        if filters:
+            q = q.filter(**filters)
+        results = q.sort(**sort_kwargs).get(per_page=min(max(limit, 1), 50))
+    except Exception as e:
+        logger.warning("OpenAlex search failed for %r: %s", query, e)
+        return []
+    return [dict(w) for w in results]
+
+
 # ---------------------------------------------------------------------------
 # Autocomplete / search for the subscription editor UI
 # ---------------------------------------------------------------------------
@@ -379,31 +458,84 @@ def work_arxiv_id(work: dict[str, Any] | None) -> str | None:
 
 
 def work_pdf_url(work: dict[str, Any] | None) -> tuple[str | None, str]:
-    """Return (pdf_url, oa_status).
+    """Return (best_pdf_url, oa_status).
 
-    `pdf_url` is only set to a direct PDF URL (best_oa_location.pdf_url, or any
-    OA location's pdf_url) — a landing-page HTML URL is not a PDF and would make
-    the M3 downloader save an HTML page. oa_status is 'oa' only when a direct
-    PDF is available, 'closed' when the work is paywalled, 'none' when it is OA
-    but we could not find a direct PDF (e.g. HTML-only OA).
+    The chosen URL is the highest-ranked of the work's candidate OA PDF URLs
+    (see :func:`work_pdf_candidates`). A landing-page HTML URL is never
+    returned directly; however OpenAlex sometimes mislabels a publisher HTML
+    page as a ``pdf_url`` (e.g. an IOP ``/pdf`` route that serves text/html),
+    so the ranker prefers repository/arXiv copies — which are reliably real
+    PDFs — over publisher URLs. Callers that actually download should still
+    validate by content-type/magic bytes and fall through to the rest of
+    :func:`work_pdf_candidates`.
+
+    oa_status is 'oa' when at least one candidate PDF URL exists, 'closed'
+    when the work is paywalled, and 'none' when it is OA but no direct PDF URL
+    is advertised (HTML-only OA).
+    """
+    candidates = work_pdf_candidates(work)
+    if not candidates:
+        if not work:
+            return None, "none"
+        oa = work.get("open_access") or {}
+        return None, "closed" if not oa.get("is_oa") else "none"
+    return candidates[0], "oa"
+
+
+def work_pdf_candidates(work: dict[str, Any] | None) -> list[str]:
+    """Return all advertised OA PDF URLs for ``work``, best-first and de-duped.
+
+    Ordering: arXiv/repository copies first (canonical, almost always a real
+    PDF and never a publisher landing page), then any other location, with
+    ``best_oa_location`` leading its tier. OpenAlex's ``best_oa_location`` is
+    *not* trusted on its own: for hybrid-OA works it is often the publisher's
+    HTML ``/pdf`` route (which returns ``text/html``), while a perfectly good
+    arXiv PDF sits further down ``locations``. Empty/landing-page-only
+    locations are skipped.
     """
     if not work:
-        return None, "none"
+        return []
+    # Respect OpenAlex's OA flag: a non-OA work should not surface a PDF URL
+    # even if some stray location carries one.
     oa = work.get("open_access") or {}
     if not oa.get("is_oa"):
-        return None, "closed"
+        return []
 
-    best = work.get("best_oa_location") or {}
-    pdf_url = best.get("pdf_url")
-    if not pdf_url:
-        for loc in work.get("locations") or []:
-            if loc.get("pdf_url"):
-                pdf_url = loc["pdf_url"]
-                break
-    if not pdf_url:
-        # OA but HTML-only / landing-page-only — no direct PDF to download.
-        return None, "none"
-    return pdf_url, "oa"
+    raw: list[tuple[str, Any, int]] = []  # (pdf_url, location dict, order)
+    seen: set[str] = set()
+    order = 0
+
+    def _add(loc: Any) -> None:
+        nonlocal order
+        if not isinstance(loc, dict):
+            return
+        url = (loc.get("pdf_url") or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            raw.append((url, loc, order))
+            order += 1
+
+    _add(work.get("best_oa_location"))
+    for loc in work.get("locations") or []:
+        _add(loc)
+
+    if not raw:
+        return []
+
+    def _rank(item: tuple[str, Any, int]) -> tuple[int, int]:
+        url, loc, idx = item
+        host = urlsplit(url).netloc.lower()
+        source = (loc.get("source") or {}) if isinstance(loc, dict) else {}
+        stype = (source.get("type") or "").lower()
+        name = (source.get("display_name") or "").lower()
+        is_arxiv = "arxiv.org" in host or "arxiv" in name
+        is_repo = stype == "repository"
+        # Lower rank wins. arXiv > other repositories > publisher/everything.
+        tier = 0 if is_arxiv else (1 if is_repo else 2)
+        # Within a tier keep insertion order (best_oa_location first).
+        return tier, idx
+
+    return [url for url, _, _ in sorted(raw, key=_rank)]
 
 
 # ---------------------------------------------------------------------------

@@ -86,7 +86,7 @@ def test_semantic_search_groups_multiple_chunks_per_paper(session, client: TestC
 def test_semantic_search_empty_query_returns_empty(session, client: TestClient):
     r = client.get("/search/semantic", params={"q": ""})
     assert r.status_code == 200
-    assert r.json() == {"query": "", "results": []}
+    assert r.json() == {"query": "", "corrected_from": None, "results": []}
 
 
 def test_semantic_search_embedding_failure_returns_empty(session, client: TestClient):

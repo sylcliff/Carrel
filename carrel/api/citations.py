@@ -25,6 +25,7 @@ from carrel.schemas import (
     CitationListOut,
     CitationRefreshRequest,
     JobOut,
+    ReferenceListOut,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +211,55 @@ def list_citations(
 def _norm_title(t: str | None) -> str:
     import re
     return re.sub(r"\s+", " ", (t or "").strip().lower())
+
+
+@router.get("/{paper_id}/references", response_model=ReferenceListOut)
+def list_references(
+    paper_id: str,
+    sort: str | None = None,
+    session: Session = Depends(get_session_dep),
+) -> ReferenceListOut:
+    """List the papers this paper cites (its bibliography).
+
+    Data comes from the cached `paper.references` populated by the citations
+    refresh job. `sort` ∈ {`year_asc`, `year_desc`}; default preserves the
+    Semantic Scholar order (roughly order of first appearance). Library
+    membership is resolved per item so the UI can link / offer Import.
+    """
+    paper = session.get(Paper, paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+
+    if sort not in (None, "", "year_asc", "year_desc"):
+        raise HTTPException(status_code=400, detail=f"unknown sort: {sort}")
+
+    refs = list(paper.references or [])
+    if sort == "year_asc":
+        refs.sort(key=lambda c: (c.get("year") or 9999, _norm_title(c.get("title"))))
+    elif sort == "year_desc":
+        refs.sort(key=lambda c: -(c.get("year") or -9999))
+
+    lib_map = _resolve_library(session, refs)
+    items: list[CitationItem] = []
+    for c in refs:
+        pid = _find_in_library(lib_map, c)
+        items.append(CitationItem(
+            title=c.get("title"),
+            year=c.get("year"),
+            doi=c.get("doi"),
+            arxiv_id=c.get("arxiv_id"),
+            s2_paper_id=c.get("s2_paper_id"),
+            openalex_id=c.get("openalex_id"),
+            in_library=pid is not None,
+            paper_id=pid,
+        ))
+
+    return ReferenceListOut(
+        paper_id=paper.id,
+        reference_count=paper.reference_count,
+        updated_at=paper.citations_updated_at,
+        references=items,
+    )
 
 
 def _fetch_openalex_page(

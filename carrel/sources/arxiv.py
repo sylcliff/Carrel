@@ -60,6 +60,21 @@ def _get_with_retry(
     for attempt in range(max_retries):
         try:
             resp = client.get(url, timeout=timeout)
+            # arXiv sometimes returns 200 OK with a plain-text "Rate exceeded."
+            # body instead of a 429. Treat it like a 429 (retry/backoff).
+            if resp.status_code == 200 and resp.text.lstrip().lower().startswith(
+                "rate exceeded"
+            ):
+                if attempt < max_retries - 1:
+                    wait = base_wait * (2**attempt)
+                    logger.warning("arXiv rate body; sleeping %.0fs (attempt %d)", wait, attempt + 1)
+                    time.sleep(wait)
+                    continue
+                raise httpx.HTTPStatusError(
+                    "arXiv rate limit exceeded (200 body)",
+                    request=resp.request,
+                    response=resp,
+                )
             if resp.status_code == 429 and attempt < max_retries - 1:
                 wait = base_wait * (2**attempt)
                 logger.warning("arXiv 429; sleeping %.0fs (attempt %d)", wait, attempt + 1)
@@ -314,3 +329,49 @@ def fetch_one(arxiv_id: str, *, timeout: int = 15) -> ArxivEntry | None:
     if not entries:
         return None
     return _parse_entry(entries[0])
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc search (used by the /search endpoint)
+# ---------------------------------------------------------------------------
+
+
+def search(
+    query: str,
+    *,
+    limit: int = 20,
+    categories: list[str] | None = None,
+    timeout: int = 30,
+) -> list[ArxivEntry]:
+    """Search arXiv by free-text query with relevance ranking.
+
+    `query` is passed through verbatim, so arXiv advanced syntax
+    (``ti:"..."``, ``au:Name``, ``cat:cs.LG``, ``AND/OR``) is supported.
+    `categories`, when given, ANDs a category filter onto the query. No
+    lookback cutoff — that's subscription-specific and lives in
+    :func:`fetch_recent`.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    if categories:
+        cat_part = _build_category_part(categories, [])
+        if cat_part != "all:all":
+            query = f"({query}) AND ({cat_part})"
+
+    page_size = min(max(limit, 10), 50)
+    with httpx.Client(headers={"User-Agent": ARXIV_USER_AGENT}) as client:
+        try:
+            entries = _one_query(
+                client,
+                search_query=query,
+                page_size=page_size,
+                start=0,
+                sort_by="relevance",
+                timeout=timeout,
+            )
+        except httpx.HTTPError as e:
+            logger.warning("arXiv search failed for %r: %s", query, e)
+            return []
+    return entries[:limit]

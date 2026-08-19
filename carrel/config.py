@@ -42,6 +42,8 @@ class OpenAlexConfig(BaseModel):
     api_key: str | None = None
     request_timeout_seconds: int = 30
     max_retries: int = 3
+    search_enabled: bool = True
+    search_per_page: int = 20
 
 
 class ArxivConfig(BaseModel):
@@ -49,6 +51,8 @@ class ArxivConfig(BaseModel):
     max_retries: int = 3
     max_results_per_query: int = 200
     delay_between_requests_seconds: float = 3.0
+    search_enabled: bool = True
+    search_per_page: int = 20
 
 
 class SemanticScholarConfig(BaseModel):
@@ -59,6 +63,8 @@ class SemanticScholarConfig(BaseModel):
     delay_between_requests_seconds: float = 1.5  # politeness between papers
     citations_limit: int = 500  # cap on stored citing-paper list
     fetch_on_sync: bool = True  # look up citations for newly synced papers
+    search_enabled: bool = True
+    search_per_page: int = 20
 
 
 class LLMConfig(BaseModel):

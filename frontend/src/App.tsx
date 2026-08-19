@@ -10,7 +10,7 @@ import SyncStatus from "@/pages/SyncStatus";
 function Header() {
   return (
     <header className="border-b">
-      <div className="container flex h-14 items-center gap-6">
+      <div className="container max-w-screen-2xl flex h-14 items-center gap-6">
         <Link to="/" className="text-lg font-semibold">
           Carrel
         </Link>

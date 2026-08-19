@@ -25,7 +25,7 @@ from sqlmodel import Session, select
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
 from carrel.sources import mineru_client
-from carrel.sources.pdf_download import download_pdf, safe_paper_dir
+from carrel.sources.pdf_download import download_pdf_with_fallback, safe_paper_dir
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,42 @@ def paper_paths(paper: Paper, cfg: CarrelYAML) -> tuple[Path, Path, Path, str]:
     work_dir = safe_paper_dir(paper.id, root, cfg.storage.papers_subdir)
     rel_prefix = work_dir.relative_to(root).as_posix()
     return work_dir, work_dir / PDF_FILENAME, work_dir / MD_FILENAME, rel_prefix
+
+
+def _pdf_candidates(paper: Paper) -> list[str]:
+    """Build an ordered list of PDF URLs to try for this paper.
+
+    The stored ``paper.pdf_url`` goes first; then any additional candidates
+    extracted from the OpenAlex work cached in ``raw_meta`` (repository/arXiv
+    copies that OpenAlex lists alongside a publisher URL); finally an arXiv PDF
+    as a last resort when the paper has an ``arxiv_id``. OpenAlex sometimes
+    mislabels a publisher HTML page as ``pdf_url``, so the downloader works
+    through this list and keeps the first one that is genuinely a PDF.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(u: str | None) -> None:
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    _add(paper.pdf_url)
+
+    meta = paper.raw_meta or {}
+    work = meta.get("openalex") if isinstance(meta, dict) else None
+    if work is None and isinstance(meta, dict) and "open_access" in meta:
+        work = meta  # pure-OpenAlex record stores the work directly
+
+    if isinstance(work, dict):
+        from carrel.sources import openalex_client as oa
+        for u in oa.work_pdf_candidates(work):
+            _add(u)
+
+    if paper.arxiv_id:
+        _add(f"https://arxiv.org/pdf/{paper.arxiv_id}.pdf")
+
+    return urls
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +165,8 @@ def _step_download(
         raise ProcessError("no PDF URL available (closed access or metadata only)")
 
     dl = cfg.download
-    download_pdf(
-        paper.pdf_url,
+    _path, used_url = download_pdf_with_fallback(
+        _pdf_candidates(paper),
         work_dir,
         filename=PDF_FILENAME,
         timeout=dl.request_timeout_seconds,
@@ -138,6 +174,12 @@ def _step_download(
         user_agent=dl.user_agent,
         client=client,
     )
+    # If a fallback candidate (e.g. an arXiv copy) succeeded where the stored
+    # publisher URL served HTML, remember it so future retries don't repeat the
+    # bad URL.
+    if used_url != paper.pdf_url:
+        logger.info("PDF for %s resolved via fallback %s", paper.id, used_url)
+        paper.pdf_url = used_url
     paper.pdf_path = f"{rel_prefix}/{PDF_FILENAME}"
     paper.status = PaperStatus.pdf_ready.value
     session.add(paper)

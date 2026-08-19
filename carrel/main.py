@@ -15,6 +15,7 @@ from carrel.api import citations, embed, health, papers, process, search, subscr
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
 from carrel.scheduler import start_scheduler, stop_scheduler
+from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
 
 logger = logging.getLogger("carrel")
@@ -56,6 +57,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         api_key=cfg.semantic_scholar.api_key,
         timeout=cfg.semantic_scholar.request_timeout_seconds,
     )
+    # pyalex is configured lazily by the sync pipeline; configure it here too
+    # so /search gets the polite-pool mailto and the connect/read timeout.
+    oa.configure(cfg)
 
     app_config = cfg
     app_env = env

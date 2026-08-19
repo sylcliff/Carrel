@@ -30,17 +30,24 @@ export default function MarkdownReader({
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeCitations, rehypeKatex]}
         components={{
-          a: ({ href, children, ...rest }) => (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary underline underline-offset-2 hover:opacity-80"
-              {...rest}
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children, ...rest }) => {
+            // In-document anchors (citations, figures, sections) must stay in
+            // the same tab so the browser scrolls to the target. Forcing
+            // target=_blank on a "#ref-n" link reopened the current page in a
+            // new window instead of jumping to the reference.
+            const isAnchor = typeof href === "string" && href.startsWith("#");
+            return (
+              <a
+                href={href}
+                target={isAnchor ? undefined : "_blank"}
+                rel={isAnchor ? undefined : "noopener noreferrer"}
+                className="text-primary underline underline-offset-2 hover:opacity-80"
+                {...rest}
+              >
+                {children}
+              </a>
+            );
+          },
           img: ({ src, alt }) => (
             <img
               src={resolveImageSrc(src, mdPath)}

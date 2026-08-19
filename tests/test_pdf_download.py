@@ -6,6 +6,7 @@ import pytest
 from carrel.sources.pdf_download import (
     DownloadError,
     download_pdf,
+    download_pdf_with_fallback,
     looks_like_pdf,
     safe_paper_dir,
 )
@@ -90,3 +91,46 @@ def test_download_rejects_non_200(tmp_path):
 
     with pytest.raises(DownloadError, match="HTTP 404"):
         download_pdf("https://example.org/missing.pdf", tmp_path, client=_client(handler))
+
+
+def test_download_falls_through_to_valid_pdf(tmp_path):
+    # First candidate is a publisher URL that serves an HTML landing page;
+    # the second is a real arXiv PDF. The downloader must keep going and
+    # report which URL actually worked.
+    pdf_bytes = b"%PDF-1.7\nreal pdf\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "iopscience" in request.url.host:
+            return httpx.Response(
+                200, headers={"content-type": "text/html"},
+                content=b"<!doctype html>paywall page</html>",
+            )
+        return httpx.Response(
+            200, headers={"content-type": "application/pdf"}, content=pdf_bytes
+        )
+
+    path, used = download_pdf_with_fallback(
+        [
+            "https://iopscience.iop.org/article/x/pdf",
+            "https://arxiv.org/pdf/2402.09251",
+        ],
+        tmp_path,
+        client=_client(handler),
+    )
+    assert path.read_bytes() == pdf_bytes
+    assert used == "https://arxiv.org/pdf/2402.09251"
+
+
+def test_download_fallback_raises_when_all_fail(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"content-type": "text/html"}, content=b"<html>nope</html>"
+        )
+
+    with pytest.raises(DownloadError, match="no valid PDF among candidates"):
+        download_pdf_with_fallback(
+            ["https://example.org/a", "https://example.org/b"],
+            tmp_path,
+            client=_client(handler),
+        )
+    assert not (tmp_path / "paper.pdf").exists()

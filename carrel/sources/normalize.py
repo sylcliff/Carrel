@@ -94,7 +94,7 @@ def from_openalex(work: dict[str, Any]) -> PaperRecord | None:
     """
     doi = oa.work_doi(work)
     venue = (oa.work_venue(work) or "").strip().lower()
-    if _is_zenodo(doi, venue):
+    if is_zenodo(doi, venue):
         logger.debug(
             "skipping Zenodo work %s (doi=%s venue=%s)",
             oa.work_id(work), doi, oa.work_venue(work),
@@ -128,7 +128,14 @@ def from_openalex(work: dict[str, Any]) -> PaperRecord | None:
     )
 
 
-def _is_zenodo(doi: str | None, venue_lower: str) -> bool:
+def is_zenodo(doi: str | None, venue: str | None) -> bool:
+    """Return True for Zenodo deposits (software/datasets, not papers).
+
+    Matches on the venue name ("Zenodo" or "Zenodo (...)") or a Zenodo DOI
+    prefix (10.5281/zenodo.).
+    """
+    venue_lower = (venue or "").strip().lower()
+
     # OpenAlex returns "Zenodo" or "Zenodo (CERN European Organization for
     # Nuclear Research)" depending on the record; match either.
     if venue_lower == "zenodo" or venue_lower.startswith("zenodo "):
@@ -148,8 +155,9 @@ def _is_zenodo(doi: str | None, venue_lower: str) -> bool:
 
 def enrich_with_openalex(rec: PaperRecord) -> PaperRecord:
     """If the record came from arXiv, try to attach an OpenAlex Work so the
-    rest of the system has a canonical ID, authors with OA IDs, and an OA
-    PDF (publisher-deposited, often better quality than arXiv's)."""
+    rest of the system has a canonical ID, authors with OA IDs, and a
+    canonical PDF. ``work_pdf_url`` prefers repository/arXiv copies, since
+    publisher ``pdf_url`` values sometimes serve HTML landing pages."""
     if rec.id_kind != "arxiv" or not rec.arxiv_id:
         return rec
 

@@ -72,7 +72,7 @@ export default function Subscriptions() {
   const current = KINDS.find((k) => k.value === kind)!;
 
   return (
-    <main className="container space-y-6 py-8">
+    <main className="container max-w-screen-2xl space-y-6 py-8">
       <h1 className="text-2xl font-bold">Subscriptions</h1>
       <p className="text-sm text-muted-foreground">
         Tell Carrel what you want it to fetch. You can mix keywords, arXiv categories,

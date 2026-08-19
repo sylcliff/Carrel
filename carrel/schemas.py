@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # -------- Health / meta --------
 
@@ -85,55 +85,66 @@ class CitationRefreshRequest(BaseModel):
     background: bool = False
 
 
+class ReferenceListOut(BaseModel):
+    paper_id: str
+    reference_count: int | None = None
+    updated_at: datetime | None = None
+    references: list[CitationItem] = []
+
+
 # -------- Search (M5) --------
 
 
-class LocalSearchResult(BaseModel):
-    """A library paper matched by the local DB."""
+class SearchResultIds(BaseModel):
+    """Every identifier we know for a paper across sources. All optional."""
 
-    id: str
-    title: str
-    abstract: str | None = None
-    authors: list[str] = []
-    venue: str | None = None
-    publication_date: str | None = None
+    openalex: str | None = None
     doi: str | None = None
-    arxiv_id: str | None = None
-    citation_count: int | None = None
-    status: str | None = None
-    snippet: str | None = None  # abstract excerpt around the match
+    arxiv: str | None = None
+    s2: str | None = None
 
 
-class ExternalSearchResult(BaseModel):
-    """An OpenAlex work not yet in the local library."""
+class SearchResultItem(BaseModel):
+    """One paper in a merged /search response.
 
-    openalex_id: str
+    ``sources`` lists which backends contributed this row — any subset of
+    ``"library" | "openalex" | "semantic_scholar" | "arxiv"`` — so the UI can
+    render badges and filter client-side. When ``in_library`` is True,
+    ``library_id`` is the Carrel Paper.id for navigation and ``status`` its
+    pipeline status.
+    """
+
     title: str
-    abstract: str | None = None
     authors: list[str] = []
+    abstract: str | None = None
     venue: str | None = None
+    venue_type: str | None = None
     publication_date: str | None = None
-    doi: str | None = None
-    arxiv_id: str | None = None
     citation_count: int | None = None
-    cited_by_url: str | None = None
-    in_library: bool = False
-    library_id: str | None = None
+    tldr: str | None = None
     pdf_url: str | None = None
     snippet: str | None = None
+    ids: SearchResultIds = Field(default_factory=SearchResultIds)
+    sources: list[str] = []
+    in_library: bool = False
+    library_id: str | None = None
+    status: str | None = None
 
 
 class SearchResponse(BaseModel):
     query: str  # the query we actually searched with (post-correction)
     corrected_from: str | None = None  # original user query if we spell-fixed it
-    local: list[LocalSearchResult] = []
-    external: list[ExternalSearchResult] = []
+    results: list[SearchResultItem] = []
+    # Per-source soft failures: strings like "semantic_scholar: timeout". Empty
+    # when all sources responded.
+    warnings: list[str] = []
 
 
 class ImportPaperIn(BaseModel):
     openalex_id: str | None = None
     doi: str | None = None
     arxiv_id: str | None = None
+    s2: str | None = None
 
 
 class ImportPaperOut(BaseModel):

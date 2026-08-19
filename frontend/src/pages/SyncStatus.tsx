@@ -116,7 +116,7 @@ export default function SyncStatus() {
   }, [jobs, failed]);
 
   return (
-    <main className="container py-8">
+    <main className="container max-w-screen-2xl py-8">
       <section className="flex items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold">Sync status</h1>

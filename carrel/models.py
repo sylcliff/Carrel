@@ -100,12 +100,14 @@ class Paper(SQLModel, table=True):
 
     # Citations (Semantic Scholar). `citing_papers` is a capped list of
     # {title, year, doi, arxiv_id, s2_paper_id}; the authoritative count is
-    # `citation_count` (may exceed the stored list length).
+    # `citation_count` (may exceed the stored list length). `references` is
+    # the papers this paper cites (its bibliography), same item shape.
     s2_paper_id: str | None = Field(default=None, index=True, max_length=64)
     citation_count: int | None = None
     influential_citation_count: int | None = None
     reference_count: int | None = None
     citing_papers: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
+    references: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
     citations_updated_at: datetime | None = Field(
         default=None, sa_column=Column(DateTime(timezone=True))
     )

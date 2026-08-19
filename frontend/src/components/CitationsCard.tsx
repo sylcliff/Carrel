@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+
 import { Link } from "react-router-dom";
-import { ChevronDown, ChevronRight, ExternalLink, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import CitationRowActions from "@/components/CitationRowActions";
 import {
   getJob,
   getPaperCitations,
   refreshPaperCitations,
   type CitationItem,
-  type CitationList,
   type Job,
   type PaperDetail,
 } from "@/api/client";
@@ -50,7 +51,6 @@ export default function CitationsCard({ paper, onChanged }: Props) {
   const [err, setErr] = useState<string | null>(null);
   const [pageSource, setPageSource] = useState<"cache" | "openalex" | "">("");
   const pollTimer = useRef<number | null>(null);
-  const pageInputRef = useRef<HTMLInputElement | null>(null);
 
   const count = paper.citation_count;
   const influential = paper.influential_citation_count;
@@ -247,34 +247,43 @@ export default function CitationsCard({ paper, onChanged }: Props) {
                 return (
                   <li
                     key={`${c.s2_paper_id ?? c.openalex_id ?? c.doi ?? i}`}
-                    className="text-sm leading-snug"
+                    className="flex items-baseline text-sm leading-snug"
                   >
-                    {c.in_library && c.paper_id ? (
-                      <Link
-                        to={`/papers/${encodeURIComponent(c.paper_id)}`}
-                        className="font-medium text-foreground underline-offset-2 hover:underline"
-                      >
-                        {title}
-                      </Link>
-                    ) : url ? (
-                      <a
-                        href={url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="font-medium text-foreground underline-offset-2 hover:underline"
-                      >
-                        {title}
-                      </a>
-                    ) : (
-                      <span className="font-medium">{title}</span>
-                    )}
-                    <span className="ml-2 text-xs text-muted-foreground">
-                      {c.year ?? "—"}
-                      {c.in_library ? " · in your library" : ""}
+                    <span className="min-w-0 flex-1">
+                      {c.in_library && c.paper_id ? (
+                        <Link
+                          to={`/papers/${encodeURIComponent(c.paper_id)}`}
+                          className="font-medium text-foreground underline-offset-2 hover:underline"
+                        >
+                          {title}
+                        </Link>
+                      ) : url ? (
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-medium text-foreground underline-offset-2 hover:underline"
+                        >
+                          {title}
+                        </a>
+                      ) : (
+                        <span className="font-medium">{title}</span>
+                      )}
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {c.year ?? "—"}
+                      </span>
                     </span>
-                    {url && !c.in_library && (
-                      <ExternalLink className="ml-1 inline h-3 w-3 text-muted-foreground" />
-                    )}
+                    <CitationRowActions
+                      item={c}
+                      onImported={(pid) => {
+                        setItems((prev) =>
+                          prev.map((it) =>
+                            it === c ? { ...it, in_library: true, paper_id: pid } : it,
+                          ),
+                        );
+                        onChanged?.();
+                      }}
+                    />
                   </li>
                 );
               })}

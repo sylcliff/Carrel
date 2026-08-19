@@ -92,6 +92,38 @@ def _merge_citing(s2_list: list[dict], oa_list: list[dict]) -> list[dict]:
     return out
 
 
+def _dedup_simple(items: list[dict]) -> list[dict]:
+    """Drop duplicate reference rows by doi / arxiv / s2 id / normalized title."""
+    out: list[dict] = []
+    seen_doi: set[str] = set()
+    seen_arxiv: set[str] = set()
+    seen_s2: set[str] = set()
+    seen_title: set[str] = set()
+    for d in items:
+        doi = (d.get("doi") or "").lower() or None
+        arxiv = d.get("arxiv_id") or None
+        s2id = d.get("s2_paper_id") or None
+        title = _norm_title(d.get("title"))
+        if doi and doi in seen_doi:
+            continue
+        if arxiv and arxiv in seen_arxiv:
+            continue
+        if s2id and s2id in seen_s2:
+            continue
+        if title and title in seen_title:
+            continue
+        if doi:
+            seen_doi.add(doi)
+        if arxiv:
+            seen_arxiv.add(arxiv)
+        if s2id:
+            seen_s2.add(s2id)
+        if title:
+            seen_title.add(title)
+        out.append(d)
+    return out
+
+
 def _openalex_identifier(paper: Paper) -> str | None:
     """Pick the best identifier for the OpenAlex `cites:` filter.
 
@@ -175,6 +207,8 @@ def enrich_paper(
         paper.citation_count = max(result.citation_count or 0, len(oa_citing)) or result.citation_count
         paper.influential_citation_count = result.influential_count
         paper.reference_count = result.reference_count
+        # References only come from S2; no OpenAlex equivalent to merge.
+        paper.references = _dedup_simple(result.referenced_papers)
     else:
         # No S2 result — fall back to OA page count as a lower bound.
         paper.citation_count = len(oa_citing)

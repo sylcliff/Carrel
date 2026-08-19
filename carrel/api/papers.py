@@ -1,12 +1,18 @@
-"""Paper list and detail endpoints. Read-only for M1."""
+"""Paper list, detail, and deletion endpoints."""
 from __future__ import annotations
+
+import logging
+import shutil
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session, select
 
 from carrel.db import get_session_dep
-from carrel.models import Paper
+from carrel.models import Chunk, Paper
 from carrel.schemas import PaperDetail, PaperSummary
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/papers", tags=["papers"])
 
@@ -83,6 +89,54 @@ def get_paper(
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
     return _to_detail(p)
+
+
+@router.delete("/{paper_id}")
+def delete_paper(
+    paper_id: str,
+    session: Session = Depends(get_session_dep),
+) -> dict[str, object]:
+    """Delete a paper: its chunks, DB row, and files on disk.
+
+    The chunks table has no ON DELETE CASCADE, so related rows are removed
+    explicitly. Disk cleanup is best-effort — a missing directory must not
+    block the DB deletion. Only the paper's own directory under the storage
+    papers subdir is removed.
+    """
+    p = session.get(Paper, paper_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+
+    # The chunks FK has no ON DELETE CASCADE; remove related rows explicitly.
+    chunks = session.exec(select(Chunk).where(Chunk.paper_id == paper_id)).all()
+    for c in chunks:
+        session.delete(c)
+
+    # Resolve the on-disk paper directory before deleting the row.
+    from carrel.main import app_config
+
+    storage_root = Path(app_config.storage.root)
+    rel_dir: Path | None = None
+    for rel in (p.pdf_path, p.md_path):
+        if rel:
+            rel_dir = (storage_root / rel).parent
+            break
+
+    session.delete(p)
+    session.commit()
+
+    removed_files = False
+    if rel_dir is not None:
+        # Safety: only delete a directory that lives under <storage>/papers/.
+        papers_root = (storage_root / app_config.storage.papers_subdir).resolve()
+        target = rel_dir.resolve()
+        if target == papers_root or papers_root not in target.parents:
+            logger.warning("refusing to delete %s: outside papers root", target)
+        elif target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+            removed_files = not target.exists()
+
+    return {"id": paper_id, "deleted": True, "removed_files": removed_files}
 
 
 @router.get("/{paper_id}/markdown")

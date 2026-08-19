@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router-dom";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
+import ReferencesCard from "@/components/ReferencesCard";
 import {
   embedPaper,
   getJob,
@@ -36,6 +38,8 @@ export default function PaperDetail({ onProcessed }: Props) {
   const [processing, setProcessing] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [pdfOpen, setPdfOpen] = useState(false);
+  const [textOpen, setTextOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const timer = useRef<number | null>(null);
 
@@ -56,6 +60,7 @@ export default function PaperDetail({ onProcessed }: Props) {
   }, [id]);
 
   useEffect(() => {
+    setPdfOpen(false);
     load().catch((e) => setErr(String(e)));
   }, [load]);
 
@@ -147,7 +152,7 @@ export default function PaperDetail({ onProcessed }: Props) {
   const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
 
   return (
-    <main className="container max-w-3xl space-y-6 py-8">
+    <main className="container max-w-screen-2xl space-y-6 py-8">
       <div>
         <Link to="/" className="text-sm text-muted-foreground hover:underline">
           ← Back
@@ -216,9 +221,10 @@ export default function PaperDetail({ onProcessed }: Props) {
         {p.pdf_path && (
           <Button
             variant="outline"
-            onClick={() => window.open(`/storage/${p.pdf_path}`, "_blank", "noopener")}
+            onClick={() => setPdfOpen((v) => !v)}
+            aria-pressed={pdfOpen}
           >
-            Open saved PDF
+            {pdfOpen ? "Close PDF" : "Open saved PDF"}
           </Button>
         )}
       </div>
@@ -272,28 +278,68 @@ export default function PaperDetail({ onProcessed }: Props) {
         </Card>
       )}
 
-      {md ? (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Full text</CardTitle>
+      {md && pdfOpen && p.pdf_path ? (
+        <Card className="overflow-hidden">
+          <CardHeader className="py-3">
+            <CardTitle className="text-base">PDF</CardTitle>
           </CardHeader>
-          <CardContent>
-            <MarkdownReader body={md} mdPath={p.md_path} />
+          <CardContent className="p-0">
+            <iframe
+              title={`${p.title} — PDF`}
+              src={`/storage/${p.pdf_path}`}
+              className="h-[calc(100vh-200px)] w-full border-0"
+            />
           </CardContent>
+        </Card>
+      ) : md ? (
+        <Card>
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <button
+              type="button"
+              onClick={() => setTextOpen((v) => !v)}
+              className="flex items-center gap-2 text-left"
+            >
+              {textOpen ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              )}
+              <CardTitle className="text-base">Full text</CardTitle>
+            </button>
+          </CardHeader>
+          {textOpen && (
+            <CardContent>
+              <MarkdownReader body={md} mdPath={p.md_path} />
+            </CardContent>
+          )}
         </Card>
       ) : (
         <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Abstract</CardTitle>
+          <CardHeader className="flex-row items-center justify-between space-y-0">
+            <button
+              type="button"
+              onClick={() => setTextOpen((v) => !v)}
+              className="flex items-center gap-2 text-left"
+            >
+              {textOpen ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              )}
+              <CardTitle className="text-base">Abstract</CardTitle>
+            </button>
           </CardHeader>
-          <CardContent className="text-sm leading-relaxed">
-            {p.abstract || (
-              <span className="text-muted-foreground">No abstract available.</span>
-            )}
-          </CardContent>
+          {textOpen && (
+            <CardContent className="text-sm leading-relaxed">
+              {p.abstract || (
+                <span className="text-muted-foreground">No abstract available.</span>
+              )}
+            </CardContent>
+          )}
         </Card>
       )}
 
+      <ReferencesCard paper={p} onChanged={load} />
       <CitationsCard paper={p} onChanged={load} />
     </main>
   );

@@ -99,6 +99,12 @@ export const listPapers = (params?: { limit?: number; offset?: number; status?: 
 
 export const getPaper = (id: string) => request<PaperDetail>(`/papers/${encodeURIComponent(id)}`);
 
+export const deletePaper = (id: string) =>
+  request<{ id: string; deleted: boolean; removed_files: boolean }>(
+    `/papers/${encodeURIComponent(id)}`,
+    { method: "DELETE" },
+  );
+
 export const getPaperMarkdown = (id: string) =>
   request<{ id: string; body: string | null; md_path: string | null }>(
     `/papers/${encodeURIComponent(id)}/markdown`
@@ -121,6 +127,25 @@ export const refreshPaperCitations = (id: string, background = true) =>
     method: "POST",
     body: JSON.stringify({ background }),
   });
+
+export interface ReferenceList {
+  paper_id: string;
+  reference_count: number | null;
+  updated_at: string | null;
+  references: CitationItem[];
+}
+
+export const getPaperReferences = (
+  id: string,
+  opts?: { sort?: "year_asc" | "year_desc" },
+) => {
+  const q = new URLSearchParams();
+  if (opts?.sort) q.set("sort", opts.sort);
+  const qs = q.toString();
+  return request<ReferenceList>(
+    `/papers/${encodeURIComponent(id)}/references${qs ? `?${qs}` : ""}`,
+  );
+};
 
 // ---- Processing (download PDF + parse with MinerU) ----
 
@@ -204,48 +229,66 @@ export const getJob = (id: number) => request<Job>(`/sync/jobs/${id}`);
 
 // -------- Search (M5) --------
 
-export interface LocalSearchResult {
-  id: string;
-  title: string;
-  abstract: string | null;
-  authors: string[];
-  venue: string | null;
-  publication_date: string | null;
+export type SearchSource = "library" | "openalex" | "semantic_scholar" | "arxiv";
+
+export interface SearchResultIds {
+  openalex: string | null;
   doi: string | null;
-  arxiv_id: string | null;
-  citation_count: number | null;
-  status: string | null;
-  snippet: string | null;
+  arxiv: string | null;
+  s2: string | null;
 }
 
-export interface ExternalSearchResult {
-  openalex_id: string;
+export interface SearchResultItem {
   title: string;
-  abstract: string | null;
   authors: string[];
+  abstract: string | null;
   venue: string | null;
+  venue_type: string | null;
   publication_date: string | null;
-  doi: string | null;
-  arxiv_id: string | null;
   citation_count: number | null;
-  cited_by_url: string | null;
-  in_library: boolean;
-  library_id: string | null;
+  tldr: string | null;
   pdf_url: string | null;
   snippet: string | null;
+  ids: SearchResultIds;
+  sources: SearchSource[];
+  in_library: boolean;
+  library_id: string | null;
+  status: string | null;
 }
 
 export interface SearchResponse {
   query: string;
   corrected_from: string | null;
-  local: LocalSearchResult[];
-  external: ExternalSearchResult[];
+  results: SearchResultItem[];
+  warnings: string[];
 }
 
-export const searchPapers = (q: string, limit = 20, correct = true) =>
-  request<SearchResponse>(
-    `/search?q=${encodeURIComponent(q)}&limit=${limit}&correct=${correct ? "true" : "false"}`,
-  );
+export interface SearchOptions {
+  limit?: number;
+  correct?: boolean;
+  yearFrom?: number;
+  yearTo?: number;
+  minCitations?: number;
+  openAccessOnly?: boolean;
+  sort?: "relevance" | "citations" | "date";
+  sources?: SearchSource[];
+}
+
+export const searchPapers = (q: string, opts: SearchOptions = {}) => {
+  const params = new URLSearchParams();
+  params.set("q", q);
+  if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+  if (opts.correct !== undefined) params.set("correct", opts.correct ? "true" : "false");
+  if (opts.yearFrom !== undefined) params.set("year_from", String(opts.yearFrom));
+  if (opts.yearTo !== undefined) params.set("year_to", String(opts.yearTo));
+  if (opts.minCitations !== undefined) params.set("min_citations", String(opts.minCitations));
+  if (opts.openAccessOnly) params.set("open_access_only", "true");
+  if (opts.sort) params.set("sort", opts.sort);
+  if (opts.sources && opts.sources.length > 0) {
+    for (const s of opts.sources) params.append("sources", s);
+  }
+  return request<SearchResponse>(`/search?${params.toString()}`);
+};
 
 export interface SemanticHit {
   paper_id: string;
@@ -297,6 +340,7 @@ export const importPaper = (body: {
   openalex_id?: string;
   doi?: string;
   arxiv_id?: string;
+  s2?: string;
 }) =>
   request<{ id: string; created: boolean }>("/import", {
     method: "POST",

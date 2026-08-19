@@ -1,18 +1,34 @@
-"""Search endpoints (M5).
+"""Search endpoints.
 
-Local results come from a SQL LIKE on title/abstract/authors against the
-``papers`` table. External results are an OpenAlex ``Works().search()`` call,
-with an in-library flag so the UI can fold duplicates into the local section.
-Full-text results come from a cosine-similarity search over embedded chunks
-(pgvector on Postgres, in-memory scan on SQLite).
+Three sources are fanned out in parallel and merged into one result list:
+
+  * **library** — SQL ILIKE on title/abstract/authors/identifiers of the
+    ``papers`` table.
+  * **OpenAlex** — faceted Works search with inverted-index abstract
+    reconstruction and Zenodo filtering.
+  * **Semantic Scholar** — Graph API search (relevance or citation/date sort
+    via the bulk endpoint), contributing citation counts, venue type, and TLDR.
+  * **arXiv** — Atom API relevance search, contributing the canonical PDF link
+    and the freshest preprint metadata.
+
+Results are deduplicated by DOI → arXiv id → S2 id → OpenAlex id → normalized
+title, merged with field-authority rules in :mod:`carrel.sources.merge`, and
+ordered by reciprocal-rank fusion (or by citations / date when requested).
+Per-source failures are captured in ``warnings`` rather than aborting the
+response. Full-text semantic search over embedded chunks is kept as a separate
+endpoint.
 """
 from __future__ import annotations
 
 import json
 import logging
 import math
+import re
 import threading
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import String, cast
@@ -23,16 +39,20 @@ from carrel import spelling
 from carrel.db import get_session_dep
 from carrel.models import Chunk, Paper, PaperStatus, SourceKind
 from carrel.schemas import (
-    ExternalSearchResult,
     ImportPaperIn,
     ImportPaperOut,
-    LocalSearchResult,
     SearchResponse,
+    SearchResultIds,
+    SearchResultItem,
     SemanticSearchHit,
     SemanticSearchResponse,
     SemanticSearchResult,
 )
+from carrel.sources import arxiv as arxiv_src
+from carrel.sources import merge as merge_mod
 from carrel.sources import openalex_client as oa
+from carrel.sources import semanticscholar_client as s2
+from carrel.sources.normalize import is_zenodo
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +62,11 @@ router = APIRouter(tags=["search"])
 # few thousand papers) so startup stays fast.
 _seeded = False
 _seed_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Spelling
+# ---------------------------------------------------------------------------
 
 
 def _ensure_spelling_seeded(session: Session) -> None:
@@ -69,6 +94,11 @@ def _apply_correction(q: str, session: Session) -> tuple[str, str | None]:
         return q, None
 
 
+# ---------------------------------------------------------------------------
+# Snippet helpers
+# ---------------------------------------------------------------------------
+
+
 def _abstract_excerpt(text: str | None, query: str, *, width: int = 240) -> str | None:
     if not text:
         return None
@@ -93,35 +123,38 @@ def _author_names(paper: Paper) -> list[str]:
     return [a.get("name", "") for a in (paper.authors or []) if a.get("name")]
 
 
-def _find_library_match(
-    session: Session, *, oa_id: str | None, doi: str | None, arxiv_id: str | None,
-) -> Paper | None:
-    if oa_id:
-        for cand in {oa_id, f"https://openalex.org/{oa_id}"}:
-            row = session.get(Paper, cand)
-            if row is not None:
-                return row
-    if doi:
-        doi_variants = {doi, f"https://doi.org/{doi}"}
-        rows = session.exec(select(Paper).where(col(Paper.doi).in_(doi_variants))).all()
-        if rows:
-            return rows[0]
-    if arxiv_id:
-        row = session.exec(
-            select(Paper).where(col(Paper.arxiv_id) == arxiv_id)
-        ).first()
-        if row is not None:
-            return row
-    return None
+# ---------------------------------------------------------------------------
+# Filters
+# ---------------------------------------------------------------------------
 
 
-def _local_search(session: Session, q: str, limit: int) -> list[LocalSearchResult]:
-    """SQL LIKE search on title/abstract/authors.
+@dataclass(frozen=True)
+class SearchFilters:
+    year_from: int | None = None
+    year_to: int | None = None
+    min_citations: int | None = None
+    open_access_only: bool = False
+    sort: str = "relevance"  # "relevance" | "citations" | "date"
+    sources: tuple[str, ...] = ()  # empty = all enabled
 
-    ponytail: SQLite FTS5 would be the proper fix (relevance, stemming) but
-    for a single-user library of a few thousand rows the LIKE scan is fast
-    enough and keeps the schema unchanged.
-    """
+
+_ALLOWED_SORTS = {"relevance", "citations", "date"}
+_ALLOWED_SOURCES = {
+    merge_mod.SOURCE_OPENALEX,
+    merge_mod.SOURCE_SEMANTIC_SCHOLAR,
+    merge_mod.SOURCE_ARXIV,
+}
+
+
+# ---------------------------------------------------------------------------
+# Local search
+# ---------------------------------------------------------------------------
+
+
+def _local_search_items(
+    session: Session, q: str, limit: int
+) -> list[merge_mod.MutableSearchHit]:
+    """SQL ILIKE search, returning MutableSearchHits tagged ``library``."""
     pattern = f"%{q}%"
     stmt = (
         select(Paper)
@@ -138,131 +171,431 @@ def _local_search(session: Session, q: str, limit: int) -> list[LocalSearchResul
         .limit(limit)
     )
     rows = session.exec(stmt).all()
-    out: list[LocalSearchResult] = []
+    out: list[merge_mod.MutableSearchHit] = []
     for p in rows:
-        abstract = p.abstract
-        snippet = _abstract_excerpt(abstract, q)
-        out.append(LocalSearchResult(
-            id=p.id,
-            title=p.title,
-            abstract=abstract,
+        snippet = _abstract_excerpt(p.abstract, q)
+        hit = merge_mod.MutableSearchHit(
+            title=p.title or "(untitled)",
             authors=_author_names(p),
+            abstract=p.abstract,
             venue=p.venue,
             publication_date=p.publication_date.isoformat() if p.publication_date else None,
-            doi=p.doi,
-            arxiv_id=p.arxiv_id,
             citation_count=p.citation_count,
+            pdf_url=p.pdf_url,
+            snippet=snippet,
+            openalex_id=p.id if p.id_kind == "openalex" else None,
+            doi=(p.doi or "").lower().removeprefix("https://doi.org/") if p.doi else None,
+            arxiv_id=p.arxiv_id,
+            s2_id=p.s2_paper_id,
+            sources={merge_mod.SOURCE_LIBRARY},
+            in_library=True,
+            library_id=p.id,
             status=p.status,
-            snippet=snippet,
-        ))
+        )
+        out.append(hit)
     return out
 
 
-def _external_search(
-    session: Session, q: str, limit: int,
-) -> list[ExternalSearchResult]:
-    try:
-        results = oa.Works().search(q).get(per_page=min(limit, 50))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("openalex search failed for %r: %s", q, e)
-        return []
+# ---------------------------------------------------------------------------
+# External fan-out
+# ---------------------------------------------------------------------------
 
-    out: list[ExternalSearchResult] = []
-    for w in results:
-        oa_id = oa.work_id(w) or ""
-        doi = oa.work_doi(w)
-        arxiv = oa.work_arxiv_id(w)
-        lib = _find_library_match(session, oa_id=oa_id, doi=doi, arxiv_id=arxiv)
 
-        abstract_inverted = w.get("abstract_inverted_index") or {}
-        abstract: str | None = None
-        if abstract_inverted:
-            positions: dict[int, str] = {}
-            for word, idxs in abstract_inverted.items():
-                for i in idxs:
-                    positions[i] = word
-            if positions:
-                abstract = " ".join(positions[i] for i in sorted(positions))
-        snippet = _abstract_excerpt(abstract, q)
-
-        pdf_url, oa_status = oa.work_pdf_url(w)
-        out.append(ExternalSearchResult(
-            openalex_id=oa_id,
-            title=(w.get("title") or w.get("display_name") or "").strip(),
-            abstract=abstract,
-            authors=[
-                (a.get("author") or {}).get("display_name") or ""
-                for a in (w.get("authorships") or [])
-            ],
-            venue=oa.work_venue(w),
-            publication_date=str(w.get("publication_year")) if w.get("publication_year") else None,
-            doi=doi,
-            arxiv_id=arxiv,
-            citation_count=w.get("cited_by_count"),
-            cited_by_url=f"https://openalex.org/works/{oa_id}" if oa_id else None,
-            in_library=lib is not None,
-            library_id=lib.id if lib is not None else None,
-            pdf_url=pdf_url if oa_status == "oa" else None,
-            snippet=snippet,
-        ))
+def _search_openalex(
+    q: str, filters: SearchFilters, limit: int
+) -> list[merge_mod.MutableSearchHit]:
+    works = oa.search_work(
+        q,
+        limit=limit,
+        year_from=filters.year_from,
+        year_to=filters.year_to,
+        min_citations=filters.min_citations,
+        open_access_only=filters.open_access_only,
+        sort=filters.sort,
+    )
+    out: list[merge_mod.MutableSearchHit] = []
+    for i, w in enumerate(works):
+        if is_zenodo(oa.work_doi(w), oa.work_venue(w)):
+            continue
+        hit = merge_mod.from_openalex_work(w)
+        if hit is None:
+            continue
+        hit.ranks[merge_mod.SOURCE_OPENALEX] = i + 1
+        hit.snippet = _abstract_excerpt(hit.abstract, q)
+        out.append(hit)
     return out
 
 
-@router.get("/search/local", response_model=list[LocalSearchResult])
+def _search_s2(
+    q: str, filters: SearchFilters, limit: int
+) -> list[merge_mod.MutableSearchHit]:
+    rows = s2.search_papers(
+        q,
+        limit=limit,
+        year_from=filters.year_from,
+        year_to=filters.year_to,
+        min_citations=filters.min_citations,
+        open_access_only=filters.open_access_only,
+        # Default sort is relevance; "citations"/"date" trigger the bulk
+        # endpoint inside the client. We don't pass venue_types here because
+        # the filter bar doesn't expose them yet.
+        sort=filters.sort,
+    )
+    out: list[merge_mod.MutableSearchHit] = []
+    for i, row in enumerate(rows):
+        hit = merge_mod.from_s2_row(row)
+        if hit is None:
+            continue
+        hit.ranks[merge_mod.SOURCE_SEMANTIC_SCHOLAR] = i + 1
+        hit.snippet = _abstract_excerpt(hit.abstract, q)
+        out.append(hit)
+    return out
+
+
+def _search_arxiv(
+    q: str, filters: SearchFilters, limit: int
+) -> list[merge_mod.MutableSearchHit]:
+    entries = arxiv_src.search(q, limit=limit)
+    out: list[merge_mod.MutableSearchHit] = []
+    for i, e in enumerate(entries):
+        hit = merge_mod.from_arxiv_entry(e)
+        if hit is None:
+            continue
+        # arXiv Atom API doesn't support year/citation/OA filters server-side;
+        # post-filter by year. arXiv is always OA, so open_access_only is a
+        # no-op. Citation filter can't be applied without a second source.
+        if filters.year_from and hit.publication_date:
+            try:
+                year = int(hit.publication_date[:4])
+            except ValueError:
+                year = None
+            if year is not None and year < filters.year_from:
+                continue
+        if filters.year_to and hit.publication_date:
+            try:
+                year = int(hit.publication_date[:4])
+            except ValueError:
+                year = None
+            if year is not None and year > filters.year_to:
+                continue
+        hit.ranks[merge_mod.SOURCE_ARXIV] = i + 1
+        hit.snippet = _abstract_excerpt(hit.abstract, q)
+        out.append(hit)
+    return out
+
+
+def _multi_source_search(
+    q: str, filters: SearchFilters, per_source_limit: int
+) -> tuple[list[merge_mod.MutableSearchHit], list[str]]:
+    """Fan out to the enabled external sources and merge results."""
+    enabled = set(filters.sources) if filters.sources else set(_ALLOWED_SOURCES)
+    enabled &= _ALLOWED_SOURCES
+
+    jobs: dict[str, Any] = {}
+    if merge_mod.SOURCE_OPENALEX in enabled:
+        jobs[merge_mod.SOURCE_OPENALEX] = (
+            _search_openalex,
+            (q, filters, per_source_limit),
+        )
+    if merge_mod.SOURCE_SEMANTIC_SCHOLAR in enabled:
+        jobs[merge_mod.SOURCE_SEMANTIC_SCHOLAR] = (
+            _search_s2,
+            (q, filters, per_source_limit),
+        )
+    if merge_mod.SOURCE_ARXIV in enabled:
+        jobs[merge_mod.SOURCE_ARXIV] = (
+            _search_arxiv,
+            (q, filters, per_source_limit),
+        )
+
+    results: dict[str, list[merge_mod.MutableSearchHit]] = {}
+    warnings: list[str] = []
+
+    # Run the HTTP calls in parallel. SQLite session isn't used inside these
+    # workers — library membership is resolved after the fan-out.
+    with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as pool:
+        futures = {
+            name: pool.submit(fn, *args) for name, (fn, args) in jobs.items()
+        }
+        for name, fut in futures.items():
+            try:
+                results[name] = fut.result()
+            except Exception as e:  # noqa: BLE001 - per-source soft failure
+                logger.warning("search source %s failed for %r: %s", name, q, e)
+                warnings.append(f"{name}: {e}")
+                results[name] = []
+
+    merged = merge_mod.merge_search_hits(
+        [hit for hits in results.values() for hit in hits]
+    )
+
+    if filters.sort == "relevance":
+        merged = merge_mod.reciprocal_rank_fusion(merged)
+    elif filters.sort == "citations":
+        merged.sort(
+            key=lambda h: (h.citation_count if h.citation_count is not None else -1),
+            reverse=True,
+        )
+    elif filters.sort == "date":
+        merged.sort(key=lambda h: h.publication_date or "", reverse=True)
+
+    return merged, warnings
+
+
+# ---------------------------------------------------------------------------
+# Batched library-membership lookup
+# ---------------------------------------------------------------------------
+
+
+def _resolve_library_membership(
+    session: Session, hits: list[merge_mod.MutableSearchHit]
+) -> None:
+    """Set ``in_library`` / ``library_id`` / ``status`` on each hit.
+
+    One batched SELECT across doi / arxiv_id / s2_paper_id / (W-)id, following
+    the same pattern as carrel.api.citations._resolve_library so we don't run
+    three queries per result.
+    """
+    if not hits:
+        return
+
+    dois: set[str] = set()
+    arxiv_ids: set[str] = set()
+    s2_ids: set[str] = set()
+    oa_ids: set[str] = set()
+    for h in hits:
+        if h.doi:
+            dois.add(h.doi.lower())
+        if h.arxiv_id:
+            arxiv_ids.add(h.arxiv_id.lower())
+        if h.s2_id:
+            s2_ids.add(h.s2_id)
+        if h.openalex_id and h.openalex_id.startswith("W"):
+            oa_ids.add(h.openalex_id)
+
+    clauses = []
+    if dois:
+        doi_variants = list(dois) + [f"https://doi.org/{d}" for d in dois]
+        clauses.append(Paper.doi.in_(doi_variants))
+    if arxiv_ids:
+        clauses.append(Paper.arxiv_id.in_(list(arxiv_ids)))
+    if s2_ids:
+        clauses.append(Paper.s2_paper_id.in_(list(s2_ids)))
+    if oa_ids:
+        oa_variants = list(oa_ids) + [f"https://openalex.org/{o}" for o in oa_ids]
+        clauses.append(Paper.id.in_(oa_variants))
+
+    if not clauses:
+        return
+
+    papers = session.exec(select(Paper).where(or_(*clauses))).all()
+
+    def _match(hit: merge_mod.MutableSearchHit) -> Paper | None:
+        for p in papers:
+            if hit.openalex_id and (p.id == hit.openalex_id or p.id == f"https://openalex.org/{hit.openalex_id}"):
+                return p
+            if hit.doi and p.doi:
+                bare = p.doi.lower().removeprefix("https://doi.org/").removeprefix("http://doi.org/")
+                if bare == hit.doi.lower():
+                    return p
+            if hit.arxiv_id and p.arxiv_id:
+                if p.arxiv_id.lower() == hit.arxiv_id.lower():
+                    return p
+            if hit.s2_id and p.s2_paper_id == hit.s2_id:
+                return p
+        return None
+
+    for hit in hits:
+        if hit.in_library:
+            continue
+        m = _match(hit)
+        if m is not None:
+            hit.in_library = True
+            hit.library_id = m.id
+            hit.status = m.status
+            # Tag "library" so the source badge/filter recognizes it — this
+            # runs for external hits that turn out to be in the user's library.
+            # (Hits that originated from _local_search_items already carry it.)
+            hit.sources.add(merge_mod.SOURCE_LIBRARY)
+            # A library paper's local citation count can be fresher than what
+            # the external sources returned.
+            if m.citation_count is not None and (
+                hit.citation_count is None or m.citation_count > hit.citation_count
+            ):
+                hit.citation_count = m.citation_count
+
+
+# ---------------------------------------------------------------------------
+# Serialize MutableSearchHit -> SearchResultItem
+# ---------------------------------------------------------------------------
+
+
+def _to_item(hit: merge_mod.MutableSearchHit) -> SearchResultItem:
+    return SearchResultItem(
+        title=hit.title,
+        authors=list(hit.authors or []),
+        abstract=hit.abstract,
+        venue=hit.venue,
+        venue_type=hit.venue_type,
+        publication_date=hit.publication_date,
+        citation_count=hit.citation_count,
+        tldr=hit.tldr,
+        pdf_url=hit.pdf_url,
+        snippet=hit.snippet,
+        ids=SearchResultIds(
+            openalex=hit.openalex_id,
+            doi=hit.doi,
+            arxiv=hit.arxiv_id,
+            s2=hit.s2_id,
+        ),
+        sources=sorted(hit.sources),
+        in_library=hit.in_library,
+        library_id=hit.library_id,
+        status=hit.status,
+    )
+
+
+def _parse_filters(
+    *,
+    year_from: int | None,
+    year_to: int | None,
+    min_citations: int | None,
+    open_access_only: bool,
+    sort: str,
+    sources: list[str] | None,
+) -> SearchFilters:
+    sort = sort if sort in _ALLOWED_SORTS else "relevance"
+    src_tuple = tuple(s for s in (sources or []) if s in _ALLOWED_SOURCES)
+    return SearchFilters(
+        year_from=year_from,
+        year_to=year_to,
+        min_citations=min_citations,
+        open_access_only=open_access_only,
+        sort=sort,
+        sources=src_tuple,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@router.get("/search/local", response_model=list[SearchResultItem])
 def search_local(
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=100),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
-) -> list[LocalSearchResult]:
+) -> list[SearchResultItem]:
     q = q.strip()
     if not q:
         return []
     if correct:
         q, _ = _apply_correction(q, session)
-    return _local_search(session, q, limit)
+    hits = _local_search_items(session, q, limit)
+    return [_to_item(h) for h in hits]
 
 
-@router.get("/search/external", response_model=list[ExternalSearchResult])
+@router.get("/search/external", response_model=list[SearchResultItem])
 def search_external(
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=50),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
+    min_citations: int | None = Query(None, ge=0),
+    open_access_only: bool = Query(False),
+    sort: str = Query("relevance"),
+    sources: list[str] | None = Query(None),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
-) -> list[ExternalSearchResult]:
+) -> list[SearchResultItem]:
     q = q.strip()
     if not q:
         return []
     if correct:
         q, _ = _apply_correction(q, session)
-    return _external_search(session, q, limit)
+    filters = _parse_filters(
+        year_from=year_from, year_to=year_to,
+        min_citations=min_citations, open_access_only=open_access_only,
+        sort=sort, sources=sources,
+    )
+    hits, _warnings = _multi_source_search(q, filters, per_source_limit=limit)
+    _resolve_library_membership(session, hits)
+    return [_to_item(h) for h in hits[:limit]]
 
 
 @router.get("/search", response_model=SearchResponse)
 def search_combined(
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=50),
+    year_from: int | None = Query(None, ge=1900, le=2100),
+    year_to: int | None = Query(None, ge=1900, le=2100),
+    min_citations: int | None = Query(None, ge=0),
+    open_access_only: bool = Query(False),
+    sort: str = Query("relevance"),
+    sources: list[str] | None = Query(None),
     correct: bool = Query(True),
+    include_local: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> SearchResponse:
-    """One-shot: local + external. Frontend uses this for unified view."""
+    """One-shot search: external sources merged with library results."""
     q = q.strip()
     if not q:
-        return SearchResponse(query="", local=[], external=[])
+        return SearchResponse(query="", results=[], warnings=[])
     if correct:
         corrected, original = _apply_correction(q, session)
     else:
         corrected, original = q, None
+
+    filters = _parse_filters(
+        year_from=year_from, year_to=year_to,
+        min_citations=min_citations, open_access_only=open_access_only,
+        sort=sort, sources=sources,
+    )
+
+    # External fan-out first (HTTP-bound) — can run while local query runs.
+    external_hits, warnings = _multi_source_search(
+        corrected, filters, per_source_limit=limit,
+    )
+
+    local_hits: list[merge_mod.MutableSearchHit] = []
+    if include_local:
+        local_hits = _local_search_items(session, corrected, limit)
+
+    # Merge local + external together so a paper that's both in library and
+    # returned by an external source becomes one row tagged "library".
+    merged = merge_mod.merge_search_hits(local_hits + external_hits)
+
+    if filters.sort == "relevance":
+        # Local hits don't have an external rank, so blend: give library hits
+        # a strong head start (rank 1) since the user already owns them.
+        for h in merged:
+            if merge_mod.SOURCE_LIBRARY in h.sources and not h.ranks:
+                h.ranks[merge_mod.SOURCE_LIBRARY] = 1
+        merged = merge_mod.reciprocal_rank_fusion(merged)
+    elif filters.sort == "citations":
+        merged.sort(
+            key=lambda h: (h.citation_count if h.citation_count is not None else -1),
+            reverse=True,
+        )
+    elif filters.sort == "date":
+        merged.sort(key=lambda h: h.publication_date or "", reverse=True)
+
+    # Library membership on the external-only rows. Local hits already have
+    # in_library=True; _resolve_library_membership skips them.
+    _resolve_library_membership(session, merged)
+
     return SearchResponse(
         query=corrected,
         corrected_from=original,
-        local=_local_search(session, corrected, limit),
-        external=_external_search(session, corrected, limit),
+        results=[_to_item(h) for h in merged[:limit]],
+        warnings=warnings,
     )
 
 
 # ---------------------------------------------------------------------------
-# Full-text semantic search (M5)
+# Full-text semantic search (unchanged)
 # ---------------------------------------------------------------------------
 
 
@@ -336,12 +669,7 @@ def _semantic_search_postgres(
 def _semantic_search(
     session: Session, q: str, limit: int
 ) -> list[SemanticSearchResult]:
-    """Run a full-text query and group chunk hits by paper.
-
-    ponytail: embeds the query and a top-K scan over the chunks table; groups
-    hits by paper (max 3 chunks per paper) so the UI shows one card per paper.
-    No re-ranker — we trust cosine + per-paper best-score ordering.
-    """
+    """Run a full-text query and group chunk hits by paper."""
     from carrel.main import app_config  # set in lifespan
 
     model = app_config.embeddings.model
@@ -354,7 +682,6 @@ def _semantic_search(
         return []
     q_vec = q_vecs[0]
 
-    # Pull K=3x limit chunks so per-paper grouping still has headroom.
     raw_limit = min(limit * 3, 100)
     bind = session.get_bind()
     if bind.dialect.name == "postgresql":
@@ -362,7 +689,6 @@ def _semantic_search(
     else:
         hits = _semantic_search_sqlite(session, q_vec, raw_limit)
 
-    # Group by paper; keep top-3 chunks per paper, top-N papers overall.
     by_paper: dict[str, list[tuple[int, str | None, str, float]]] = defaultdict(list)
     for pid, idx, heading, body, score in hits:
         by_paper[pid].append((idx, heading, body, score))
@@ -433,7 +759,7 @@ def search_semantic(
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> SemanticSearchResponse:
-    """Full-text semantic search over embedded chunks (M5)."""
+    """Full-text semantic search over embedded chunks."""
     q = q.strip()
     if not q:
         return SemanticSearchResponse(query="", results=[])
@@ -448,45 +774,107 @@ def search_semantic(
     )
 
 
+# ---------------------------------------------------------------------------
+# Import
+# ---------------------------------------------------------------------------
+
+
+def _resolve_work_for_import(
+    *,
+    oa_id: str | None,
+    doi: str | None,
+    arxiv_id: str | None,
+    s2_id: str | None,
+) -> dict | None:
+    """Resolve whichever identifier the client gave us into an OpenAlex Work.
+
+    Priority: OpenAlex W-id → DOI → arXiv id → S2 id (looked up then mapped to
+    DOI/arXiv, with title-search fallback). Returns None if nothing resolves.
+    """
+    work: dict | None = None
+    if oa_id:
+        oa_id = oa_id.rsplit("/", 1)[-1]
+        try:
+            w = oa.Works()[oa_id]
+            work = dict(w) if w else None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("openalex lookup W=%s failed: %s", oa_id, e)
+            work = None
+    if work is None and doi:
+        work = oa.lookup_by_doi(doi)
+    if work is None and arxiv_id:
+        work = oa.lookup_by_arxiv_id(arxiv_id)
+    if work is None and s2_id:
+        # Resolve via S2 first to get DOI/arXiv, then use the normal path.
+        try:
+            s2_paper = s2.fetch_paper(s2_id)
+        except s2.S2Error as e:
+            logger.warning("S2 lookup for import %s failed: %s", s2_id, e)
+            s2_paper = None
+        if s2_paper:
+            if s2_paper.get("doi"):
+                work = oa.lookup_by_doi(s2_paper["doi"])
+            if work is None and s2_paper.get("arxiv_id"):
+                work = oa.lookup_by_arxiv_id(s2_paper["arxiv_id"])
+        if work is None and s2_paper and s2_paper.get("title"):
+            # Last-ditch: OpenAlex title search, take top hit only if the
+            # normalized titles match closely. We refuse loose matches to
+            # avoid importing the wrong paper (mirrors lookup_by_arxiv_id's
+            # strict-match discipline).
+            try:
+                cand = oa.search_work(s2_paper["title"], limit=3)
+            except Exception:  # noqa: BLE001
+                cand = []
+            for w in cand:
+                wt = (w.get("title") or "").lower()
+                if _title_similarity(s2_paper["title"], wt) >= 0.85:
+                    work = w
+                    break
+    return work
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Token-overlap ratio in [0, 1] for loose title matching."""
+    ta = {t for t in _TITLE_TOKEN_RE.findall(a.lower()) if len(t) > 1}
+    tb = {t for t in _TITLE_TOKEN_RE.findall(b.lower()) if len(t) > 1}
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta | tb), 1)
+
+
+_TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
 @router.post("/import", response_model=ImportPaperOut)
 def import_external_paper(
     body: ImportPaperIn,
     session: Session = Depends(get_session_dep),
 ) -> ImportPaperOut:
-    """Fetch an external work from OpenAlex and upsert it into the library.
+    """Fetch an external work and upsert it into the library.
 
-    Accepts any of: `openalex_id` (W… or full URL), `doi`, or `arxiv_id`.
-    Returns the resulting library Paper id and whether it was new.
+    Accepts any of ``openalex_id`` / ``doi`` / ``arxiv_id`` / ``s2``.
     """
-    oa_id = body.openalex_id
-    doi = body.doi
-    arxiv_id = body.arxiv_id
-
-    # Resolve to an OpenAlex Work. Prefer W-id, fall back to DOI lookup, then
-    # arXiv lookup. We need a Work object to extract normalized fields.
-    work: dict | None = None
-    if oa_id:
-        oa_id = oa_id.rsplit("/", 1)[-1]  # strip https://openalex.org/
-        work = oa.lookup_by_doi(oa_id)  # pyalex Works()[id] handles W-ids too
-        # lookup_by_doi calls Works()[doi] which doesn't accept W-ids; retry
-        # via a direct fetch if needed.
-        if not work or oa_id.startswith("W"):
-            try:
-                w = oa.Works()[oa_id]
-                work = dict(w) if w else None
-            except Exception as e:  # noqa: BLE001
-                logger.warning("openalex lookup W=%s failed: %s", oa_id, e)
-                work = None
-    if work is None and doi:
-        work = oa.lookup_by_doi(doi)
-    if work is None and arxiv_id:
-        work = oa.lookup_by_arxiv_id(arxiv_id)
-
+    work = _resolve_work_for_import(
+        oa_id=body.openalex_id,
+        doi=body.doi,
+        arxiv_id=body.arxiv_id,
+        s2_id=body.s2,
+    )
     if not work:
         from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="could not resolve that identifier on OpenAlex")
+        raise HTTPException(
+            status_code=404,
+            detail="could not resolve that identifier on OpenAlex/Semantic Scholar",
+        )
 
-    # If it's already in the library under any matching identifier, return that.
+    # Block Zenodo deposits (same filter as subscription sync).
+    if is_zenodo(oa.work_doi(work), oa.work_venue(work)):
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=422,
+            detail="Zenodo deposits are not papers and cannot be imported into the library",
+        )
+
     existing = _find_library_match(
         session,
         oa_id=oa.work_id(work),
@@ -500,7 +888,6 @@ def import_external_paper(
     now = datetime.now(UTC)
     pid = oa.work_id(work)
     if not pid:
-        # OpenAlex id missing; refuse rather than silently use a placeholder.
         from fastapi import HTTPException
         raise HTTPException(status_code=502, detail="OpenAlex returned a work without an id")
 
@@ -509,7 +896,7 @@ def import_external_paper(
         id=pid,
         id_kind="openalex",
         title=(work.get("title") or work.get("display_name") or "").strip() or "(untitled)",
-        abstract=None,  # filled below from inverted index
+        abstract=None,
         publication_date=oa.work_publication_date(work),
         venue=oa.work_venue(work),
         doi=oa.work_doi(work),
@@ -523,7 +910,6 @@ def import_external_paper(
         created_at=now,
         updated_at=now,
     )
-    # Reconstruct abstract.
     inv = work.get("abstract_inverted_index") or {}
     if inv:
         positions: dict[int, str] = {}
@@ -536,3 +922,27 @@ def import_external_paper(
     session.commit()
     session.refresh(paper)
     return ImportPaperOut(id=paper.id, created=True)
+
+
+def _find_library_match(
+    session: Session, *, oa_id: str | None, doi: str | None, arxiv_id: str | None,
+) -> Paper | None:
+    """Pre-import identifier check. Kept for the import path; search uses the
+    batched resolver instead."""
+    if oa_id:
+        for cand in {oa_id, f"https://openalex.org/{oa_id}"}:
+            row = session.get(Paper, cand)
+            if row is not None:
+                return row
+    if doi:
+        doi_variants = {doi, f"https://doi.org/{doi}"}
+        rows = session.exec(select(Paper).where(col(Paper.doi).in_(doi_variants))).all()
+        if rows:
+            return rows[0]
+    if arxiv_id:
+        row = session.exec(
+            select(Paper).where(col(Paper.arxiv_id) == arxiv_id)
+        ).first()
+        if row is not None:
+            return row
+    return None

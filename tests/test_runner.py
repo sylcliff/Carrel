@@ -240,7 +240,11 @@ def test_run_sync_swallows_per_source_errors_and_records_them(session, cfg):
 
     with patch("carrel.pipeline.runner.arxiv_src.fetch_recent",
                side_effect=RuntimeError("boom")), \
-         patch("carrel.pipeline.runner.oa.configure"):
+         patch("carrel.pipeline.runner.oa.configure"), \
+         patch(
+             "carrel.pipeline.citations.enrich_papers",
+             return_value={"enriched": 0, "failed": 0, "skipped": 0},
+         ):
         run_sync(session, cfg, lookback_hours=24, job=job)
 
     session.refresh(job)

@@ -86,9 +86,16 @@ def test_sync_inline_runs_pipeline(client, session):
         abs_url="https://arxiv.org/abs/2401.00099",
         pdf_url="https://arxiv.org/pdf/2401.00099",
     )
+    # Citation enrichment hits the live Semantic Scholar API; mock it so this
+    # smoke test stays hermetic (S2 rate limits / timeouts would otherwise hang
+    # the sync through retry backoff).
     with patch("carrel.pipeline.runner.arxiv_src.fetch_recent", return_value=[entry]), \
          patch("carrel.pipeline.runner.oa.lookup_by_arxiv_id", return_value=None), \
-         patch("carrel.pipeline.runner.oa.configure"):
+         patch("carrel.pipeline.runner.oa.configure"), \
+         patch(
+             "carrel.pipeline.citations.enrich_papers",
+             return_value={"enriched": 0, "failed": 0, "skipped": 1},
+         ):
         r = client.post("/sync", json={"lookback_hours": 24, "background": False})
 
     assert r.status_code == 200, r.text

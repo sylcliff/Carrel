@@ -99,6 +99,39 @@ def test_work_pdf_url_closed():
     assert status == "closed"
 
 
+def test_work_pdf_url_prefers_arxiv_over_publisher_html():
+    # Mirrors a real OpenAlex record: best_oa_location is a publisher /pdf URL
+    # that actually serves text/html, while a genuine arXiv PDF sits in
+    # locations[]. Selection must rank arXiv first without touching the network.
+    publisher = {
+        "pdf_url": "https://iopscience.iop.org/article/10.1088/x/7/077103/pdf",
+        "landing_page_url": "https://doi.org/10.1088/x/7/077103",
+        "source": {"display_name": "Chinese Physics Letters", "type": "journal"},
+    }
+    arxiv_loc = {
+        "pdf_url": "https://arxiv.org/pdf/2402.09251",
+        "landing_page_url": "http://arxiv.org/abs/2402.09251",
+        "source": {"display_name": "arXiv (Cornell University)", "type": "repository"},
+    }
+    w = _work(best_oa_location=publisher, locations=[publisher, arxiv_loc])
+
+    candidates = oa.work_pdf_candidates(w)
+    assert candidates[0] == "https://arxiv.org/pdf/2402.09251"
+    assert candidates[-1].startswith("https://iopscience.iop.org/")
+
+    url, status = oa.work_pdf_url(w)
+    assert url == "https://arxiv.org/pdf/2402.09251"
+    assert status == "oa"
+
+
+def test_work_pdf_candidates_dedupes():
+    w = _work(
+        best_oa_location={"pdf_url": "https://arxiv.org/pdf/2401.00001"},
+        locations=[{"pdf_url": "https://arxiv.org/pdf/2401.00001"}],
+    )
+    assert oa.work_pdf_candidates(w) == ["https://arxiv.org/pdf/2401.00001"]
+
+
 def test_work_authors_shape():
     authors = oa.work_authors(_work())
     assert authors == [{

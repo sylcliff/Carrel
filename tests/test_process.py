@@ -34,11 +34,12 @@ def _make_paper(session, **kw) -> Paper:
 def _fake_download_ok(tmp_path: Path):
     """Return a downloader stub that writes a tiny valid PDF to the dest."""
 
-    def _dl(url, dest_dir, *, filename="paper.pdf", **_kw):
+    def _dl(urls, dest_dir, *, filename="paper.pdf", **_kw):
+        url = urls[0] if isinstance(urls, list) else urls
         dest = Path(dest_dir) / filename
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(b"%PDF-1.7\nfake")
-        return dest
+        return dest, url
 
     return _dl
 
@@ -57,7 +58,7 @@ def test_process_paper_happy_path(session, cfg: CarrelYAML, tmp_path, monkeypatc
     cfg.storage.root = tmp_path / "data"
     p = _make_paper(session, pdf_url="https://example.org/p.pdf")
 
-    monkeypatch.setattr(proc, "download_pdf", _fake_download_ok(tmp_path))
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _fake_download_ok(tmp_path))
     monkeypatch.setattr(proc.mineru_client, "parse_pdf", _fake_parse_ok())
 
     out = proc.process_paper(session, cfg, p.id)
@@ -88,7 +89,7 @@ def test_process_paper_download_failure_marks_failed(session, cfg, tmp_path, mon
     def _boom(*a, **k):
         raise DownloadError("refusing HTML content-type")
 
-    monkeypatch.setattr(proc, "download_pdf", _boom)
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _boom)
 
     with pytest.raises(DownloadError):
         proc.process_paper(session, cfg, p.id)
@@ -101,7 +102,7 @@ def test_process_paper_parse_failure_marks_failed(session, cfg, tmp_path, monkey
     cfg.storage.root = tmp_path / "data"
     p = _make_paper(session, pdf_url="https://example.org/p.pdf")
 
-    monkeypatch.setattr(proc, "download_pdf", _fake_download_ok(tmp_path))
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _fake_download_ok(tmp_path))
 
     def _boom(*a, **k):
         raise MinerUError("HTTP 500: boom")
@@ -126,15 +127,15 @@ def test_process_paper_is_idempotent_on_retry(session, cfg, tmp_path, monkeypatc
     dl_calls = {"n": 0}
     parse_calls = {"n": 0}
 
-    def _dl(url, dest_dir, *, filename="paper.pdf", **_kw):
+    def _dl(urls, dest_dir, *, filename="paper.pdf", **_kw):
         dl_calls["n"] += 1
-        return _fake_download_ok(tmp_path)(url, dest_dir, filename=filename)
+        return _fake_download_ok(tmp_path)(urls, dest_dir, filename=filename)
 
     def _parse(pdf_path, dest_dir, **_kw):
         parse_calls["n"] += 1
         return _fake_parse_ok()(pdf_path, dest_dir)
 
-    monkeypatch.setattr(proc, "download_pdf", _dl)
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _dl)
     monkeypatch.setattr(proc.mineru_client, "parse_pdf", _parse)
 
     proc.process_paper(session, cfg, p.id)
@@ -145,6 +146,39 @@ def test_process_paper_is_idempotent_on_retry(session, cfg, tmp_path, monkeypatc
     assert p.status == PaperStatus.parsed.value
     proc.process_paper(session, cfg, p.id)
     assert dl_calls["n"] == 1 and parse_calls["n"] == 1
+
+
+def test_pdf_candidates_fall_back_to_raw_meta_arxiv(session, cfg, tmp_path):
+    """A paper whose stored publisher pdf_url serves HTML should still get the
+    arXiv candidate from its cached OpenAlex work, so download can fall back."""
+    cfg.storage.root = tmp_path / "data"
+    work = {
+        "open_access": {"is_oa": True},
+        "best_oa_location": {
+            "pdf_url": "https://iopscience.iop.org/article/x/pdf",
+            "source": {"display_name": "Chinese Physics Letters", "type": "journal"},
+        },
+        "locations": [
+            {"pdf_url": "https://iopscience.iop.org/article/x/pdf",
+             "source": {"type": "journal"}},
+            {"pdf_url": "https://arxiv.org/pdf/2402.09251",
+             "source": {"display_name": "arXiv", "type": "repository"}},
+        ],
+    }
+    p = _make_paper(
+        session,
+        pdf_url="https://iopscience.iop.org/article/x/pdf",
+        arxiv_id="2402.09251",
+        raw_meta=work,
+    )
+    urls = proc._pdf_candidates(p)
+    # Stored (bad publisher) URL stays first so we preserve identity, but the
+    # genuine arXiv PDF from the cached work is present as a fallback.
+    assert urls[0] == "https://iopscience.iop.org/article/x/pdf"
+    assert "https://arxiv.org/pdf/2402.09251" in urls
+    # The arXiv candidate from raw_meta must not be pushed after another
+    # publisher URL (publisher is already deduped to position 0).
+    assert len(urls) >= 2
 
 
 def test_select_pending_excludes_closed_and_parsed(session, cfg, tmp_path):
@@ -164,7 +198,7 @@ def test_process_pending_batch_counts(session, cfg, tmp_path, monkeypatch):
     _make_paper(session, id="W-ok", pdf_url="https://x/1.pdf", status=PaperStatus.pending.value)
     _make_paper(session, id="W-fail", pdf_url=None, status=PaperStatus.failed.value)
 
-    monkeypatch.setattr(proc, "download_pdf", _fake_download_ok(tmp_path))
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _fake_download_ok(tmp_path))
     monkeypatch.setattr(proc.mineru_client, "parse_pdf", _fake_parse_ok())
 
     counts = proc.process_pending(session, cfg, limit=10)
