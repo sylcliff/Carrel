@@ -1,6 +1,9 @@
 """Tests for the Semantic Scholar citation client."""
 from __future__ import annotations
 
+import threading
+import time
+
 import httpx
 import pytest
 from carrel.sources import semanticscholar_client as s2
@@ -259,3 +262,197 @@ def test_search_429_raises_s2error(monkeypatch):
 def test_search_empty_query_returns_empty():
     client, _ = _make_search_client()
     assert search_papers("  ", client=client) == []
+
+
+# ---------------------------------------------------------------------------
+# Global rate limiter
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_s2_globals():
+    """Keep configure()/limiter state from leaking between tests."""
+    yield
+    if s2._client is not None:
+        s2._client.close()
+    s2._client = None
+    s2._limiter = s2._RateLimiter()
+    s2._max_retries = s2.MAX_RETRIES
+
+
+def test_limiter_disabled_by_default_does_not_sleep(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))
+    lim = s2._RateLimiter()
+    assert lim.enabled is False
+    lim.acquire()
+    lim.acquire()
+    lim.penalty(10)
+    assert sleeps == []
+
+
+def test_acquire_spaces_calls(monkeypatch):
+    clock = {"t": 1000.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(s2.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))
+    # Deterministic interval.
+    lim = s2._RateLimiter(jitter_fraction=0.0)
+    lim.configure(1.0)
+
+    lim.acquire()  # gate open -> no sleep, next slot at 1001
+    assert sleeps == []
+    lim.acquire()  # still at t=1000 -> must wait ~1s
+    assert sleeps and 0.99 <= sleeps[-1] <= 1.01
+
+    # After the wait elapses, the next call is open again.
+    clock["t"] = 1002.0
+    before = len(sleeps)
+    lim.acquire()
+    assert len(sleeps) == before  # no additional sleep
+
+
+def test_penalty_pushes_gate_out(monkeypatch):
+    clock = {"t": 50.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(s2.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))
+    lim = s2._RateLimiter(jitter_fraction=0.0)
+    lim.configure(1.0)
+
+    lim.acquire()  # next slot = 51
+    lim.penalty(5)  # gate pushed to 55
+    lim.acquire()  # at t=50, must wait ~5s (not the normal 1s)
+    assert sleeps and 4.99 <= sleeps[-1] <= 5.01
+
+
+def test_penalty_is_monotonic_max():
+    lim = s2._RateLimiter(jitter_fraction=0.0)
+    lim.configure(1.0)
+    lim.penalty(10)
+    far = lim._next_allowed
+    lim.penalty(1)  # smaller penalty must not move gate earlier
+    assert lim._next_allowed == far
+
+
+def test_concurrent_callers_stagger():
+    # Real threads, tiny real interval; verifies serialization across threads.
+    lim = s2._RateLimiter(jitter_fraction=0.0)
+    lim.configure(0.02)
+    starts: list[float] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        lim.acquire()
+        with lock:
+            starts.append(time.monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    begin = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.monotonic() - begin
+
+    assert len(starts) == 5
+    # The five acquisitions serialize across ~4 intervals; they cannot all
+    # cluster at the same instant. Record-time reordering across CPUs makes
+    # individual gaps noisy, so assert on the span instead.
+    span = max(starts) - min(starts)
+    assert span >= 0.07, (span, elapsed)
+    assert elapsed >= 0.07, elapsed
+
+
+def test_configure_derives_interval_from_key():
+    s2.configure(api_key="k")  # builds a real httpx.Client, no network
+    assert s2._limiter.enabled
+    assert abs(s2._limiter.interval - 1.0) < 1e-9
+
+    s2.configure(api_key=None)
+    assert abs(s2._limiter.interval - 2.0) < 1e-9  # 0.5 RPS
+
+    s2.configure(api_key=None, rate_limit_per_second=4.0)
+    assert abs(s2._limiter.interval - 0.25) < 1e-9
+
+
+def test_lazy_client_does_not_arm_limiter():
+    assert s2._client is None
+    s2._get_client()
+    assert s2._limiter.enabled is False
+
+
+def test_max_retries_config_is_wired(monkeypatch):
+    monkeypatch.setattr(s2.time, "sleep", lambda *_a, **_k: None)
+    s2.configure(api_key="k", max_retries=1)
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(429, json={"error": "rate"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(S2Error):
+        fetch_citations(doi="10.1/x", client=client)
+    assert hits["n"] == 1  # range(1): a single attempt, no retries
+
+
+def test_429_retry_after_sets_global_penalty_and_caps(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))
+    s2.configure(api_key="k", max_retries=2)
+    s2._limiter.configure(1.0)  # arm (configure already did; be explicit)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, json={"error": "rate"}, headers={"Retry-After": "999"}
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(S2Error):
+        fetch_citations(doi="10.1/x", client=client)
+
+    # Retry-After (999) was capped to _MAX_RETRY_AFTER_SECONDS (30).
+    assert s2._limiter._next_allowed > time.monotonic() + 29.0
+    # No local sleep of 999 happened (would have hung the test).
+    assert all(s <= 30.0 for s in sleeps)
+
+
+def test_429_without_retry_after_uses_local_backoff(monkeypatch):
+    monkeypatch.setattr(s2.time, "sleep", lambda *_a, **_k: None)
+    s2.configure(api_key="k", max_retries=2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": "rate"})  # no Retry-After
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(S2Error):
+        fetch_citations(doi="10.1/x", client=client)
+    # Without Retry-After the gate only advances by the normal interval per
+    # attempt (2 attempts => ~2s out), never a large (30s) penalty.
+    assert s2._limiter._next_allowed <= time.monotonic() + 2.5
+
+
+def test_bulk_pages_each_throttle(monkeypatch):
+    acquires: list[int] = []
+    real_acquire = s2._limiter.acquire
+    monkeypatch.setattr(
+        s2._limiter, "acquire",
+        lambda: (acquires.append(1), real_acquire()),
+    )
+    # Disabled limiter so the spy runs without real sleeps; counts acquire()
+    # calls which equal the number of paged HTTP calls.
+    s2._limiter.configure(0.0)
+
+    pages = [
+        {"data": [{"paperId": "p1", "title": "T", "externalIds": {}}], "token": "next"},
+        {"data": [{"paperId": "p2", "title": "T", "externalIds": {}}]},  # no token
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=pages.pop(0))
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    out = search_papers("x", client=client, sort="citations", limit=1000)
+    assert len(out) == 2
+    assert len(acquires) == 2  # one acquire() per page

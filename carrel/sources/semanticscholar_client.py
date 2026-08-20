@@ -21,7 +21,9 @@ package, just httpx, matching arxiv.py / mineru_client.py.
 from __future__ import annotations
 
 import logging
+import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,16 +33,111 @@ import httpx
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.semanticscholar.org"
+DEFAULT_USER_AGENT = "Carrel/0.1 (+https://github.com/)"
 # S2 caps the citations page size at 1000; we default lower to stay polite.
 DEFAULT_CITATIONS_LIMIT = 500
 MAX_RETRIES = 3
 _BASE_WAIT_SECONDS = 2.0
+# S2 rate limits (per semanticscholar.org/product/api): an API key gets an
+# introductory 1 request/second shared across ALL endpoints; unauthenticated
+# traffic shares a congested pool that "may be further throttled". We default
+# the unauthenticated tier conservatively to 0.5 RPS.
+DEFAULT_RPS_WITH_KEY = 1.0
+DEFAULT_RPS_WITHOUT_KEY = 0.5
+# Cap a server-supplied Retry-After so one 429 can't stall the serial sync
+# worker for minutes. 30s bounds the worst case while giving S2 room.
+_MAX_RETRY_AFTER_SECONDS = 30.0
 
 # Module-level shared client, configured once at startup (like openalex/arxiv).
 _client: httpx.Client | None = None
 _base_url = DEFAULT_BASE_URL
 _api_key: str | None = None
 _timeout = 30.0
+_user_agent = DEFAULT_USER_AGENT
+_max_retries = MAX_RETRIES
+
+
+class _RateLimiter:
+    """Process-global min-interval gate (one token, no burst) for S2.
+
+    Thread-safe. ``configure(0)`` (the default) makes every method a no-op, so
+    paths that never call :func:`configure` (tests injecting a mock client,
+    direct/script use via the lazy client) are never throttled.
+
+    Coordinates all threads within one process. The app runs as a single
+    uvicorn process; if it ever moves to multiple workers, a cross-process
+    lock would be required here.
+    """
+
+    def __init__(self, jitter_fraction: float = 0.15) -> None:
+        self._lock = threading.Lock()
+        self._interval = 0.0  # 0 == disabled
+        self._next_allowed = 0.0  # monotonic timestamp
+        self._jitter_fraction = jitter_fraction
+
+    def configure(self, interval: float) -> None:
+        with self._lock:
+            self._interval = max(0.0, float(interval))
+            if self._interval <= 0.0:
+                self._next_allowed = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self._interval > 0.0
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    def acquire(self) -> None:
+        """Block until the next request is allowed, then reserve its slot."""
+        with self._lock:
+            if self._interval <= 0.0:
+                return
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait <= 0.0:
+                # Gate is open now; reserve the slot after this one.
+                self._next_allowed = now + self._jittered_interval()
+                return
+            # Reserve the next slot BEFORE sleeping so concurrent arrivals
+            # stagger by one interval instead of all waking together.
+            self._next_allowed += self._jittered_interval()
+        time.sleep(max(0.0, wait))
+
+    def penalty(self, seconds: float) -> None:
+        """Push the gate to ``now + seconds`` so every thread backs off.
+
+        Used on a 429 with a Retry-After header. Monotonic max: never moves
+        the gate earlier than an already-scheduled wait.
+        """
+        if seconds <= 0.0:
+            return
+        with self._lock:
+            if self._interval <= 0.0:
+                return
+            target = time.monotonic() + seconds
+            if target > self._next_allowed:
+                self._next_allowed = target
+
+    def _jittered_interval(self) -> float:
+        if self._jitter_fraction <= 0.0:
+            return self._interval
+        j = random.uniform(-self._jitter_fraction, self._jitter_fraction)
+        return max(0.0, self._interval * (1.0 + j))
+
+
+# Process-global gate, armed by configure() at startup.
+_limiter = _RateLimiter()
+
+
+def _build_client(
+    base_url: str, api_key: str | None, timeout: float, user_agent: str
+) -> httpx.Client:
+    headers = {"User-Agent": user_agent, "Accept": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    return httpx.Client(base_url=base_url, timeout=timeout, headers=headers)
 
 
 def configure(
@@ -48,24 +145,48 @@ def configure(
     base_url: str = DEFAULT_BASE_URL,
     api_key: str | None = None,
     timeout: float = 30.0,
-    user_agent: str = "Carrel/0.1 (+https://github.com/)",
+    user_agent: str = DEFAULT_USER_AGENT,
+    max_retries: int = MAX_RETRIES,
+    rate_limit_per_second: float | None = None,
 ) -> None:
-    """Idempotently (re)build the shared httpx client. Safe to call repeatedly."""
-    global _client, _base_url, _api_key, _timeout
+    """Idempotently (re)build the shared httpx client and arm the rate limiter.
+
+    Safe to call repeatedly. Production calls this once from the FastAPI
+    lifespan, which ARMS the limiter. The lazy :func:`_get_client` path does
+    NOT call this, so direct/script use and tests that inject their own
+    client are never throttled.
+    """
+    global _client, _base_url, _api_key, _timeout, _user_agent, _max_retries
     if _client is not None:
         _client.close()
-    headers = {"User-Agent": user_agent, "Accept": "application/json"}
-    if api_key:
-        headers["x-api-key"] = api_key
     _base_url = base_url.rstrip("/")
     _api_key = api_key
     _timeout = timeout
-    _client = httpx.Client(timeout=timeout, headers=headers)
+    _user_agent = user_agent
+    _max_retries = max(1, int(max_retries))
+    _client = _build_client(_base_url, _api_key, _timeout, _user_agent)
+
+    if rate_limit_per_second is not None and rate_limit_per_second > 0:
+        interval = 1.0 / rate_limit_per_second
+    elif api_key:
+        interval = 1.0 / DEFAULT_RPS_WITH_KEY
+    else:
+        interval = 1.0 / DEFAULT_RPS_WITHOUT_KEY
+    _limiter.configure(interval)
+    logger.info(
+        "S2 rate limiter armed: interval=%.2fs (api_key=%s)",
+        interval,
+        bool(api_key),
+    )
 
 
 def _get_client() -> httpx.Client:
+    # Bare default client for direct/script use. Deliberately does NOT call
+    # configure() (and therefore does NOT arm _limiter), so this path stays
+    # unthrottled and tests injecting their own client are unaffected.
+    global _client
     if _client is None:
-        configure()
+        _client = _build_client(DEFAULT_BASE_URL, None, _timeout, DEFAULT_USER_AGENT)
     assert _client is not None
     return _client
 
@@ -503,12 +624,14 @@ def _clean_venue(v: Any) -> str | None:
 def _get_with_retry(client: httpx.Client, url: str) -> httpx.Response | None:
     """GET with 429/5xx backoff. Returns None on 404, raises S2Error otherwise."""
     last_exc: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(_max_retries):
+        # Global gate: spaces every request across every endpoint/page/thread.
+        _limiter.acquire()
         try:
             resp = client.get(url)
         except httpx.HTTPError as e:
             last_exc = e
-            if attempt < MAX_RETRIES - 1:
+            if attempt < _max_retries - 1:
                 time.sleep(_backoff(attempt))
                 continue
             raise S2Error(f"S2 request failed: {e}") from e
@@ -518,10 +641,22 @@ def _get_with_retry(client: httpx.Client, url: str) -> httpx.Response | None:
             return None
         if resp.status_code in (429, 500, 502, 503, 504):
             last_exc = S2Error(f"S2 HTTP {resp.status_code}")
-            if attempt < MAX_RETRIES - 1:
-                wait = _retry_after(resp) or _backoff(attempt)
-                logger.warning("S2 %s; sleeping %.1fs", resp.status_code, wait)
-                time.sleep(wait)
+            if attempt < _max_retries - 1:
+                retry_after = _retry_after(resp)
+                if resp.status_code == 429 and retry_after is not None:
+                    wait = min(retry_after, _MAX_RETRY_AFTER_SECONDS)
+                    # Global backoff: push the gate so ALL threads hold until
+                    # this elapses, killing the thundering herd. The next
+                    # acquire() below blocks for the wait; sleep here too for
+                    # the disabled-limiter (test/direct) path.
+                    _limiter.penalty(wait)
+                    if not _limiter.enabled:
+                        time.sleep(wait)
+                    logger.warning("S2 429; global backoff %.1fs", wait)
+                else:
+                    wait = _backoff(attempt)
+                    logger.warning("S2 %s; sleeping %.1fs", resp.status_code, wait)
+                    time.sleep(wait)
                 continue
             raise S2Error(f"S2 HTTP {resp.status_code} after retries")
         if resp.status_code >= 400:
@@ -574,7 +709,9 @@ def _as_int(v: Any) -> int | None:
 
 
 def _backoff(attempt: int) -> float:
-    return _BASE_WAIT_SECONDS * (2 ** attempt)
+    base = _BASE_WAIT_SECONDS * (2 ** attempt)
+    # Equal jitter in [0.5*base, base] to desync concurrent retries.
+    return base * (0.5 + random.random() * 0.5)
 
 
 def _retry_after(resp: httpx.Response) -> float | None:

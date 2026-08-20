@@ -71,6 +71,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         base_url=cfg.semantic_scholar.base_url,
         api_key=cfg.semantic_scholar.api_key,
         timeout=cfg.semantic_scholar.request_timeout_seconds,
+        max_retries=cfg.semantic_scholar.max_retries,
+        rate_limit_per_second=cfg.semantic_scholar.rate_limit_per_second,
     )
     # pyalex is configured lazily by the sync pipeline; configure it here too
     # so /search gets the polite-pool mailto and the connect/read timeout.

@@ -32,10 +32,12 @@ arxiv:
 
 semantic_scholar:
   base_url: https://api.semanticscholar.org
-  api_key: null                       # optional S2_API_KEY; raises rate limit
+  api_key: null                       # optional S2_API_KEY; raises rate limit to 1 RPS
   request_timeout_seconds: 30
   max_retries: 3
-  delay_between_requests_seconds: 1.5
+  # Max S2 requests/second. null = auto: 1.0 with an API key (the documented
+  # introductory limit, shared across all endpoints), 0.5 without.
+  rate_limit_per_second: null
   citations_limit: 500                # cap stored "cited by" list per paper
   fetch_on_sync: true                 # look up citations for newly synced papers
 

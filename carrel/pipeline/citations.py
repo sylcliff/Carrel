@@ -8,7 +8,8 @@ synchronous and mirrors :mod:`carrel.pipeline.process`:
 
   - :func:`enrich_paper` enriches one paper and reports progress via a callback
     shaped like process.py's (a dict with ``stage`` / ``detail``).
-  - :func:`enrich_papers` walks a list, sleeping between calls to stay polite.
+  - :func:`enrich_papers` walks a list; request pacing is handled globally by
+    the S2 client's rate limiter.
   - :func:`select_stale` picks papers never enriched (for a first backfill).
 
 Failures are soft: a network/rate-limit error is logged and re-raised so the
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -249,13 +249,14 @@ def enrich_papers(
     *,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, int]:
-    """Enrich many papers, one at a time, with a courtesy delay between them.
+    """Enrich many papers, one at a time.
 
-    Returns counters ``{enriched, failed, skipped}``. A failure on one paper is
-    logged and counted but does not stop the batch.
+    Request pacing is handled globally by the S2 client's rate limiter (which
+    spaces the three calls within each paper and between papers), so no extra
+    delay is needed here. Returns counters ``{enriched, failed, skipped}``. A
+    failure on one paper is logged and counted but does not stop the batch.
     """
     enriched = failed = skipped = 0
-    delay = cfg.semantic_scholar.delay_between_requests_seconds
     total = len(paper_ids)
 
     for idx, pid in enumerate(paper_ids):
@@ -273,8 +274,6 @@ def enrich_papers(
         except Exception as e:  # noqa: BLE001 - batch must continue
             logger.warning("citation enrichment failed for %s: %s", pid, e)
             failed += 1
-        if delay and idx < total - 1:
-            time.sleep(delay)
 
     return {"enriched": enriched, "failed": failed, "skipped": skipped}
 

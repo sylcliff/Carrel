@@ -60,7 +60,14 @@ class SemanticScholarConfig(BaseModel):
     api_key: str | None = None  # optional x-api-key; raises rate limit
     request_timeout_seconds: int = 30
     max_retries: int = 3
-    delay_between_requests_seconds: float = 1.5  # politeness between papers
+    # Max requests per second. None = auto: 1.0 with an API key (S2's documented
+    # introductory limit, shared across all endpoints), 0.5 without (the
+    # unauthenticated pool is shared and may be throttled under load).
+    rate_limit_per_second: float | None = None
+    # Deprecated: inter-paper spacing is now handled by the global rate limiter
+    # inside semanticscholar_client. Retained so existing config.yaml still
+    # parses; ignored by the pipeline.
+    delay_between_requests_seconds: float = 1.5
     citations_limit: int = 500  # cap on stored citing-paper list
     fetch_on_sync: bool = True  # look up citations for newly synced papers
     # Max reference-less papers (enriched before the references-list feature
