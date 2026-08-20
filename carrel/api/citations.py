@@ -184,6 +184,7 @@ def list_citations(
         items.append(CitationItem(
             title=c.get("title"),
             year=c.get("year"),
+            venue=c.get("venue"),
             doi=c.get("doi"),
             arxiv_id=c.get("arxiv_id"),
             s2_paper_id=c.get("s2_paper_id"),
@@ -246,6 +247,7 @@ def list_references(
         items.append(CitationItem(
             title=c.get("title"),
             year=c.get("year"),
+            venue=c.get("venue"),
             doi=c.get("doi"),
             arxiv_id=c.get("arxiv_id"),
             s2_paper_id=c.get("s2_paper_id"),
@@ -317,6 +319,7 @@ def _fetch_openalex_page(
         out.append({
             "title": (w.get("title") or "").strip() or None,
             "year": w.get("publication_year"),
+            "venue": oa.work_venue(w),
             "doi": oa.work_doi(w),
             "arxiv_id": oa.work_arxiv_id(w),
             "s2_paper_id": None,

@@ -103,13 +103,36 @@ def configure(cfg: CarrelYAML) -> None:
 # ---------------------------------------------------------------------------
 
 
-def lookup_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
+def _title_similarity(a: str | None, b: str | None) -> float:
+    """Token Jaccard overlap in [0, 1] for loose title matching."""
+    import re as _re
+
+    toks_a = {t for t in _re.findall(r"[a-z0-9]+", (a or "").lower()) if len(t) > 1}
+    toks_b = {t for t in _re.findall(r"[a-z0-9]+", (b or "").lower()) if len(t) > 1}
+    if not toks_a or not toks_b:
+        return 0.0
+    return len(toks_a & toks_b) / max(len(toks_a | toks_b), 1)
+
+
+_ARXIV_TITLE_MATCH_THRESHOLD = 0.85
+
+
+def lookup_by_arxiv_id(
+    arxiv_id: str,
+    *,
+    title_hint: str | None = None,
+) -> dict[str, Any] | None:
     """Return the OpenAlex Work dict for an arXiv ID, or None.
 
     OpenAlex does not reliably index arXiv DOIs of the form 10.48550/arXiv.X.Y
     (returns 404 for many). The reliable approach is a multi-step search:
     try the DOI form first, then search by the arXiv ID as a token and pick
     the top hit that actually matches.
+
+    When ``title_hint`` is supplied and no id-field match is found, fall back to
+    a title search and accept a top hit whose normalized title has high token
+    overlap (≥ 0.85). This rescues preprints OpenAlex indexed under a title but
+    without a back-linked arXiv id.
     """
     arxiv_id = arxiv_id.strip()
     if not arxiv_id:
@@ -125,7 +148,7 @@ def lookup_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
         logger.debug("DOI lookup failed for %s: %s", arxiv_id, e)
 
     # 2. Search fallback — find a work whose ids actually reference this arXiv ID.
-    #    We do NOT return a top search hit on a weak match: attaching the wrong
+    #    We do NOT return a top search hit on a weak id match: attaching the wrong
     #    canonical Work ID would corrupt authorship/venue data for a paper.
     try:
         candidates = (
@@ -146,6 +169,17 @@ def lookup_by_arxiv_id(arxiv_id: str) -> dict[str, Any] | None:
                 return d
     except Exception as e:
         logger.debug("Search lookup failed for %s: %s", arxiv_id, e)
+
+    # 3. Title-hint fallback — OpenAlex sometimes has the work but never linked
+    #    its arXiv id. Accept only a strong title match to avoid wrong imports.
+    if title_hint:
+        try:
+            for cand in search_work(title_hint, limit=5):
+                cand_title = cand.get("title") or cand.get("display_name") or ""
+                if _title_similarity(title_hint, cand_title) >= _ARXIV_TITLE_MATCH_THRESHOLD:
+                    return cand
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Title-hint lookup failed for %s: %s", arxiv_id, e)
 
     return None
 

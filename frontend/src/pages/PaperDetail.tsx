@@ -278,7 +278,7 @@ export default function PaperDetail({ onProcessed }: Props) {
         </Card>
       )}
 
-      {md && pdfOpen && p.pdf_path ? (
+      {pdfOpen && p.pdf_path ? (
         <Card className="overflow-hidden">
           <CardHeader className="py-3">
             <CardTitle className="text-base">PDF</CardTitle>
@@ -291,7 +291,8 @@ export default function PaperDetail({ onProcessed }: Props) {
             />
           </CardContent>
         </Card>
-      ) : md ? (
+      ) : null}
+      {md ? (
         <Card>
           <CardHeader className="flex-row items-center justify-between space-y-0">
             <button

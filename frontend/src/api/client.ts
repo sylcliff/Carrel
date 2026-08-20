@@ -66,6 +66,7 @@ export interface PaperDetail extends PaperSummary {
 export interface CitationItem {
   title: string | null;
   year: number | null;
+  venue: string | null;
   doi: string | null;
   arxiv_id: string | null;
   s2_paper_id: string | null;
@@ -341,6 +342,7 @@ export const importPaper = (body: {
   doi?: string;
   arxiv_id?: string;
   s2?: string;
+  title?: string;
 }) =>
   request<{ id: string; created: boolean }>("/import", {
     method: "POST",

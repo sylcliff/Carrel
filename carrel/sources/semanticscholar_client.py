@@ -420,7 +420,7 @@ def _get_citing_papers(
 ) -> list[dict[str, Any]]:
     url = (
         f"{_base_url}/graph/v1/paper/{s2_id}/citations"
-        f"?fields=title,year,externalIds&limit={min(limit, DEFAULT_CITATIONS_LIMIT)}"
+        f"?fields=title,year,venue,externalIds&limit={min(limit, DEFAULT_CITATIONS_LIMIT)}"
     )
     resp = _get_with_retry(client, url)
     if resp is None:
@@ -440,6 +440,7 @@ def _get_citing_papers(
         out.append({
             "title": (cp.get("title") or "").strip() or None,
             "year": cp.get("year"),
+            "venue": _clean_venue(cp.get("venue")),
             "doi": doi,
             "arxiv_id": arxiv_id,
             "s2_paper_id": cp.get("paperId"),
@@ -458,7 +459,7 @@ def _get_referenced_papers(
     """
     url = (
         f"{_base_url}/graph/v1/paper/{s2_id}/references"
-        f"?fields=title,year,externalIds&limit={min(limit, DEFAULT_CITATIONS_LIMIT)}"
+        f"?fields=title,year,venue,externalIds&limit={min(limit, DEFAULT_CITATIONS_LIMIT)}"
     )
     resp = _get_with_retry(client, url)
     if resp is None:
@@ -483,11 +484,20 @@ def _get_referenced_papers(
         out.append({
             "title": title,
             "year": cp.get("year"),
+            "venue": _clean_venue(cp.get("venue")),
             "doi": doi,
             "arxiv_id": arxiv_id,
             "s2_paper_id": cp.get("paperId"),
         })
     return out
+
+
+def _clean_venue(v: Any) -> str | None:
+    """S2's `venue` is a free-text string; normalize empties to None."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    return s or None
 
 
 def _get_with_retry(client: httpx.Client, url: str) -> httpx.Response | None:

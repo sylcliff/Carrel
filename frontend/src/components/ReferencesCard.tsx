@@ -216,7 +216,9 @@ export default function ReferencesCard({ paper, onChanged }: Props) {
                         <span className="font-medium">{title}</span>
                       )}
                       <span className="ml-2 text-xs text-muted-foreground">
-                        {c.year ?? "—"}
+                        {c.venue ? <span>{c.venue}</span> : null}
+                        {c.venue && c.year ? <span className="mx-1">·</span> : null}
+                        {c.year ?? (c.venue ? null : "—")}
                       </span>
                     </span>
                     <CitationRowActions

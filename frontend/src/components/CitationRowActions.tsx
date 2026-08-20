@@ -3,7 +3,32 @@ import { useState } from "react";
 import { Check, FileDown } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Link } from "react-router-dom";
-import { importPaper, type CitationItem } from "@/api/client";
+import { importPaper, APIError, type CitationItem } from "@/api/client";
+
+/** Pull a human-readable reason out of a thrown import error. */
+function errorMessage(e: unknown): string {
+  if (e instanceof APIError) {
+    // FastAPI errors come back as {"detail": "..."} (string) or a structured
+    // list; pull out whatever we can show.
+    try {
+      const parsed = JSON.parse(e.message);
+      if (typeof parsed?.detail === "string") return parsed.detail;
+      if (Array.isArray(parsed?.detail)) {
+        return parsed.detail
+          .map((d: { msg?: string }) => d?.msg)
+          .filter(Boolean)
+          .join("; ");
+      }
+    } catch {
+      // fall through to raw text
+    }
+    if (e.status === 404) return "Not found on OpenAlex/S2";
+    if (e.status === 429) return "Rate limited — retry in a moment";
+    if (e.status === 422) return e.message || "Not importable";
+    return e.message || `HTTP ${e.status}`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
 
 type Props = {
   item: CitationItem;
@@ -62,12 +87,13 @@ export default function CitationRowActions({ item, onImported }: Props) {
         doi: item.doi ?? undefined,
         arxiv_id: item.arxiv_id ?? undefined,
         s2: item.s2_paper_id ?? undefined,
+        title: item.title ?? undefined,
       });
       setImportedId(out.id);
       setState("done");
       onImported?.(out.id);
     } catch (e) {
-      setErr(String(e));
+      setErr(errorMessage(e));
       setState("idle");
     }
   }
@@ -85,7 +111,14 @@ export default function CitationRowActions({ item, onImported }: Props) {
         <FileDown className="mr-1 h-3.5 w-3.5" />
         {state === "busy" ? "Importing…" : "Import"}
       </Button>
-      {err ? <span className="ml-2 text-xs text-red-600">failed</span> : null}
+      {err ? (
+        <span
+          className="ml-2 max-w-[260px] truncate text-xs text-red-600"
+          title={err}
+        >
+          {err}
+        </span>
+      ) : null}
     </span>
   );
 }

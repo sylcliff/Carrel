@@ -49,6 +49,7 @@ def _openalex_to_citing(work: dict) -> dict:
     return {
         "title": (work.get("title") or work.get("display_name") or "").strip() or None,
         "year": work.get("publication_year"),
+        "venue": oa.work_venue(work),
         "doi": oa.work_doi(work),
         "arxiv_id": oa.work_arxiv_id(work),
         "s2_paper_id": None,
@@ -58,7 +59,8 @@ def _openalex_to_citing(work: dict) -> dict:
 
 def _merge_citing(s2_list: list[dict], oa_list: list[dict]) -> list[dict]:
     """Merge S2 and OpenAlex citing-paper dicts, dedup by (doi, arxiv_id, s2_id,
-    openalex_id, normalized title). S2 entries win on conflict (richer fields)."""
+    openalex_id, normalized title). S2 entries win on conflict (richer fields);
+    when an S2 entry is missing venue but the OA match has one, backfill it."""
     out: list[dict] = []
     seen_doi: set[str] = set()
     seen_arxiv: set[str] = set()
@@ -66,30 +68,46 @@ def _merge_citing(s2_list: list[dict], oa_list: list[dict]) -> list[dict]:
     seen_oa: set[str] = set()
     seen_title: set[str] = set()
 
-    def _add(d: dict) -> bool:
+    def _dup(d: dict) -> bool:
         doi = (d.get("doi") or "").lower() or None
         arxiv = d.get("arxiv_id") or None
         s2id = d.get("s2_paper_id") or None
         oaid = d.get("openalex_id") or None
         title = _norm_title(d.get("title"))
-        if doi and doi in seen_doi: return False
-        if arxiv and arxiv in seen_arxiv: return False
-        if s2id and s2id in seen_s2: return False
-        if oaid and oaid in seen_oa: return False
-        if title and title in seen_title: return False
+        if (doi and doi in seen_doi) or (arxiv and arxiv in seen_arxiv) or \
+           (s2id and s2id in seen_s2) or (oaid and oaid in seen_oa) or \
+           (title and title in seen_title):
+            return True
         if doi: seen_doi.add(doi)
         if arxiv: seen_arxiv.add(arxiv)
         if s2id: seen_s2.add(s2id)
         if oaid: seen_oa.add(oaid)
         if title: seen_title.add(title)
-        return True
+        return False
+
+    def _find_existing(d: dict) -> dict | None:
+        doi = (d.get("doi") or "").lower() or None
+        arxiv = d.get("arxiv_id") or None
+        oaid = d.get("openalex_id") or None
+        title = _norm_title(d.get("title"))
+        for existing in out:
+            if (doi and (existing.get("doi") or "").lower() == doi) or \
+               (arxiv and existing.get("arxiv_id") == arxiv) or \
+               (oaid and existing.get("openalex_id") == oaid) or \
+               (title and _norm_title(existing.get("title")) == title):
+                return existing
+        return None
 
     for d in s2_list:
-        if _add(d):
-            out.append(d)
+        if not _dup(d):
+            out.append(dict(d))
     for d in oa_list:
-        if _add(d):
-            out.append(d)
+        match = _find_existing(d)
+        if match is not None:
+            if not match.get("venue") and d.get("venue"):
+                match["venue"] = d["venue"]
+        elif not _dup(d):
+            out.append(dict(d))
     return out
 
 

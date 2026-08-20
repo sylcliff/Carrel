@@ -304,3 +304,50 @@ def test_import_via_s2_resolves_to_paper(session, client: TestClient, monkeypatc
     body = r.json()
     assert body["created"] is True
     assert body["id"] == "W1"
+
+
+def test_import_s2_only_when_openalex_has_nothing(session, client, monkeypatch):
+    """When OA DOI/arXiv/title all miss, import creates an s2: paper from S2."""
+    import carrel.api.search as search_mod
+
+    s2_row = _s2_row(s2_id="s2zzz", doi=None, arxiv=None, title="Orphan paper",
+                     venue="Some Workshop", year="2021-03-01")
+    s2_row["pdf_url"] = "https://example.org/p.pdf"
+
+    monkeypatch.setattr(search_mod.s2, "fetch_paper", lambda *a, **k: s2_row)
+    monkeypatch.setattr(search_mod.oa, "lookup_by_doi", lambda *a, **k: None)
+    monkeypatch.setattr(search_mod.oa, "lookup_by_arxiv_id", lambda *a, **k: None)
+    monkeypatch.setattr(search_mod.oa, "search_work", lambda *a, **k: [])
+
+    r = client.post("/import", json={"s2": "s2zzz"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["created"] is True
+    assert body["id"] == "s2:s2zzz"
+
+    from carrel.models import Paper
+    paper = session.get(Paper, "s2:s2zzz")
+    assert paper is not None
+    assert paper.id_kind == "semanticscholar"
+    assert paper.s2_paper_id == "s2zzz"
+    assert paper.pdf_url == "https://example.org/p.pdf"
+    assert paper.title == "Orphan paper"
+
+
+def test_import_s2_only_is_idempotent(session, client, monkeypatch):
+    """Re-importing an s2 paper returns the existing row (created=False)."""
+    import carrel.api.search as search_mod
+
+    s2_row = _s2_row(s2_id="s2dup", doi=None, arxiv=None, title="Dup")
+    monkeypatch.setattr(search_mod.s2, "fetch_paper", lambda *a, **k: s2_row)
+    monkeypatch.setattr(search_mod.oa, "lookup_by_doi", lambda *a, **k: None)
+    monkeypatch.setattr(search_mod.oa, "lookup_by_arxiv_id", lambda *a, **k: None)
+    monkeypatch.setattr(search_mod.oa, "search_work", lambda *a, **k: [])
+
+    r1 = client.post("/import", json={"s2": "s2dup"})
+    assert r1.status_code == 200, r1.text
+    assert r1.json() == {"id": "s2:s2dup", "created": True}
+
+    r2 = client.post("/import", json={"s2": "s2dup"})
+    assert r2.status_code == 200, r2.text
+    assert r2.json() == {"id": "s2:s2dup", "created": False}

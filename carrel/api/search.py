@@ -28,6 +28,7 @@ import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -785,11 +786,19 @@ def _resolve_work_for_import(
     doi: str | None,
     arxiv_id: str | None,
     s2_id: str | None,
-) -> dict | None:
-    """Resolve whichever identifier the client gave us into an OpenAlex Work.
+    title: str | None = None,
+) -> tuple[dict, str] | None:
+    """Resolve whichever identifier the client gave us to importable metadata.
 
-    Priority: OpenAlex W-id → DOI → arXiv id → S2 id (looked up then mapped to
-    DOI/arXiv, with title-search fallback). Returns None if nothing resolves.
+    Returns ``(record, source)`` where ``source`` is ``"openalex"`` (a real
+    OpenAlex Work dict) or ``"semantic_scholar"`` (a synthetic record built
+    from an S2 paper, used when OpenAlex has no copy). Returns None if nothing
+    resolves on either source.
+
+    Resolution order: OpenAlex W-id → DOI → arXiv id (with title-hint fallback)
+    → S2 id (mapped to DOI/arXiv, then OpenAlex title search). If every
+    OpenAlex path fails but S2 has the paper, fall back to the S2 record so the
+    paper can still be imported (id_kind=semanticscholar).
     """
     work: dict | None = None
     if oa_id:
@@ -803,34 +812,90 @@ def _resolve_work_for_import(
     if work is None and doi:
         work = oa.lookup_by_doi(doi)
     if work is None and arxiv_id:
-        work = oa.lookup_by_arxiv_id(arxiv_id)
-    if work is None and s2_id:
-        # Resolve via S2 first to get DOI/arXiv, then use the normal path.
-        try:
-            s2_paper = s2.fetch_paper(s2_id)
-        except s2.S2Error as e:
-            logger.warning("S2 lookup for import %s failed: %s", s2_id, e)
-            s2_paper = None
-        if s2_paper:
-            if s2_paper.get("doi"):
-                work = oa.lookup_by_doi(s2_paper["doi"])
-            if work is None and s2_paper.get("arxiv_id"):
-                work = oa.lookup_by_arxiv_id(s2_paper["arxiv_id"])
-        if work is None and s2_paper and s2_paper.get("title"):
-            # Last-ditch: OpenAlex title search, take top hit only if the
-            # normalized titles match closely. We refuse loose matches to
-            # avoid importing the wrong paper (mirrors lookup_by_arxiv_id's
-            # strict-match discipline).
+        work = oa.lookup_by_arxiv_id(arxiv_id, title_hint=title)
+
+    # We need an S2 lookup only if OpenAlex hasn't resolved the work: either
+    # the client gave an s2 id directly, or all OA paths (W/DOI/arXiv) missed.
+    s2_paper: dict | None = None
+    if work is None:
+        # S2's /paper/{id} needs a prefixed id for DOI/arXiv lookups.
+        if s2_id:
+            lookup_id = s2_id
+        elif doi:
+            lookup_id = f"DOI:{doi}"
+        elif arxiv_id:
+            lookup_id = f"ARXIV:{arxiv_id}"
+        else:
+            lookup_id = None
+        if lookup_id:
             try:
-                cand = oa.search_work(s2_paper["title"], limit=3)
-            except Exception:  # noqa: BLE001
-                cand = []
-            for w in cand:
-                wt = (w.get("title") or "").lower()
-                if _title_similarity(s2_paper["title"], wt) >= 0.85:
-                    work = w
-                    break
-    return work
+                s2_paper = s2.fetch_paper(lookup_id)
+            except s2.S2Error as e:
+                logger.warning("S2 lookup for import %s failed: %s", lookup_id, e)
+                s2_paper = None
+            if s2_paper:
+                doi = doi or s2_paper.get("doi")
+                arxiv_id = arxiv_id or s2_paper.get("arxiv_id")
+                title = title or s2_paper.get("title")
+
+    if work is None and s2_paper:
+        if s2_paper.get("doi"):
+            work = oa.lookup_by_doi(s2_paper["doi"])
+        if work is None and s2_paper.get("arxiv_id"):
+            work = oa.lookup_by_arxiv_id(
+                s2_paper["arxiv_id"], title_hint=s2_paper.get("title")
+            )
+    if work is None and s2_paper and s2_paper.get("title"):
+        # Last-ditch OpenAlex path: title search with a strict match threshold.
+        try:
+            cand = oa.search_work(s2_paper["title"], limit=3)
+        except Exception:  # noqa: BLE001
+            cand = []
+        for w in cand:
+            wt = (w.get("title") or w.get("display_name") or "").lower()
+            if _title_similarity(s2_paper["title"], wt) >= 0.85:
+                work = w
+                break
+
+    if work is not None:
+        return work, "openalex"
+
+    # OpenAlex has nothing. If S2 found the paper, build a synthetic record so
+    # it can still be imported without a canonical Work ID.
+    if s2_paper:
+        return _s2_record_to_work(s2_paper), "semantic_scholar"
+
+    return None
+
+
+def _s2_record_to_work(rec: dict[str, Any]) -> dict[str, Any]:
+    """Adapt a normalized S2 search row into a Work-shaped dict for import.
+
+    Only the fields the import path reads are populated. Marked with
+    ``_source == "semantic_scholar"`` so :func:`import_external_paper` can
+    branch on it.
+    """
+    authors = [
+        {"name": name}
+        for name in (rec.get("authors") or [])
+        if isinstance(name, str) and name.strip()
+    ]
+    return {
+        "_source": "semantic_scholar",
+        "id": f"https://www.semanticscholar.org/paper/{rec.get('s2_paper_id')}",
+        "s2_paper_id": rec.get("s2_paper_id"),
+        "title": rec.get("title") or "(untitled)",
+        "doi": rec.get("doi"),
+        "arxiv_id": rec.get("arxiv_id"),
+        "venue": rec.get("venue"),
+        "publication_date": rec.get("publication_date"),
+        "abstract": rec.get("abstract"),
+        "authors": authors,
+        "pdf_url": rec.get("pdf_url"),
+        "citation_count": rec.get("citation_count"),
+        "reference_count": rec.get("reference_count"),
+        "raw": rec,
+    }
 
 
 def _title_similarity(a: str, b: str) -> float:
@@ -854,18 +919,20 @@ def import_external_paper(
 
     Accepts any of ``openalex_id`` / ``doi`` / ``arxiv_id`` / ``s2``.
     """
-    work = _resolve_work_for_import(
+    resolved = _resolve_work_for_import(
         oa_id=body.openalex_id,
         doi=body.doi,
         arxiv_id=body.arxiv_id,
         s2_id=body.s2,
+        title=body.title,
     )
-    if not work:
+    if not resolved:
         from fastapi import HTTPException
         raise HTTPException(
             status_code=404,
-            detail="could not resolve that identifier on OpenAlex/Semantic Scholar",
+            detail="Could not find this paper on OpenAlex or Semantic Scholar.",
         )
+    work, source = resolved
 
     # Block Zenodo deposits (same filter as subscription sync).
     if is_zenodo(oa.work_doi(work), oa.work_venue(work)):
@@ -875,17 +942,22 @@ def import_external_paper(
             detail="Zenodo deposits are not papers and cannot be imported into the library",
         )
 
+    s2_id = work.get("s2_paper_id") if source == "semantic_scholar" else None
     existing = _find_library_match(
         session,
-        oa_id=oa.work_id(work),
+        oa_id=oa.work_id(work) if source == "openalex" else None,
         doi=oa.work_doi(work),
         arxiv_id=oa.work_arxiv_id(work),
+        s2_id=s2_id,
     )
     if existing is not None:
         return ImportPaperOut(id=existing.id, created=False)
 
-    from datetime import UTC, datetime
     now = datetime.now(UTC)
+
+    if source == "semantic_scholar":
+        return _import_from_s2(session, work, now)
+
     pid = oa.work_id(work)
     if not pid:
         from fastapi import HTTPException
@@ -924,8 +996,57 @@ def import_external_paper(
     return ImportPaperOut(id=paper.id, created=True)
 
 
+def _import_from_s2(session: Session, work: dict[str, Any], now: datetime) -> ImportPaperOut:
+    """Insert a paper directly from a Semantic Scholar record (no OpenAlex Work).
+
+    Used as a fallback when OpenAlex has no copy of the paper. The Carrel id is
+    ``"s2:" + paperId``; DOI/arXiv are carried normally so download, citation
+    enrichment, and library matching all work.
+    """
+    s2_pid = work.get("s2_paper_id")
+    if not s2_pid:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=502, detail="Semantic Scholar record had no paper id")
+
+    pub_date = work.get("publication_date")
+    try:
+        parsed_date = datetime.fromisoformat(pub_date).date() if pub_date else None
+    except ValueError:
+        parsed_date = None
+
+    pdf_url = work.get("pdf_url")
+    paper = Paper(
+        id=f"s2:{s2_pid}",
+        id_kind="semanticscholar",
+        title=(work.get("title") or "").strip() or "(untitled)",
+        abstract=work.get("abstract"),
+        publication_date=parsed_date,
+        venue=work.get("venue"),
+        doi=work.get("doi"),
+        arxiv_id=work.get("arxiv_id"),
+        s2_paper_id=s2_pid,
+        pdf_url=pdf_url,
+        oa_status="oa" if pdf_url else "none",
+        source=SourceKind.both.value,
+        status=PaperStatus.pending.value,
+        authors=work.get("authors") or [],
+        raw_meta=work.get("raw") or work,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(paper)
+    session.commit()
+    session.refresh(paper)
+    return ImportPaperOut(id=paper.id, created=True)
+
+
 def _find_library_match(
-    session: Session, *, oa_id: str | None, doi: str | None, arxiv_id: str | None,
+    session: Session,
+    *,
+    oa_id: str | None,
+    doi: str | None,
+    arxiv_id: str | None,
+    s2_id: str | None = None,
 ) -> Paper | None:
     """Pre-import identifier check. Kept for the import path; search uses the
     batched resolver instead."""
@@ -934,6 +1055,17 @@ def _find_library_match(
             row = session.get(Paper, cand)
             if row is not None:
                 return row
+    if s2_id:
+        # Matches both s2-kind primary keys and OA papers whose s2_paper_id
+        # was populated by citation enrichment.
+        row = session.get(Paper, f"s2:{s2_id}")
+        if row is not None:
+            return row
+        row = session.exec(
+            select(Paper).where(col(Paper.s2_paper_id) == s2_id)
+        ).first()
+        if row is not None:
+            return row
     if doi:
         doi_variants = {doi, f"https://doi.org/{doi}"}
         rows = session.exec(select(Paper).where(col(Paper.doi).in_(doi_variants))).all()

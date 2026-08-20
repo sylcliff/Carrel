@@ -60,6 +60,7 @@ class CitationItem(BaseModel):
 
     title: str | None = None
     year: int | None = None
+    venue: str | None = None  # journal / conference / repository name
     doi: str | None = None
     arxiv_id: str | None = None
     s2_paper_id: str | None = None
@@ -145,6 +146,7 @@ class ImportPaperIn(BaseModel):
     doi: str | None = None
     arxiv_id: str | None = None
     s2: str | None = None
+    title: str | None = None  # display title; used as a loose-match fallback
 
 
 class ImportPaperOut(BaseModel):
