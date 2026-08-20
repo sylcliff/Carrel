@@ -273,6 +273,7 @@ def select_pending(session: Session, limit: int = 10) -> list[Paper]:
     stmt = (
         select(Paper)
         .where(
+            Paper.in_library.is_(True),
             Paper.pdf_url.is_not(None),
             Paper.status.in_(
                 [PaperStatus.pending.value, PaperStatus.failed.value]

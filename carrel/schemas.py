@@ -34,6 +34,8 @@ class PaperSummary(BaseModel):
     keywords: list[str] = []
     source: str
     citation_count: int | None = None
+    in_library: bool = True
+    discovered_at: datetime | None = None
 
 
 class PaperDetail(PaperSummary):

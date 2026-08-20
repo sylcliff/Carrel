@@ -160,6 +160,7 @@ def select_pending_embed(session: Session, limit: int = 20) -> list[Paper]:
     stmt = (
         select(Paper)
         .where(
+            Paper.in_library.is_(True),
             Paper.md_path.is_not(None),
             Paper.status.in_([
                 PaperStatus.parsed.value,

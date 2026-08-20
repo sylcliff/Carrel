@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -31,6 +32,8 @@ def _to_summary(p: Paper) -> PaperSummary:
         keywords=p.keywords or [],
         source=p.source,
         citation_count=p.citation_count,
+        in_library=p.in_library,
+        discovered_at=p.discovered_at,
     )
 
 
@@ -48,6 +51,8 @@ def _to_detail(p: Paper) -> PaperDetail:
         keywords=p.keywords or [],
         source=p.source,
         citation_count=p.citation_count,
+        in_library=p.in_library,
+        discovered_at=p.discovered_at,
         abstract=p.abstract,
         doi=p.doi,
         arxiv_id=p.arxiv_id,
@@ -71,12 +76,21 @@ def list_papers(
     offset: int = Query(0, ge=0),
     status: str | None = Query(None, description="Filter by paper status"),
     venue: str | None = Query(None, description="Case-insensitive substring match on venue name"),
+    in_library: bool | None = Query(
+        True,
+        description="True (default): library papers. False: inbox (discovered, not discarded). Null: all.",
+    ),
 ) -> list[PaperSummary]:
     stmt = select(Paper).order_by(Paper.created_at.desc()).offset(offset).limit(limit)
     if status:
         stmt = stmt.where(Paper.status == status)
     if venue:
         stmt = stmt.where(Paper.venue.ilike(f"%{venue}%"))
+    if in_library is not None:
+        stmt = stmt.where(Paper.in_library.is_(in_library))
+        if not in_library:
+            # Inbox view hides discarded papers.
+            stmt = stmt.where(Paper.discarded.is_(False))
     return [_to_summary(p) for p in session.exec(stmt).all()]
 
 
@@ -89,6 +103,53 @@ def get_paper(
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
     return _to_detail(p)
+
+
+@router.post("/{paper_id}/import")
+def import_paper_to_library(
+    paper_id: str,
+    session: Session = Depends(get_session_dep),
+) -> dict[str, object]:
+    """Move a discovered (inbox) paper into the library.
+
+    Metadata-only: the paper stays ``pending`` and download/parse is a separate
+    step. Importing also un-discards a previously discarded paper.
+    """
+    p = session.get(Paper, paper_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    p.in_library = True
+    p.discarded = False
+    p.updated_at = datetime.now(UTC)
+    session.add(p)
+    session.commit()
+    return {"id": p.id, "imported": True, "in_library": True}
+
+
+@router.post("/{paper_id}/discard")
+def discard_paper(
+    paper_id: str,
+    session: Session = Depends(get_session_dep),
+) -> dict[str, object]:
+    """Remove a discovered paper from the inbox (soft delete).
+
+    Only valid for inbox (``in_library=False``) papers. Library papers should be
+    deleted outright via DELETE. A later sync leaves the discarded flag intact;
+    only an explicit import revives it.
+    """
+    p = session.get(Paper, paper_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    if p.in_library:
+        raise HTTPException(
+            status_code=409,
+            detail="paper is in the library; use DELETE to remove it instead",
+        )
+    p.discarded = True
+    p.updated_at = datetime.now(UTC)
+    session.add(p)
+    session.commit()
+    return {"id": p.id, "discarded": True}
 
 
 @router.delete("/{paper_id}")

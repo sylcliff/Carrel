@@ -212,17 +212,24 @@ def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
 
 
 def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, object]:
-    """Insert or update each record.
+    """Discover records: insert new ones into the inbox, refresh existing ones.
 
-    Returns counters ``{new, updated, skipped, new_ids}`` where ``new_ids`` is
-    the list of paper IDs inserted in this pass (used by downstream enrichment
-    such as citation lookups).
+    Sync never adds a paper directly to the library. A never-before-seen record
+    is inserted with ``in_library=False`` (the inbox) and a ``discovered_at``
+    stamp; the user imports it explicitly later. Records we already know —
+    whether in the inbox or already in the library — get their metadata
+    refreshed, but their ``in_library`` / ``discarded`` flags are never changed
+    by a sync.
+
+    Returns counters ``{new_discovered, updated, skipped, discovered_ids}`` where
+    ``discovered_ids`` are the paper IDs newly inserted into the inbox this pass
+    (used by the caller, e.g. to avoid citation enrichment on non-library rows).
     """
     now = datetime.now(UTC)
     new_count = 0
     updated_count = 0
     skipped_count = 0
-    new_ids: list[str] = []
+    discovered_ids: list[str] = []
 
     for rec in records:
         if not rec.id:
@@ -231,13 +238,20 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
             continue
 
         existing = session.get(Paper, rec.id)
+        # State to carry over when promoting an `arxiv:<id>` placeholder to its
+        # canonical OpenAlex id (see below). Defaults are the fresh-inbox values
+        # used when there is no placeholder.
+        was_in_library = False
+        was_discarded = False
+        prior_discovered_at: datetime | None = None
         if existing is None and rec.id_kind == "openalex" and rec.arxiv_id:
             # A previous sync may have stored this paper under `arxiv:<id>`
             # because OpenAlex enrichment failed then. Promote the placeholder
             # to the canonical OpenAlex ID rather than inserting a duplicate.
             # No chunks/notes exist for a pending placeholder, so delete+insert
             # is safe; preserve any fields (e.g. the arXiv PDF URL) the
-            # canonical record lacks.
+            # canonical record lacks, plus the placeholder's inbox/library
+            # state so a promotion never silently re-imports or un-discards.
             placeholder = session.get(Paper, f"arxiv:{rec.arxiv_id}")
             if placeholder is not None:
                 logger.info(
@@ -248,6 +262,9 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
                     rec.oa_status = "oa"
                 if not rec.abstract and placeholder.abstract:
                     rec.abstract = placeholder.abstract
+                was_in_library = placeholder.in_library
+                was_discarded = placeholder.discarded
+                prior_discovered_at = placeholder.discovered_at
                 session.delete(placeholder)
 
         if existing is None:
@@ -266,14 +283,18 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
                 status=PaperStatus.pending.value,
                 authors=rec.authors,
                 raw_meta=rec.raw_meta,
+                in_library=was_in_library,
+                discarded=was_discarded,
+                discovered_at=prior_discovered_at or now,
                 created_at=now,
                 updated_at=now,
             )
             session.add(paper)
             new_count += 1
-            new_ids.append(rec.id)
+            discovered_ids.append(rec.id)
         else:
-            # Refresh metadata if our new record is stronger
+            # Refresh metadata if our new record is stronger. Never touch
+            # in_library / discarded here — sync doesn't manage membership.
             changed = False
             if rec.venue and not existing.venue:
                 existing.venue = rec.venue
@@ -302,10 +323,10 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
 
     session.commit()
     return {
-        "new": new_count,
+        "new_discovered": new_count,
         "updated": updated_count,
         "skipped": skipped_count,
-        "new_ids": new_ids,
+        "discovered_ids": discovered_ids,
     }
 
 
@@ -340,11 +361,11 @@ def run_sync(
         if fetch_errors:
             counts["source_errors"] = fetch_errors
 
-        # Best-effort citation enrichment for newly inserted papers, plus a
-        # bounded backfill of papers enriched before the references-list feature
-        # shipped (reference_count set but references still NULL). Failures here
-        # (rate limits, S2 downtime) must not fail the whole sync.
-        new_ids = counts.get("new_ids") or []
+        # Best-effort citation enrichment. Newly *discovered* papers are in the
+        # inbox (in_library=False) and are NOT enriched — don't spend S2 quota on
+        # papers the user hasn't kept. We only run a bounded backfill over
+        # library papers (reference_count set but references still NULL).
+        # Failures here (rate limits, S2 downtime) must not fail the whole sync.
         if cfg.semantic_scholar.fetch_on_sync:
             from carrel.pipeline import citations as cite_pipe
 
@@ -353,13 +374,7 @@ def run_sync(
                     session, limit=cfg.semantic_scholar.references_backfill_batch
                 )
             ]
-            # Preserve order, dedup (a backfill id could coincide with a new id).
-            seen: set[str] = set()
-            cite_ids: list[str] = []
-            for pid in [*list(new_ids), *backfill]:
-                if pid not in seen:
-                    seen.add(pid)
-                    cite_ids.append(pid)
+            cite_ids: list[str] = list(backfill)
             counts["references_backfilled"] = len(backfill)
 
             def _cite_progress(progress: dict) -> None:
@@ -375,15 +390,14 @@ def run_sync(
                 counts["citations_enriched"] = cite_counts["enriched"]
                 counts["citations_failed"] = cite_counts["failed"]
                 logger.info(
-                    "citation enrichment: enriched=%d failed=%d (new=%d, reference-backfill=%d)",
-                    cite_counts["enriched"], cite_counts["failed"],
-                    len(new_ids), len(backfill),
+                    "citation enrichment: enriched=%d failed=%d (reference-backfill=%d)",
+                    cite_counts["enriched"], cite_counts["failed"], len(backfill),
                 )
 
         logger.info(
-            "sync done: fetched=%d new=%d updated=%d skipped=%d",
+            "sync done: fetched=%d new_discovered=%d updated=%d skipped=%d",
             counts["fetched"],
-            counts["new"],
+            counts["new_discovered"],
             counts["updated"],
             counts["skipped"],
         )

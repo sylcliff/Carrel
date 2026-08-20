@@ -45,6 +45,8 @@ export interface PaperSummary {
   keywords: string[];
   source: string;
   citation_count: number | null;
+  in_library: boolean;
+  discovered_at: string | null;
 }
 
 export interface PaperDetail extends PaperSummary {
@@ -88,12 +90,19 @@ export interface CitationList {
   cached_count: number;
 }
 
-export const listPapers = (params?: { limit?: number; offset?: number; status?: string; venue?: string }) => {
+export const listPapers = (params?: {
+  limit?: number;
+  offset?: number;
+  status?: string;
+  venue?: string;
+  in_library?: boolean;
+}) => {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
   if (params?.offset) q.set("offset", String(params.offset));
   if (params?.status) q.set("status", params.status);
   if (params?.venue) q.set("venue", params.venue);
+  if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
 };
@@ -104,6 +113,21 @@ export const deletePaper = (id: string) =>
   request<{ id: string; deleted: boolean; removed_files: boolean }>(
     `/papers/${encodeURIComponent(id)}`,
     { method: "DELETE" },
+  );
+
+// Inbox → library (for papers discovered by sync). Metadata-only; the paper
+// stays "pending" until the user runs Process pending.
+export const importPaperToLibrary = (id: string) =>
+  request<{ id: string; imported: boolean; in_library: boolean }>(
+    `/papers/${encodeURIComponent(id)}/import`,
+    { method: "POST" },
+  );
+
+// Soft-remove a discovered paper from the inbox (inverse of import for inbox rows).
+export const discardPaper = (id: string) =>
+  request<{ id: string; discarded: boolean }>(
+    `/papers/${encodeURIComponent(id)}/discard`,
+    { method: "POST" },
   );
 
 export const getPaperMarkdown = (id: string) =>

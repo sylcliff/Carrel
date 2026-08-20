@@ -282,7 +282,10 @@ def select_stale(session: Session, limit: int = 50) -> list[Paper]:
     """Return papers that have never had citations fetched (oldest first)."""
     stmt = (
         select(Paper)
-        .where(Paper.citations_updated_at.is_(None))
+        .where(
+            Paper.in_library.is_(True),
+            Paper.citations_updated_at.is_(None),
+        )
         .order_by(Paper.created_at.asc())
         .limit(limit)
     )
@@ -307,6 +310,7 @@ def select_missing_references(session: Session, limit: int = 50) -> list[Paper]:
     stmt = (
         select(Paper)
         .where(
+            Paper.in_library.is_(True),
             Paper.reference_count.is_not(None),
             Paper.reference_count > 0,
             refs_null,

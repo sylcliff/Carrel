@@ -160,13 +160,14 @@ def _local_search_items(
     stmt = (
         select(Paper)
         .where(
+            Paper.in_library.is_(True),
             or_(
                 col(Paper.title).ilike(pattern),
                 col(Paper.abstract).ilike(pattern),
                 cast(Paper.authors, String).ilike(pattern),
                 col(Paper.doi).ilike(pattern),
                 col(Paper.arxiv_id).ilike(pattern),
-            )
+            ),
         )
         .order_by(Paper.updated_at.desc())
         .limit(limit)
@@ -393,6 +394,11 @@ def _resolve_library_membership(
 
     def _match(hit: merge_mod.MutableSearchHit) -> Paper | None:
         for p in papers:
+            # Only papers actually in the library count as "in library" here.
+            # A sync-discovered inbox row matching by identifier should remain
+            # importable from Search (it is not the user's library yet).
+            if not p.in_library:
+                continue
             if hit.openalex_id and (p.id == hit.openalex_id or p.id == f"https://openalex.org/{hit.openalex_id}"):
                 return p
             if hit.doi and p.doi:
@@ -951,6 +957,14 @@ def import_external_paper(
         s2_id=s2_id,
     )
     if existing is not None:
+        # The paper already exists (library or sync-discovered inbox). Importing
+        # from Search/citations moves it into the library if it wasn't already.
+        if not existing.in_library:
+            existing.in_library = True
+            existing.discarded = False
+            existing.updated_at = datetime.now(UTC)
+            session.add(existing)
+            session.commit()
         return ImportPaperOut(id=existing.id, created=False)
 
     now = datetime.now(UTC)

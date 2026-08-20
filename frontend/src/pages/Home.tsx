@@ -3,8 +3,10 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
+  discardPaper,
   embedPending,
   getHealth,
+  importPaperToLibrary,
   listPapers,
   listSubscriptions,
   processPending,
@@ -17,22 +19,30 @@ import { StatusDot } from "@/components/StatusDot";
 import { TaskList } from "@/components/TaskList";
 import { OaBadge } from "@/components/OaBadge";
 import { TopJournalSection } from "@/components/TopJournalSection";
+import { FileDown, X } from "lucide-react";
 
 export default function Home() {
   const [health, setHealth] = useState<Health | null>(null);
   const [papers, setPapers] = useState<PaperSummary[]>([]);
+  const [inbox, setInbox] = useState<PaperSummary[]>([]);
   const [subs, setSubs] = useState<Subscription[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [embedding, setEmbedding] = useState(false);
-  const [lastSync, setLastSync] = useState<{ fetched: number; new: number; updated: number; subscriptions: number } | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [lastSync, setLastSync] = useState<{ fetched: number; discovered: number; updated: number; subscriptions: number } | null>(null);
   const [taskNonce, setTaskNonce] = useState(0);
   const [err, setErr] = useState<string | null>(null);
 
   async function refresh() {
     try {
       setHealth(await getHealth());
-      setPapers(await listPapers({ limit: 30 }));
+      const [library, discovered] = await Promise.all([
+        listPapers({ limit: 30 }),
+        listPapers({ in_library: false, limit: 100 }),
+      ]);
+      setPapers(library);
+      setInbox(discovered);
       setSubs(await listSubscriptions());
     } catch (e) {
       setErr(String(e));
@@ -43,6 +53,33 @@ export default function Home() {
     refresh();
   }, []);
 
+  async function onImport(p: PaperSummary) {
+    setBusyId(p.id);
+    setErr(null);
+    try {
+      await importPaperToLibrary(p.id);
+      setInbox((prev) => prev.filter((x) => x.id !== p.id));
+      await refresh();
+    } catch (e) {
+      setErr(`Import failed: ${String(e)}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function onDiscard(p: PaperSummary) {
+    setBusyId(p.id);
+    setErr(null);
+    try {
+      await discardPaper(p.id);
+      setInbox((prev) => prev.filter((x) => x.id !== p.id));
+    } catch (e) {
+      setErr(`Discard failed: ${String(e)}`);
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function onSync() {
     setSyncing(true);
     setErr(null);
@@ -51,7 +88,7 @@ export default function Home() {
       if (job.stats) {
         setLastSync({
           fetched: Number(job.stats.fetched ?? 0),
-          new: Number(job.stats.new ?? 0),
+          discovered: Number(job.stats.new_discovered ?? 0),
           updated: Number(job.stats.updated ?? 0),
           subscriptions: Number(job.stats.subscriptions ?? subs.length),
         });
@@ -135,7 +172,7 @@ export default function Home() {
               <CardContent className="pt-5 text-sm">
                 Last sync:{" "}
                 <b>{lastSync.fetched}</b> fetched,{" "}
-                <b className="text-green-600">{lastSync.new}</b> new,{" "}
+                <b className="text-green-600">{lastSync.discovered}</b> new discoveries,{" "}
                 <b className="text-blue-600">{lastSync.updated}</b> updated
                 {subs.length > 0 && (
                   <> across <b>{lastSync.subscriptions}</b> subscription(s)</>
@@ -157,15 +194,72 @@ export default function Home() {
             </Card>
           )}
 
+          {inbox.length > 0 && (
+            <section>
+              <h2 className="mb-3 text-lg font-semibold">
+                Discovered <span className="text-sm font-normal text-muted-foreground">({inbox.length})</span>
+              </h2>
+              <p className="-mt-2 mb-3 text-xs text-muted-foreground">
+                New papers from your subscriptions. Import the ones you want to add to your library.
+              </p>
+              <div className="grid gap-3">
+                {inbox.map((p, i) => (
+                  <Card key={p.id}>
+                    <CardContent className="flex items-start gap-3 p-4">
+                      <span className="w-7 shrink-0 select-none pt-1 text-right text-sm tabular-nums text-muted-foreground">
+                        {i + 1}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <Link to={`/papers/${encodeURIComponent(p.id)}`} className="font-medium hover:underline">
+                          {p.title}
+                        </Link>
+                        <div className="text-xs text-muted-foreground">
+                          {p.authors.slice(0, 4).join(", ")}
+                          {p.authors.length > 4 ? " et al." : ""} · {p.venue ?? p.source}
+                          {p.publication_date && <> · {p.publication_date}</>}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground">
+                        {p.citation_count !== null && p.citation_count !== undefined && (
+                          <span title="Citations (Semantic Scholar)">🏆 {p.citation_count}</span>
+                        )}
+                        <OaBadge oaStatus={p.oa_status} status={p.status} />
+                        <Button
+                          size="sm"
+                          onClick={() => onImport(p)}
+                          disabled={busyId === p.id}
+                          title="Add to library (metadata only)"
+                        >
+                          <FileDown className="mr-1 h-3.5 w-3.5" />
+                          {busyId === p.id ? "Importing…" : "Import"}
+                        </Button>
+                        <button
+                          type="button"
+                          onClick={() => onDiscard(p)}
+                          disabled={busyId === p.id}
+                          className="rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                          title="Discard from inbox"
+                          aria-label="Discard"
+                        >
+                          <X className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </CardContent>
+                  </Card>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section>
             <h2 className="mb-3 text-lg font-semibold">
-              Recently fetched <span className="text-sm font-normal text-muted-foreground">({today.length})</span>
+              Recently added <span className="text-sm font-normal text-muted-foreground">({today.length})</span>
             </h2>
             <div className="grid gap-3">
               {today.length === 0 && subs.length > 0 && (
                 <Card>
                   <CardContent className="pt-5 text-sm text-muted-foreground">
-                    Nothing in the last 72h. Try a longer sync or a different keyword.
+                    Nothing in the last 72h. Import discoveries above or sync more subscriptions.
                   </CardContent>
                 </Card>
               )}

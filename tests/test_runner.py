@@ -107,15 +107,46 @@ def test_merge_skips_record_with_no_id(caplog):
 
 def test_upsert_inserts_new(session):
     counts = upsert_records(session, [_rec(), _rec(id="W2", title="Two")])
-    assert counts == {"new": 2, "updated": 0, "skipped": 0, "new_ids": ["W1", "W2"]}
-    assert session.get(Paper, "W1").title == "Paper One"
+    assert counts == {"new_discovered": 2, "updated": 0, "skipped": 0,
+                      "discovered_ids": ["W1", "W2"]}
+    p1 = session.get(Paper, "W1")
+    assert p1.title == "Paper One"
+    assert p1.status == PaperStatus.pending.value
+    # Sync discovers into the inbox — new papers are NOT in the library yet.
+    assert p1.in_library is False
+    assert p1.discovered_at is not None
     assert session.get(Paper, "W2").status == PaperStatus.pending.value
 
 
 def test_upsert_skips_no_id(session):
     counts = upsert_records(session, [_rec(id="")])
-    assert counts == {"new": 0, "updated": 0, "skipped": 1, "new_ids": []}
+    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1, "discovered_ids": []}
     assert len(session.exec(select(Paper)).all()) == 0
+
+
+def test_upsert_does_not_reattach_discarded_or_library_paper(session):
+    """Re-syncing a known paper must not change its membership flags: a library
+    paper stays in the library, and a discarded inbox paper stays discarded."""
+    upsert_records(session, [_rec()])
+    p = session.get(Paper, "W1")
+    p.in_library = True  # user imported it
+    session.add(p)
+    session.commit()
+
+    upsert_records(session, [_rec()])
+    session.refresh(p)
+    assert p.in_library is True
+    assert p.discarded is False
+
+    p.in_library = False
+    p.discarded = True  # user discarded it from the inbox
+    session.add(p)
+    session.commit()
+
+    upsert_records(session, [_rec()])
+    session.refresh(p)
+    assert p.in_library is False
+    assert p.discarded is True
 
 
 def test_upsert_backfills_missing_fields_on_existing(session):
@@ -136,7 +167,7 @@ def test_upsert_backfills_missing_fields_on_existing(session):
 def test_upsert_counts_skip_when_nothing_new(session):
     upsert_records(session, [_rec()])
     counts = upsert_records(session, [_rec()])
-    assert counts == {"new": 0, "updated": 0, "skipped": 1, "new_ids": []}
+    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1, "discovered_ids": []}
 
 
 def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
@@ -156,9 +187,13 @@ def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
     )
     counts = upsert_records(session, [canonical])
 
-    assert counts["new"] == 1
+    assert counts["new_discovered"] == 1
     assert session.get(Paper, "arxiv:2401.00001") is None
-    assert session.get(Paper, "W500") is not None
+    promoted = session.get(Paper, "W500")
+    assert promoted is not None
+    # Promotion preserves the inbox state (the placeholder was discovered, not
+    # imported), so the canonical row stays out of the library.
+    assert promoted.in_library is False
     assert len(session.exec(select(Paper)).all()) == 1
 
 
@@ -219,13 +254,14 @@ def test_run_sync_persists_papers_and_updates_job(session, cfg):
         session.commit()
         counts = run_sync(session, cfg, lookback_hours=24, job=job)
 
-    assert counts["new"] == 1
+    assert counts["new_discovered"] == 1
     p = session.get(Paper, "arxiv:2401.00001")
     assert p is not None
     assert p.title == "Fetched From arXiv"
+    assert p.in_library is False  # sync discovers, does not import
     session.refresh(job)
     assert job.status == JobStatus.done.value
-    assert job.stats["new"] == 1
+    assert job.stats["new_discovered"] == 1
 
 
 def test_run_sync_swallows_per_source_errors_and_records_them(session, cfg):

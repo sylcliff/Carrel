@@ -80,6 +80,8 @@ def _resolve_library(
         clauses.append(Paper.id.in_(oa_variants))
 
     for p in session.exec(select(Paper).where(or_(*clauses))).all():
+        if not p.in_library:
+            continue  # inbox/discovered papers aren't "in the library" yet
         if p.doi:
             bare = p.doi.lower().removeprefix("https://doi.org/").removeprefix("http://doi.org/")
             by_id[f"doi:{bare}"] = p.id

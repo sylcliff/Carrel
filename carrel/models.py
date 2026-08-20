@@ -86,6 +86,17 @@ class Paper(SQLModel, table=True):
     status: str = Field(default=PaperStatus.pending.value, max_length=16, index=True)
     error: str | None = None
 
+    # Library membership. Sync/import-discover flows store fetched candidates
+    # with in_library=False (the inbox); the user explicitly imports a paper,
+    # flipping this to True. `discarded` hides an inbox row without deleting it
+    # (a deliberate import revives it). `discovered_at` stamps when a sync first
+    # surfaced the paper, independent of created_at.
+    in_library: bool = Field(default=True, index=True)
+    discarded: bool = Field(default=False, index=True)
+    discovered_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+
     # AI outputs (M4)
     tldr_en: str | None = None
     tldr_zh: str | None = None

@@ -101,7 +101,8 @@ def test_sync_inline_runs_pipeline(client, session):
     assert r.status_code == 200, r.text
     job = r.json()
     assert job["status"] in ("done", "failed")
-    assert job["stats"]["new"] == 1
+    assert job["stats"]["new_discovered"] == 1
     rows = session.exec(select(Paper)).all()
     assert len(rows) == 1
     assert rows[0].title == "API-Synced Paper"
+    assert rows[0].in_library is False  # sync discovers into the inbox

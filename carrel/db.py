@@ -62,7 +62,30 @@ def init_db(engine: Engine) -> None:
     # an existing table. Each statement is idempotent.
     _ensure_columns(engine, "papers", {
         "references": "JSON",
+        # Inbox: sync discovers candidates (in_library=False); the user imports
+        # a paper to flip it. Existing rows predate the feature and are all in
+        # the library, so the column is added with a DEFAULT and backfilled.
+        # Use TRUE/FALSE literals (Postgres rejects integer 1 as a boolean
+        # default; SQLite accepts both).
+        "in_library": "BOOLEAN DEFAULT TRUE NOT NULL",
+        "discarded": "BOOLEAN DEFAULT FALSE NOT NULL",
+        # Postgres has no DATETIME type; TIMESTAMP works on both it and SQLite.
+        "discovered_at": "TIMESTAMP",
     })
+
+    # Backfill: papers created before the inbox feature existed are already in
+    # the library. Only touches rows whose column came back NULL (SQLite treats
+    # a missing-at-ADD COLUMN DEFAULT inconsistently across versions).
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE papers SET in_library=TRUE WHERE in_library IS NULL"
+            )
+    else:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE papers SET in_library=1 WHERE in_library IS NULL"
+            )
 
     # HNSW index for cosine similarity over chunk embeddings. Built once at
     # startup (IF NOT EXISTS makes it idempotent). HNSW defaults (m=16,
