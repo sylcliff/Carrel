@@ -251,6 +251,20 @@ class EmbedRequest(BaseModel):
     background: bool = False
 
 
+class SummarizeRequest(BaseModel):
+    """Trigger LLM summary for one paper or a batch (M4).
+
+    If ``paper_id`` is given, only that paper is summarized; otherwise up to
+    ``limit`` parsed-but-unsummarized papers are processed. ``force=True``
+    regenerates fields that already exist (e.g. an S2-sourced ``tldr_en``).
+    """
+
+    paper_id: str | None = None
+    limit: int = 20
+    background: bool = False
+    force: bool = False
+
+
 # -------- Search (M5) full-text --------
 
 

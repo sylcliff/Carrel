@@ -16,6 +16,7 @@ import {
   listPaperTags,
   processPaper,
   removePaperTag,
+  summarizePaper,
   toggleFavorite,
   type Job,
   type PaperDetail as PaperDetailT,
@@ -141,6 +142,22 @@ export default function PaperDetail({ onProcessed }: Props) {
     }
   }
 
+  async function onSummarize(force = true) {
+    if (!id) return;
+    setProcessing(true);
+    setErr(null);
+    setJob(null);
+    try {
+      const started = await summarizePaper(id, true, force);
+      const firstJob = started[0];
+      if (!firstJob) throw new Error("No job returned");
+      watchJob(firstJob);
+    } catch (e) {
+      setProcessing(false);
+      setErr(String(e));
+    }
+  }
+
   useEffect(
     () => () => {
       if (timer.current) window.clearInterval(timer.current);
@@ -211,6 +228,10 @@ export default function PaperDetail({ onProcessed }: Props) {
   const canEmbed =
     p.status === "parsed" || p.status === "summarized" ||
     (p.status === "failed" && Boolean(p.md_path));
+  // Summary regeneration is available once the paper has been parsed to
+  // Markdown (chained summarization runs automatically after parse).
+  const canSummarize = Boolean(p.md_path);
+  const hasSummary = Boolean(p.tldr_en || p.tldr_zh || p.summary_zh);
   const stage = (job?.stats?.stage as string | undefined) ?? "";
   const detail = (job?.stats?.detail as string | undefined) ?? job?.message ?? "";
   const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
@@ -292,6 +313,16 @@ export default function PaperDetail({ onProcessed }: Props) {
                 {running ? "Embedding…" : "Chunk & embed"}
               </Button>
             )}
+            {canSummarize && (
+              <Button
+                onClick={() => onSummarize(true)}
+                disabled={running}
+                variant="outline"
+                title="Regenerate the bilingual TL;DR, Chinese summary, and keywords"
+              >
+                {running ? "Summarizing…" : hasSummary ? "Regenerate summary" : "Generate summary"}
+              </Button>
+            )}
             {p.pdf_url && (
               <Button
                 variant="outline"
@@ -361,7 +392,48 @@ export default function PaperDetail({ onProcessed }: Props) {
           {job?.status === "done" && !err && (
             <Card>
               <CardContent className="pt-5 text-sm text-green-700">
-                {job.kind === "embed" ? "Embedded successfully." : "Parsed successfully."}
+                {job.kind === "embed"
+                  ? "Embedded successfully."
+                  : job.kind === "summarize"
+                    ? "Summary generated."
+                    : "Parsed successfully."}
+              </CardContent>
+            </Card>
+          )}
+
+          {hasSummary && (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">Summary</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm leading-relaxed">
+                {p.tldr_en && (
+                  <p>
+                    <span className="mr-1 font-medium text-muted-foreground">EN:</span>
+                    {p.tldr_en}
+                  </p>
+                )}
+                {p.tldr_zh && (
+                  <p>
+                    <span className="mr-1 font-medium text-muted-foreground">中文:</span>
+                    {p.tldr_zh}
+                  </p>
+                )}
+                {p.summary_zh && (
+                  <p className="whitespace-pre-line text-foreground/90">{p.summary_zh}</p>
+                )}
+                {p.keywords && p.keywords.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    {p.keywords.map((k) => (
+                      <span
+                        key={k}
+                        className="rounded-full border bg-muted/40 px-2 py-0.5 text-xs"
+                      >
+                        {k}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </CardContent>
             </Card>
           )}

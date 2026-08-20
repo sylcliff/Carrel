@@ -84,6 +84,9 @@ class LLMConfig(BaseModel):
     fallback_model: str = "volcengine/doubao-pro-32k"
     temperature: float = 0.2
     request_timeout_seconds: int = 60
+    # Max characters of parsed Markdown fed to the summarizer (after stripping
+    # image markup). ~12k chars ≈ 2-3k tokens; keeps per-paper cost bounded.
+    max_input_chars: int = 12000
 
 
 class EmbeddingsConfig(BaseModel):

@@ -13,20 +13,21 @@ one place. Built as one user, one machine, one Postgres.
 
 ## Status
 
-M1–M3 are done. The app boots against a local Postgres, pulls papers from
+M1–M6 are done. The app boots against a local Postgres, pulls papers from
 arXiv + OpenAlex (normalized/deduped onto an OpenAlex Work ID, arXiv ID
-fallback), shows them in the library, and can download OA PDFs and parse them
-to Markdown via a self-hosted MinerU service. LLM summaries land in M4.
+fallback), shows them in the library, downloads OA PDFs and parses them to
+Markdown via a self-hosted MinerU service, generates bilingual LLM summaries
+(chained after parse), and supports full-text hybrid search.
 
 | Milestone | Status |
 |---|---|
 | M1 骨架 | ✅ Postgres+pgvector, FastAPI, React+Vite+TS+Tailwind, health & paper list pages |
 | M2 抓取 + 库页 | ✅ arXiv + OpenAlex fetchers, normalize, dedup, subscription CRUD, sync jobs, library page |
 | M3 PDF + MinerU | ✅ OA PDF download (content-validated), MinerU HTTP client, `pending→pdf_ready→parsed`, Markdown reader, `/process` jobs |
-| M4 LLM 摘要 | ⏳ |
-| M5 检索 | ⏳ |
-| M6 定时 + 订阅 UI (enhance) | ⏳ APScheduler + sync log page (subscription CRUD already ships) |
-| M7 打磨 | ⏳ |
+| M4 LLM 摘要 | ✅ bilingual TL;DR + Chinese summary + keywords via DeepSeek/Ark (litellm), chained after parse, `/summarize` jobs, fill-missing (preserves S2 tldr), non-fatal |
+| M5 检索 | ✅ chunking + Ark embeddings + pgvector (`halfvec`), hybrid search + RRF, search page |
+| M6 定时 + 订阅 UI | ✅ APScheduler cron sync + sync log page + subscription CRUD |
+| M7 打磨 | 🟡 favorites/tags/notes, citations/references, failure retries done; manual PDF import pending |
 
 ---
 

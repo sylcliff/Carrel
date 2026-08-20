@@ -56,7 +56,13 @@ export function TaskList({ onProcessed, refreshNonce = 0 }: Props) {
 
         if (onProcessed) {
           for (const j of rows) {
-            if (j.kind !== "download" && j.kind !== "parse" && j.kind !== "citations")
+            if (
+              j.kind !== "download" &&
+              j.kind !== "parse" &&
+              j.kind !== "summarize" &&
+              j.kind !== "embed" &&
+              j.kind !== "citations"
+            )
               continue;
             const prev = prevStatus.current.get(j.id);
             if (prev && ACTIVE.has(prev) && !ACTIVE.has(j.status)) {
@@ -213,6 +219,8 @@ function TaskRow({ job, now, compact = false }: { job: Job; now: number; compact
 function stageLabelFor(stage: string): string {
   if (stage === "download") return "download";
   if (stage === "parse") return "parse";
+  if (stage === "summarize") return "summarize";
+  if (stage === "embed") return "embed";
   if (stage === "citations") return "citations";
   if (stage === "done") return "done";
   return stage;

@@ -10,6 +10,7 @@ import {
   listPapers,
   listSubscriptions,
   processPending,
+  summarizePending,
   triggerSync,
   type Health,
   type PaperSummary,
@@ -29,6 +30,7 @@ export default function Home() {
   const [syncing, setSyncing] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [embedding, setEmbedding] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<{ fetched: number; discovered: number; updated: number; subscriptions: number } | null>(null);
   const [taskNonce, setTaskNonce] = useState(0);
@@ -128,6 +130,19 @@ export default function Home() {
     }
   }
 
+  async function onSummarizePending() {
+    setSummarizing(true);
+    setErr(null);
+    try {
+      await summarizePending(20, true);
+      setTaskNonce((n) => n + 1);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSummarizing(false);
+    }
+  }
+
   const today = papers.filter((p) => {
     if (!p.publication_date) return false;
     const d = new Date(p.publication_date);
@@ -149,6 +164,9 @@ export default function Home() {
         <div className="flex gap-2">
           <Button onClick={onProcessPending} disabled={processing} variant="outline">
             {processing ? "Queuing…" : "Process pending"}
+          </Button>
+          <Button onClick={onSummarizePending} disabled={summarizing} variant="outline" title="Backfill LLM summaries for already-parsed papers">
+            {summarizing ? "Queuing…" : "Summarize parsed"}
           </Button>
           <Button onClick={onEmbedPending} disabled={embedding} variant="outline">
             {embedding ? "Queuing…" : "Embed parsed"}

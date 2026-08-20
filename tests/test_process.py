@@ -205,3 +205,49 @@ def test_process_pending_batch_counts(session, cfg, tmp_path, monkeypatch):
     assert counts["candidates"] == 1
     assert counts["parsed"] == 1
     assert counts["failed"] == 0
+
+
+def test_process_chains_summarize_after_parse(session, cfg, tmp_path, monkeypatch):
+    cfg.storage.root = tmp_path / "data"
+    p = _make_paper(session, pdf_url="https://example.org/p.pdf")
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _fake_download_ok(tmp_path))
+    monkeypatch.setattr(proc.mineru_client, "parse_pdf", _fake_parse_ok())
+
+    called = {"n": 0}
+
+    def _fake_summarize(session, cfg, paper_id, **kw):
+        called["n"] += 1
+        paper = session.get(Paper, paper_id)
+        paper.status = PaperStatus.summarized.value
+        paper.tldr_en = "generated"
+        session.add(paper)
+        session.commit()
+        return paper
+
+    # Patch the symbol in the summarize module so process's lazy import sees it.
+    from carrel.pipeline import summarize as summ_mod
+    monkeypatch.setattr(summ_mod, "summarize_paper", _fake_summarize)
+
+    out = proc.process_paper(session, cfg, p.id)
+    assert called["n"] == 1
+    assert out.status == PaperStatus.summarized.value
+    assert out.tldr_en == "generated"
+
+
+def test_process_summarize_failure_does_not_poison_parse(session, cfg, tmp_path, monkeypatch):
+    cfg.storage.root = tmp_path / "data"
+    p = _make_paper(session, pdf_url="https://example.org/p.pdf")
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _fake_download_ok(tmp_path))
+    monkeypatch.setattr(proc.mineru_client, "parse_pdf", _fake_parse_ok())
+
+    from carrel.pipeline import summarize as summ_mod
+
+    def _boom(session, cfg, paper_id, **kw):
+        raise summ_mod.SummarizeError("no API key")
+
+    monkeypatch.setattr(summ_mod, "summarize_paper", _boom)
+
+    out = proc.process_paper(session, cfg, p.id)
+    # Parse still succeeds; paper stays parsed (NOT failed), error untouched.
+    assert out.status == PaperStatus.parsed.value
+    assert out.error is None

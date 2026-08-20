@@ -3,11 +3,15 @@
 Drives a paper through the state machine::
 
     pending --(download PDF)--> pdf_ready --(MinerU)--> parsed
+                                                  └─(best-effort LLM summary)─> summarized
 
-Both steps are individually idempotent: if ``paper.pdf`` is already on disk we
-skip the download, and if ``paper.md`` exists we skip parsing. Failures are
-recorded on ``Paper.error`` and the status is left as ``failed``; a manual
-retry simply calls :func:`process_paper` again.
+Download and parse are individually idempotent: if ``paper.pdf`` is already on
+disk we skip the download, and if ``paper.md`` exists we skip parsing. The
+summary step is chained after a successful parse but is non-fatal: a missing
+API key or an LLM error leaves the paper at ``parsed`` (embedding still
+accepts it). Failures in download/parse are recorded on ``Paper.error`` and
+the status is left as ``failed``; a manual retry simply calls
+:func:`process_paper` again.
 
 Like :mod:`carrel.pipeline.runner`, this module is synchronous — a single-user
 box processes one paper at a time, and MinerU itself is the bottleneck.
@@ -127,6 +131,22 @@ def process_paper(
         _step_download(session, cfg, paper, client=client)
         _emit({"stage": "parse", "detail": "Queued for parsing…"})
         _step_parse(session, cfg, paper, client=client, emit=_emit)
+        # M4: best-effort LLM summary. Runs chained after a successful parse;
+        # failures are non-fatal — the paper stays `parsed` and embedding can
+        # still run. We import lazily and guard against a missing API key so
+        # boxes without an LLM configured parse quietly.
+        try:
+            from carrel.pipeline.summarize import SummarizeError, summarize_paper
+
+            _emit({"stage": "summarize", "detail": "Generating summary…"})
+            summarize_paper(
+                session, cfg, paper.id,
+                on_progress=lambda d: _emit({"stage": "summarize", **d}),
+            )
+        except SummarizeError as e:
+            logger.info("summarize skipped/failed for %s: %s", paper_id, e)
+        except Exception as e:  # noqa: BLE001 - never poison a successful parse
+            logger.warning("summarize crashed for %s: %s", paper_id, e)
     except Exception as e:
         paper.status = PaperStatus.failed.value
         paper.error = f"{type(e).__name__}: {e}"[:1000]

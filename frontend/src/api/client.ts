@@ -410,6 +410,24 @@ export const embedPending = (limit = 20, background = false) =>
     body: JSON.stringify({ limit, background }),
   });
 
+// ---- Summarization (M4: LLM TL;DR + Chinese abstract + keywords) ----
+
+export const summarizePaper = (
+  paperId: string,
+  background = false,
+  force = false,
+) =>
+  request<Job[]>("/summarize", {
+    method: "POST",
+    body: JSON.stringify({ paper_id: paperId, background, force }),
+  });
+
+export const summarizePending = (limit = 20, background = false) =>
+  request<Job[]>("/summarize", {
+    method: "POST",
+    body: JSON.stringify({ limit, background }),
+  });
+
 export const importPaper = (body: {
   openalex_id?: string;
   doi?: string;

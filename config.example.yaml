@@ -53,6 +53,7 @@ llm:
   fallback_model: volcengine/doubao-pro-32k
   temperature: 0.2
   request_timeout_seconds: 60
+  max_input_chars: 12000             # parsed-markdown chars sent to the LLM (~2-3k tokens)
 
 embeddings:
   provider: volcengine
