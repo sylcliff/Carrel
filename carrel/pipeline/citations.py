@@ -23,7 +23,8 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from sqlmodel import Session, select
+from sqlalchemy import String, cast
+from sqlmodel import Session, or_, select
 
 from carrel.config import CarrelYAML
 from carrel.models import Paper
@@ -183,6 +184,7 @@ def enrich_paper(
     oa_works: list[dict] = []
     oa_id = _openalex_identifier(paper)
     if oa_id:
+        _progress("Merging OpenAlex citing works…", paper_id=paper.id)
         try:
             oa_works = oa.fetch_citing_works(oa_id, limit=_OPENALEX_CITES_LIMIT)
         except Exception as e:  # noqa: BLE001
@@ -265,6 +267,39 @@ def select_stale(session: Session, limit: int = 50) -> list[Paper]:
         select(Paper)
         .where(Paper.citations_updated_at.is_(None))
         .order_by(Paper.created_at.asc())
+        .limit(limit)
+    )
+    return list(session.exec(stmt).all())
+
+
+def select_missing_references(session: Session, limit: int = 50) -> list[Paper]:
+    """Return enriched papers whose reference list was never backfilled.
+
+    These are papers enriched before the references-list feature shipped: they
+    carry a ``reference_count`` but ``references`` is still NULL (distinct from
+    an empty list ``[]``, which means "fetched and genuinely none"). Only papers
+    with a resolvable identifier are returned, matching :func:`enrich_paper`.
+    """
+    # "Never backfilled" = the column holds SQL NULL (Postgres) or the JSON
+    # literal null (SQLite, whose JSON type serializes None to the text 'null').
+    # An empty list '[]' means "fetched, genuinely none" and must NOT match.
+    refs_null = or_(
+        Paper.references.is_(None),
+        cast(Paper.references, String) == "null",
+    )
+    stmt = (
+        select(Paper)
+        .where(
+            Paper.reference_count.is_not(None),
+            Paper.reference_count > 0,
+            refs_null,
+            or_(
+                Paper.s2_paper_id.is_not(None),
+                Paper.doi.is_not(None),
+                Paper.arxiv_id.is_not(None),
+            ),
+        )
+        .order_by(Paper.citations_updated_at.asc())
         .limit(limit)
     )
     return list(session.exec(stmt).all())

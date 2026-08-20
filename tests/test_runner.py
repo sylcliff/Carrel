@@ -289,3 +289,31 @@ def test_fetch_candidates_dedups_arxiv_and_openalert_same_paper(session, cfg):
     assert errors == {}
     ids = {r.id for r in records}
     assert ids == {"W999"}, f"expected single canonical record, got {ids}"
+
+
+# ---- select_missing_references backfill selector ----
+
+def test_select_missing_references_picks_count_without_list(session):
+    from carrel.pipeline.citations import select_missing_references
+
+    # stale: count set, references NULL, has identifier -> selected
+    stale = Paper(id="W_stale", id_kind="openalex", title="Stale",
+                  reference_count=51, references=None, doi="10.1/stale")
+    # already backfilled: references present -> skipped
+    filled = Paper(id="W_filled", id_kind="openalex", title="Filled",
+                   reference_count=10, references=[{"title": "x"}], doi="10.1/filled")
+    # genuinely empty after fetch: references == [] -> skipped (not NULL)
+    emptied = Paper(id="W_empty", id_kind="openalex", title="Empty",
+                    reference_count=3, references=[], doi="10.1/empty")
+    # no count yet -> skipped
+    nocnt = Paper(id="W_nocnt", id_kind="openalex", title="NoCount",
+                  reference_count=None, references=None, doi="10.1/nocnt")
+    # count but no resolvable identifier -> skipped
+    noid = Paper(id="W_noid", id_kind="openalex", title="NoId",
+                 reference_count=7, references=None,
+                 doi=None, arxiv_id=None, s2_paper_id=None)
+    session.add_all([stale, filled, emptied, nocnt, noid])
+    session.commit()
+
+    found = select_missing_references(session, limit=50)
+    assert [p.id for p in found] == ["W_stale"]

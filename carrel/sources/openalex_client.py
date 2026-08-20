@@ -25,11 +25,31 @@ from urllib.parse import urlsplit
 
 import pyalex
 import pyalex.api as _pyalex_api
+import requests
 from pyalex import Authors, Sources, Works, invert_abstract
+from urllib3.util import Retry
 
 from carrel.config import CarrelYAML
 
 logger = logging.getLogger(__name__)
+
+# OpenAlex's budget-exhausted 429 carries a Retry-After measured in minutes
+# (e.g. "Insufficient budget ... Resets at midnight UTC", retryAfter=253).
+# urllib3 honours Retry-After verbatim, so a single best-effort cites: lookup
+# could block the citations job for ~10 minutes. Cap it so OA failures fail
+# fast — fetch_citing_works already treats exceptions as "no extras".
+_MAX_RETRY_AFTER_SECONDS = 5.0
+
+
+class _CappedRetry(Retry):
+    """urllib3 Retry that clamps a long Retry-After to a few seconds."""
+
+    def get_retry_after(self, response: Any) -> float | None:  # type: ignore[override]
+        val = super().get_retry_after(response)
+        if val is None:
+            return None
+        return min(float(val), _MAX_RETRY_AFTER_SECONDS)
+
 
 # Saved once so repeated configure() calls don't re-wrap an already wrapped
 # session factory.
@@ -55,6 +75,17 @@ def configure(cfg: CarrelYAML) -> None:
 
     def _timed_session() -> Any:
         session = _ORIG_SESSION_FACTORY()
+        # Replace pyalex's default adapter so a budget-exhausted 429 doesn't
+        # block for minutes on its Retry-After header (see _CappedRetry).
+        retries = _CappedRetry(
+            total=cfg.openalex.max_retries,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 503],
+            allowed_methods={"GET", "POST"},
+        )
+        adapter = requests.adapters.HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         original_get = session.get
 
         def get_with_timeout(url: str, **kwargs: Any) -> Any:

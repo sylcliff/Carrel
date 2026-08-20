@@ -340,11 +340,27 @@ def run_sync(
         if fetch_errors:
             counts["source_errors"] = fetch_errors
 
-        # Best-effort citation enrichment for newly inserted papers. Failures
-        # here (rate limits, S2 downtime) must not fail the whole sync.
+        # Best-effort citation enrichment for newly inserted papers, plus a
+        # bounded backfill of papers enriched before the references-list feature
+        # shipped (reference_count set but references still NULL). Failures here
+        # (rate limits, S2 downtime) must not fail the whole sync.
         new_ids = counts.get("new_ids") or []
-        if cfg.semantic_scholar.fetch_on_sync and new_ids:
+        if cfg.semantic_scholar.fetch_on_sync:
             from carrel.pipeline import citations as cite_pipe
+
+            backfill = [
+                p.id for p in cite_pipe.select_missing_references(
+                    session, limit=cfg.semantic_scholar.references_backfill_batch
+                )
+            ]
+            # Preserve order, dedup (a backfill id could coincide with a new id).
+            seen: set[str] = set()
+            cite_ids: list[str] = []
+            for pid in [*list(new_ids), *backfill]:
+                if pid not in seen:
+                    seen.add(pid)
+                    cite_ids.append(pid)
+            counts["references_backfilled"] = len(backfill)
 
             def _cite_progress(progress: dict) -> None:
                 if job is not None:
@@ -352,15 +368,17 @@ def run_sync(
                     session.add(job)
                     session.commit()
 
-            cite_counts = cite_pipe.enrich_papers(
-                session, cfg, list(new_ids), on_progress=_cite_progress
-            )
-            counts["citations_enriched"] = cite_counts["enriched"]
-            counts["citations_failed"] = cite_counts["failed"]
-            logger.info(
-                "citation enrichment: enriched=%d failed=%d",
-                cite_counts["enriched"], cite_counts["failed"],
-            )
+            if cite_ids:
+                cite_counts = cite_pipe.enrich_papers(
+                    session, cfg, cite_ids, on_progress=_cite_progress
+                )
+                counts["citations_enriched"] = cite_counts["enriched"]
+                counts["citations_failed"] = cite_counts["failed"]
+                logger.info(
+                    "citation enrichment: enriched=%d failed=%d (new=%d, reference-backfill=%d)",
+                    cite_counts["enriched"], cite_counts["failed"],
+                    len(new_ids), len(backfill),
+                )
 
         logger.info(
             "sync done: fetched=%d new=%d updated=%d skipped=%d",

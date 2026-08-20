@@ -51,6 +51,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # tables on first run so the frontend can boot against a fresh DB.
     init_db(engine)
 
+    # A restart (or --reload) can orphan jobs left in queued/running by a dead
+    # worker. Mark them failed so the UI doesn't poll them forever.
+    from datetime import UTC, datetime
+
+    from sqlalchemy import text
+    from sqlmodel import Session
+
+    with Session(engine) as _s:
+        _s.execute(text(
+            "UPDATE jobs SET status='failed', finished_at=:now, "
+            "message='Interrupted by server restart' "
+            "WHERE status IN ('queued','running')"
+        ), {"now": datetime.now(UTC)})
+        _s.commit()
+
     # Shared HTTP clients for external metadata sources.
     s2.configure(
         base_url=cfg.semantic_scholar.base_url,

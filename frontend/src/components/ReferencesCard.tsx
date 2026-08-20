@@ -180,7 +180,9 @@ export default function ReferencesCard({ paper, onChanged }: Props) {
           {loading && <div className="text-sm text-muted-foreground">Loading…</div>}
           {!loading && items.length === 0 && (
             <div className="text-sm text-muted-foreground">
-              No references recorded. Click Refresh to fetch them from Semantic Scholar.
+              {count && count > 0
+                ? `${count.toLocaleString()} references reported by Semantic Scholar — click Refresh to load the list.`
+                : "No references recorded. Click Refresh to fetch them from Semantic Scholar."}
             </div>
           )}
           {items.length > 0 && (

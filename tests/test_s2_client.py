@@ -108,6 +108,24 @@ def test_404_on_citations_yields_empty_list():
     assert res.citation_count == 42
 
 
+def test_null_data_array_does_not_crash():
+    # S2 sometimes returns {"data": null} (key present, value null) for the
+    # citations/references endpoints. Must yield [] rather than TypeError.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/citations"):
+            return httpx.Response(200, json={"data": None})
+        if request.url.path.endswith("/references"):
+            return httpx.Response(200, json={"data": None})
+        return httpx.Response(200, json=COUNTS)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    res = fetch_citations(doi="10.1000/xyz", client=client)
+    assert res is not None
+    assert res.citing_papers == []
+    assert res.referenced_papers == []
+    assert res.reference_count == 15
+
+
 # ---------------------------------------------------------------------------
 # search_papers
 # ---------------------------------------------------------------------------

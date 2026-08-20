@@ -431,7 +431,8 @@ def _get_citing_papers(
         raise S2Error(f"invalid JSON from S2 citations: {e}") from e
 
     out: list[dict[str, Any]] = []
-    for item in payload.get("data", []):
+    # S2 occasionally returns {"data": null} for papers with no matches.
+    for item in (payload.get("data") or []):
         cp = item.get("citingPaper") or {}
         ext = cp.get("externalIds") or {}
         doi = _clean_doi(ext.get("DOI"))
@@ -468,7 +469,8 @@ def _get_referenced_papers(
         raise S2Error(f"invalid JSON from S2 references: {e}") from e
 
     out: list[dict[str, Any]] = []
-    for item in payload.get("data", []):
+    # S2 occasionally returns {"data": null} for papers with no matches.
+    for item in (payload.get("data") or []):
         cp = item.get("citedPaper") or {}
         ext = cp.get("externalIds") or {}
         doi = _clean_doi(ext.get("DOI"))

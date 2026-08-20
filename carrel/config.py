@@ -63,6 +63,9 @@ class SemanticScholarConfig(BaseModel):
     delay_between_requests_seconds: float = 1.5  # politeness between papers
     citations_limit: int = 500  # cap on stored citing-paper list
     fetch_on_sync: bool = True  # look up citations for newly synced papers
+    # Max reference-less papers (enriched before the references-list feature
+    # shipped) to backfill per sync run.
+    references_backfill_batch: int = 50
     search_enabled: bool = True
     search_per_page: int = 20
 
