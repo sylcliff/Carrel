@@ -36,6 +36,8 @@ class PaperSummary(BaseModel):
     citation_count: int | None = None
     in_library: bool = True
     discovered_at: datetime | None = None
+    favorite: bool = False
+    tags: list[str] = []
 
 
 class PaperDetail(PaperSummary):
@@ -50,8 +52,44 @@ class PaperDetail(PaperSummary):
     influential_citation_count: int | None = None
     reference_count: int | None = None
     citations_updated_at: datetime | None = None
+    notes_markdown: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# -------- User annotations (favorites / notes / tags) --------
+
+
+class FavoriteIn(BaseModel):
+    favorite: bool
+
+
+class FavoriteOut(BaseModel):
+    id: str
+    favorite: bool
+
+
+class NotesIn(BaseModel):
+    notes_markdown: str
+
+
+class NotesOut(BaseModel):
+    id: str
+    notes_markdown: str | None
+    updated_at: datetime
+
+
+class TagIn(BaseModel):
+    name: str
+
+
+class TagOut(BaseModel):
+    id: int
+    name: str
+
+
+class TagWithCount(TagOut):
+    paper_count: int
 
 
 # -------- Citations (Semantic Scholar) --------

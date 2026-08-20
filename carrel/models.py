@@ -97,6 +97,10 @@ class Paper(SQLModel, table=True):
         default=None, sa_column=Column(DateTime(timezone=True))
     )
 
+    # User annotations (M7): a star, a single long Markdown note per paper.
+    favorite: bool = Field(default=False, index=True)
+    notes_markdown: str | None = Field(default=None, sa_column=Column(Text))
+
     # AI outputs (M4)
     tldr_en: str | None = None
     tldr_zh: str | None = None
@@ -164,6 +168,32 @@ class Subscription(SQLModel, table=True):
     )
 
     __table_args__ = (Index("ix_subscriptions_kind_value", "kind", "value", unique=True),)
+
+
+class Tag(SQLModel, table=True):
+    """A user-created label. Many-to-many with Paper via PaperTag."""
+
+    __tablename__ = "tags"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True, max_length=100)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class PaperTag(SQLModel, table=True):
+    """Association row between papers and tags (composite primary key)."""
+
+    __tablename__ = "paper_tags"
+
+    paper_id: str = Field(foreign_key="papers.id", primary_key=True, max_length=64)
+    tag_id: int = Field(foreign_key="tags.id", primary_key=True)
+
+    # The composite PK already indexes paper_id (leftmost prefix); add an index
+    # on tag_id for reverse lookups (deleting a tag, counting papers per tag).
+    __table_args__ = (Index("ix_paper_tags_tag_id", "tag_id"),)
 
 
 class Job(SQLModel, table=True):

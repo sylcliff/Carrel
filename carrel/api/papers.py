@@ -7,10 +7,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlmodel import Session, select
+from sqlalchemy import String, cast
+from sqlmodel import Session, col, or_, select
 
 from carrel.db import get_session_dep
-from carrel.models import Chunk, Paper
+from carrel.models import Chunk, Paper, PaperTag, Tag
 from carrel.schemas import PaperDetail, PaperSummary
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/papers", tags=["papers"])
 
 
-def _to_summary(p: Paper) -> PaperSummary:
+def _to_summary(p: Paper, tags: list[str] | None = None) -> PaperSummary:
     return PaperSummary(
         id=p.id,
         title=p.title,
@@ -34,10 +35,12 @@ def _to_summary(p: Paper) -> PaperSummary:
         citation_count=p.citation_count,
         in_library=p.in_library,
         discovered_at=p.discovered_at,
+        favorite=p.favorite,
+        tags=tags or [],
     )
 
 
-def _to_detail(p: Paper) -> PaperDetail:
+def _to_detail(p: Paper, tags: list[str] | None = None) -> PaperDetail:
     return PaperDetail(
         id=p.id,
         title=p.title,
@@ -53,6 +56,8 @@ def _to_detail(p: Paper) -> PaperDetail:
         citation_count=p.citation_count,
         in_library=p.in_library,
         discovered_at=p.discovered_at,
+        favorite=p.favorite,
+        tags=tags or [],
         abstract=p.abstract,
         doi=p.doi,
         arxiv_id=p.arxiv_id,
@@ -64,9 +69,29 @@ def _to_detail(p: Paper) -> PaperDetail:
         influential_citation_count=p.influential_citation_count,
         reference_count=p.reference_count,
         citations_updated_at=p.citations_updated_at,
+        notes_markdown=p.notes_markdown,
         created_at=p.created_at,
         updated_at=p.updated_at,
     )
+
+
+def _load_tags_map(session: Session, paper_ids: list[str]) -> dict[str, list[str]]:
+    """Return ``{paper_id: [tag_name, ...]}`` for the given papers in one query.
+
+    Avoids an N+1 when rendering a list of papers with their tags.
+    """
+    if not paper_ids:
+        return {}
+    rows = session.exec(
+        select(PaperTag.paper_id, Tag.name)
+        .join(Tag, Tag.id == PaperTag.tag_id)
+        .where(PaperTag.paper_id.in_(paper_ids))
+        .order_by(Tag.name)
+    ).all()
+    out: dict[str, list[str]] = {}
+    for pid, name in rows:
+        out.setdefault(pid, []).append(name)
+    return out
 
 
 @router.get("", response_model=list[PaperSummary])
@@ -80,6 +105,13 @@ def list_papers(
         True,
         description="True (default): library papers. False: inbox (discovered, not discarded). Null: all.",
     ),
+    favorite: bool | None = Query(None, description="Filter by favorite state"),
+    tag: list[str] | None = Query(
+        None, description="Filter by tag name(s); repeat for ?tag=a&tag=b (match ANY)"
+    ),
+    q: str | None = Query(
+        None, description="Case-insensitive substring match on title or authors"
+    ),
 ) -> list[PaperSummary]:
     stmt = select(Paper).order_by(Paper.created_at.desc()).offset(offset).limit(limit)
     if status:
@@ -91,7 +123,28 @@ def list_papers(
         if not in_library:
             # Inbox view hides discarded papers.
             stmt = stmt.where(Paper.discarded.is_(False))
-    return [_to_summary(p) for p in session.exec(stmt).all()]
+    if favorite is not None:
+        stmt = stmt.where(Paper.favorite.is_(favorite))
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(
+            or_(
+                col(Paper.title).ilike(like),
+                cast(Paper.authors, String).ilike(like),
+            )
+        )
+    if tag:
+        names = [t.strip() for t in tag if t and t.strip()]
+        if names:
+            tag_subq = (
+                select(PaperTag.paper_id)
+                .join(Tag, Tag.id == PaperTag.tag_id)
+                .where(Tag.name.in_(names))
+            )
+            stmt = stmt.where(Paper.id.in_(tag_subq))
+    rows = session.exec(stmt).all()
+    tags_map = _load_tags_map(session, [p.id for p in rows])
+    return [_to_summary(p, tags_map.get(p.id, [])) for p in rows]
 
 
 @router.get("/{paper_id}", response_model=PaperDetail)
@@ -102,7 +155,8 @@ def get_paper(
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
-    return _to_detail(p)
+    tags_map = _load_tags_map(session, [p.id])
+    return _to_detail(p, tags_map.get(p.id, []))
 
 
 @router.post("/{paper_id}/import")
@@ -172,6 +226,13 @@ def delete_paper(
     chunks = session.exec(select(Chunk).where(Chunk.paper_id == paper_id)).all()
     for c in chunks:
         session.delete(c)
+
+    # Same for tag associations.
+    links = session.exec(
+        select(PaperTag).where(PaperTag.paper_id == paper_id)
+    ).all()
+    for link in links:
+        session.delete(link)
 
     # Resolve the on-disk paper directory before deleting the row.
     from carrel.main import app_config

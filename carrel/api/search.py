@@ -164,6 +164,7 @@ def _local_search_items(
             or_(
                 col(Paper.title).ilike(pattern),
                 col(Paper.abstract).ilike(pattern),
+                col(Paper.notes_markdown).ilike(pattern),
                 cast(Paper.authors, String).ilike(pattern),
                 col(Paper.doi).ilike(pattern),
                 col(Paper.arxiv_id).ilike(pattern),

@@ -71,6 +71,9 @@ def init_db(engine: Engine) -> None:
         "discarded": "BOOLEAN DEFAULT FALSE NOT NULL",
         # Postgres has no DATETIME type; TIMESTAMP works on both it and SQLite.
         "discovered_at": "TIMESTAMP",
+        # User annotations (M7).
+        "favorite": "BOOLEAN DEFAULT FALSE NOT NULL",
+        "notes_markdown": "TEXT",
     })
 
     # Backfill: papers created before the inbox feature existed are already in
@@ -85,6 +88,18 @@ def init_db(engine: Engine) -> None:
         with engine.begin() as conn:
             conn.exec_driver_sql(
                 "UPDATE papers SET in_library=1 WHERE in_library IS NULL"
+            )
+
+    # Backfill favorite for rows added before the column existed.
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE papers SET favorite=FALSE WHERE favorite IS NULL"
+            )
+    else:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "UPDATE papers SET favorite=0 WHERE favorite IS NULL"
             )
 
     # HNSW index for cosine similarity over chunk embeddings. Built once at

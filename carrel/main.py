@@ -11,7 +11,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from carrel import __version__
-from carrel.api import citations, embed, health, papers, process, search, subscriptions, sync
+from carrel.api import (
+    annotations,
+    citations,
+    embed,
+    health,
+    papers,
+    process,
+    search,
+    subscriptions,
+    sync,
+)
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
 from carrel.scheduler import start_scheduler, stop_scheduler
@@ -122,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(papers.router)
     app.include_router(citations.router)
+    app.include_router(annotations.router)
     app.include_router(subscriptions.router)
     app.include_router(sync.router)
     app.include_router(process.router)

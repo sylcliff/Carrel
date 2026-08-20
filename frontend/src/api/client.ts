@@ -47,6 +47,8 @@ export interface PaperSummary {
   citation_count: number | null;
   in_library: boolean;
   discovered_at: string | null;
+  favorite: boolean;
+  tags: string[];
 }
 
 export interface PaperDetail extends PaperSummary {
@@ -61,6 +63,7 @@ export interface PaperDetail extends PaperSummary {
   influential_citation_count: number | null;
   reference_count: number | null;
   citations_updated_at: string | null;
+  notes_markdown: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -96,6 +99,9 @@ export const listPapers = (params?: {
   status?: string;
   venue?: string;
   in_library?: boolean;
+  favorite?: boolean;
+  tag?: string[];
+  q?: string;
 }) => {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
@@ -103,6 +109,9 @@ export const listPapers = (params?: {
   if (params?.status) q.set("status", params.status);
   if (params?.venue) q.set("venue", params.venue);
   if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
+  if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
+  if (params?.q) q.set("q", params.q);
+  if (params?.tag) for (const t of params.tag) q.append("tag", t);
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
 };
@@ -134,6 +143,46 @@ export const getPaperMarkdown = (id: string) =>
   request<{ id: string; body: string | null; md_path: string | null }>(
     `/papers/${encodeURIComponent(id)}/markdown`
   );
+
+// ---- Annotations: favorites, notes, tags ----
+
+export interface Tag {
+  id: number;
+  name: string;
+}
+
+export interface TagWithCount extends Tag {
+  paper_count: number;
+}
+
+export const toggleFavorite = (id: string, favorite: boolean) =>
+  request<{ id: string; favorite: boolean }>(
+    `/papers/${encodeURIComponent(id)}/favorite`,
+    { method: "POST", body: JSON.stringify({ favorite }) },
+  );
+
+export const saveNotes = (id: string, notes_markdown: string) =>
+  request<{ id: string; notes_markdown: string | null; updated_at: string }>(
+    `/papers/${encodeURIComponent(id)}/notes`,
+    { method: "PUT", body: JSON.stringify({ notes_markdown }) },
+  );
+
+export const listPaperTags = (id: string) =>
+  request<Tag[]>(`/papers/${encodeURIComponent(id)}/tags`);
+
+export const addPaperTag = (id: string, name: string) =>
+  request<Tag>(`/papers/${encodeURIComponent(id)}/tags`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+
+export const removePaperTag = (id: string, tagId: number) =>
+  request<{ id: number; paper_id: string; detached: boolean }>(
+    `/papers/${encodeURIComponent(id)}/tags/${tagId}`,
+    { method: "DELETE" },
+  );
+
+export const listTags = () => request<TagWithCount[]>("/tags");
 
 export const getPaperCitations = (
   id: string,

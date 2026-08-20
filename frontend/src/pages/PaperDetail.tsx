@@ -1,19 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useParams, Link } from "react-router-dom";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
+import NotesCard from "@/components/NotesCard";
 import {
+  addPaperTag,
   embedPaper,
   getJob,
   getPaper,
   getPaperMarkdown,
+  listPaperTags,
   processPaper,
+  removePaperTag,
+  toggleFavorite,
   type Job,
   type PaperDetail as PaperDetailT,
+  type Tag,
 } from "@/api/client";
 
 type Props = {
@@ -41,12 +47,21 @@ export default function PaperDetail({ onProcessed }: Props) {
   const [pdfOpen, setPdfOpen] = useState(false);
   const [textOpen, setTextOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
+  const [favorite, setFavorite] = useState(false);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [tagInput, setTagInput] = useState("");
+  const [favBusy, setFavBusy] = useState(false);
   const timer = useRef<number | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
-    const paper = await getPaper(id);
+    const [paper, paperTags] = await Promise.all([
+      getPaper(id),
+      listPaperTags(id).catch(() => [] as Tag[]),
+    ]);
     setP(paper);
+    setFavorite(paper.favorite);
+    setTags(paperTags);
     if (paper.md_path) {
       try {
         const r = await getPaperMarkdown(id);
@@ -133,6 +148,55 @@ export default function PaperDetail({ onProcessed }: Props) {
     []
   );
 
+  async function onToggleFavorite() {
+    if (!id || favBusy) return;
+    const next = !favorite;
+    setFavorite(next);
+    setFavBusy(true);
+    try {
+      await toggleFavorite(id, next);
+    } catch (e) {
+      setFavorite(!next);
+      setErr(`Could not update favorite: ${String(e)}`);
+    } finally {
+      setFavBusy(false);
+    }
+  }
+
+  async function onAddTag(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key !== "Enter" || !id) return;
+    const raw = tagInput.trim();
+    if (!raw) return;
+    if (tags.some((t) => t.name.toLowerCase() === raw.toLowerCase())) {
+      setTagInput("");
+      return;
+    }
+    setTagInput("");
+    // Optimistic append with a provisional negative id; replaced on success.
+    const provisional: Tag = { id: -Date.now(), name: raw };
+    setTags((prev) => [...prev, provisional]);
+    try {
+      const saved = await addPaperTag(id, raw);
+      setTags((prev) => prev.map((t) => (t.id === provisional.id ? saved : t)));
+    } catch (errThrown) {
+      setTags((prev) => prev.filter((t) => t.id !== provisional.id));
+      setErr(`Could not add tag: ${String(errThrown)}`);
+    }
+  }
+
+  async function onRemoveTag(tag: Tag) {
+    if (!id) return;
+    const previous = tags;
+    setTags((prev) => prev.filter((t) => t.id !== tag.id));
+    if (tag.id < 0) return; // provisional never saved
+    try {
+      await removePaperTag(id, tag.id);
+    } catch (e) {
+      setTags(previous);
+      setErr(`Could not remove tag: ${String(e)}`);
+    }
+  }
+
   if (err && !p)
     return <main className="container py-8 text-sm text-red-600">{err}</main>;
   if (!p)
@@ -195,153 +259,201 @@ export default function PaperDetail({ onProcessed }: Props) {
         </div>
       </header>
 
-      <div className="flex flex-wrap gap-2">
-        {canParse && (
-          <Button onClick={onParse} disabled={running}>
-            {running
-              ? "Processing…"
-              : p.status === "failed"
-                ? "Retry parse"
-                : "Download & parse"}
-          </Button>
-        )}
-        {canEmbed && (
-          <Button onClick={onEmbed} disabled={running} variant="outline">
-            {running ? "Embedding…" : "Chunk & embed"}
-          </Button>
-        )}
-        {p.pdf_url && (
-          <Button
-            variant="outline"
-            onClick={() => window.open(p.pdf_url!, "_blank", "noopener")}
-          >
-            Open original PDF
-          </Button>
-        )}
-        {p.pdf_path && (
-          <Button
-            variant="outline"
-            onClick={() => setPdfOpen((v) => !v)}
-            aria-pressed={pdfOpen}
-          >
-            {pdfOpen ? "Close PDF" : "Open saved PDF"}
-          </Button>
-        )}
-      </div>
-
-
-
-      {running && (
-        <Card>
-          <CardContent className="flex items-center gap-3 pt-5 text-sm">
-            <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
-            <span className="flex-1">
-              <span className="font-medium">{detail || "Working…"}</span>
-              {stage && stage !== "queued" && stage !== "done" && (
-                <span className="ml-2 text-xs uppercase tracking-wide text-muted-foreground">
-                  {stage}
-                </span>
-              )}
-            </span>
-            {job?.started_at && (
-              <span className="tabular-nums text-muted-foreground">
-                {elapsed(job.started_at, now)}
-              </span>
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <div className="min-w-0 space-y-6">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={onToggleFavorite}
+              disabled={favBusy}
+              aria-pressed={favorite}
+              title={favorite ? "Remove from favorites" : "Add to favorites"}
+            >
+              <Star
+                className={
+                  favorite
+                    ? "h-4 w-4 fill-yellow-400 text-yellow-500"
+                    : "h-4 w-4"
+                }
+              />
+            </Button>
+            {canParse && (
+              <Button onClick={onParse} disabled={running}>
+                {running
+                  ? "Processing…"
+                  : p.status === "failed"
+                    ? "Retry parse"
+                    : "Download & parse"}
+              </Button>
             )}
-          </CardContent>
-        </Card>
-      )}
+            {canEmbed && (
+              <Button onClick={onEmbed} disabled={running} variant="outline">
+                {running ? "Embedding…" : "Chunk & embed"}
+              </Button>
+            )}
+            {p.pdf_url && (
+              <Button
+                variant="outline"
+                onClick={() => window.open(p.pdf_url!, "_blank", "noopener")}
+              >
+                Open original PDF
+              </Button>
+            )}
+            {p.pdf_path && (
+              <Button
+                variant="outline"
+                onClick={() => setPdfOpen((v) => !v)}
+                aria-pressed={pdfOpen}
+              >
+                {pdfOpen ? "Close PDF" : "Open saved PDF"}
+              </Button>
+            )}
+          </div>
 
-      {job?.status === "done" && !err && (
-        <Card>
-          <CardContent className="pt-5 text-sm text-green-700">
-            {job.kind === "embed" ? "Embedded successfully." : "Parsed successfully."}
-          </CardContent>
-        </Card>
-      )}
-
-      {p.error && (
-        <Card className="border-red-300">
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm text-red-700">Processing error</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm text-red-600">{p.error}</CardContent>
-        </Card>
-      )}
-
-      {!p.pdf_url && (
-        <Card>
-          <CardContent className="pt-5 text-sm text-muted-foreground">
-            No open-access PDF is available for this paper — only metadata and the abstract
-            are stored. Use “Open original PDF” if a publisher link exists.
-          </CardContent>
-        </Card>
-      )}
-
-      {pdfOpen && p.pdf_path ? (
-        <Card className="overflow-hidden">
-          <CardHeader className="py-3">
-            <CardTitle className="text-base">PDF</CardTitle>
-          </CardHeader>
-          <CardContent className="p-0">
-            <iframe
-              title={`${p.title} — PDF`}
-              src={`/storage/${p.pdf_path}`}
-              className="h-[calc(100vh-200px)] w-full border-0"
+          <div className="flex flex-wrap items-center gap-2">
+            {tags.map((t) => (
+              <span
+                key={t.id}
+                className="inline-flex items-center gap-1 rounded-full border bg-muted/40 px-2 py-0.5 text-xs"
+              >
+                {t.name}
+                <button
+                  type="button"
+                  onClick={() => onRemoveTag(t)}
+                  aria-label={`Remove tag ${t.name}`}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
+            <input
+              value={tagInput}
+              onChange={(e) => setTagInput(e.target.value)}
+              onKeyDown={onAddTag}
+              placeholder="Add tag…"
+              className="h-7 w-36 rounded-md border border-input bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
             />
-          </CardContent>
-        </Card>
-      ) : null}
-      {md ? (
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <button
-              type="button"
-              onClick={() => setTextOpen((v) => !v)}
-              className="flex items-center gap-2 text-left"
-            >
-              {textOpen ? (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronRight className="h-4 w-4 text-muted-foreground" />
-              )}
-              <CardTitle className="text-base">Full text</CardTitle>
-            </button>
-          </CardHeader>
-          {textOpen && (
-            <CardContent>
-              <MarkdownReader body={md} mdPath={p.md_path} />
-            </CardContent>
-          )}
-        </Card>
-      ) : (
-        <Card>
-          <CardHeader className="flex-row items-center justify-between space-y-0">
-            <button
-              type="button"
-              onClick={() => setTextOpen((v) => !v)}
-              className="flex items-center gap-2 text-left"
-            >
-              {textOpen ? (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronRight className="h-4 w-4 text-muted-foreground" />
-              )}
-              <CardTitle className="text-base">Abstract</CardTitle>
-            </button>
-          </CardHeader>
-          {textOpen && (
-            <CardContent className="text-sm leading-relaxed">
-              {p.abstract || (
-                <span className="text-muted-foreground">No abstract available.</span>
-              )}
-            </CardContent>
-          )}
-        </Card>
-      )}
+          </div>
 
-      <ReferencesCard paper={p} onChanged={load} />
-      <CitationsCard paper={p} onChanged={load} />
+          {running && (
+            <Card>
+              <CardContent className="flex items-center gap-3 pt-5 text-sm">
+                <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-foreground" />
+                <span className="flex-1">
+                  <span className="font-medium">{detail || "Working…"}</span>
+                  {stage && stage !== "queued" && stage !== "done" && (
+                    <span className="ml-2 text-xs uppercase tracking-wide text-muted-foreground">
+                      {stage}
+                    </span>
+                  )}
+                </span>
+                {job?.started_at && (
+                  <span className="tabular-nums text-muted-foreground">
+                    {elapsed(job.started_at, now)}
+                  </span>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {job?.status === "done" && !err && (
+            <Card>
+              <CardContent className="pt-5 text-sm text-green-700">
+                {job.kind === "embed" ? "Embedded successfully." : "Parsed successfully."}
+              </CardContent>
+            </Card>
+          )}
+
+          {p.error && (
+            <Card className="border-red-300">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm text-red-700">Processing error</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-red-600">{p.error}</CardContent>
+            </Card>
+          )}
+
+          {!p.pdf_url && (
+            <Card>
+              <CardContent className="pt-5 text-sm text-muted-foreground">
+                No open-access PDF is available for this paper — only metadata and the abstract
+                are stored. Use “Open original PDF” if a publisher link exists.
+              </CardContent>
+            </Card>
+          )}
+
+          {pdfOpen && p.pdf_path ? (
+            <Card className="overflow-hidden">
+              <CardHeader className="py-3">
+                <CardTitle className="text-base">PDF</CardTitle>
+              </CardHeader>
+              <CardContent className="p-0">
+                <iframe
+                  title={`${p.title} — PDF`}
+                  src={`/storage/${p.pdf_path}`}
+                  className="h-[calc(100vh-200px)] w-full border-0"
+                />
+              </CardContent>
+            </Card>
+          ) : null}
+          {md ? (
+            <Card>
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <button
+                  type="button"
+                  onClick={() => setTextOpen((v) => !v)}
+                  className="flex items-center gap-2 text-left"
+                >
+                  {textOpen ? (
+                    <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                  )}
+                  <CardTitle className="text-base">Full text</CardTitle>
+                </button>
+              </CardHeader>
+              {textOpen && (
+                <CardContent>
+                  <MarkdownReader body={md} mdPath={p.md_path} />
+                </CardContent>
+              )}
+            </Card>
+          ) : (
+            <Card>
+              <CardHeader className="flex-row items-center justify-between space-y-0">
+                <button
+                  type="button"
+                  onClick={() => setTextOpen((v) => !v)}
+                  className="flex items-center gap-2 text-left"
+                >
+                  {textOpen ? (
+                    <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                  ) : (
+                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                  )}
+                  <CardTitle className="text-base">Abstract</CardTitle>
+                </button>
+              </CardHeader>
+              {textOpen && (
+                <CardContent className="text-sm leading-relaxed">
+                  {p.abstract || (
+                    <span className="text-muted-foreground">No abstract available.</span>
+                  )}
+                </CardContent>
+              )}
+            </Card>
+          )}
+
+          <ReferencesCard paper={p} onChanged={load} />
+          <CitationsCard paper={p} onChanged={load} />
+        </div>
+
+        <aside className="min-w-0 lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto lg:pr-1">
+          <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
+        </aside>
+      </div>
     </main>
   );
 }
