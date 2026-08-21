@@ -29,6 +29,7 @@ from carrel.api import (
     subscriptions,
     summarize,
     sync,
+    topics,
 )
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
@@ -145,6 +146,7 @@ def create_app() -> FastAPI:
     app.include_router(sync.router)
     app.include_router(process.router)
     app.include_router(summarize.router)
+    app.include_router(topics.router)
     app.include_router(embed.router)
     app.include_router(search.router)
     app.include_router(chat.router)

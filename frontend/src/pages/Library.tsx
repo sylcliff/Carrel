@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ChevronDown, Star } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/StatusDot";
+import { TopicsLayout } from "@/components/TopicsLayout";
 import {
   deletePaper,
   listPapers,
@@ -12,6 +13,7 @@ import {
   type TagWithCount,
 } from "@/api/client";
 import { useDebouncedCallback } from "@/lib/useDebouncedCallback";
+import { topicColorClass } from "@/lib/topicColor";
 
 type SortKey =
   | "added"
@@ -29,6 +31,7 @@ export default function Library() {
   const [err, setErr] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [searchParams, setSearchParams] = useSearchParams();
 
   // Filter state
   const [q, setQ] = useState("");
@@ -37,6 +40,26 @@ export default function Library() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagMenuOpen, setTagMenuOpen] = useState(false);
   const [sort, setSort] = useState<SortKey>("added");
+
+  // Topics are URL-driven (?topic=X&topic=Y) so sidebar links, detail-page
+  // chips and the Topics page all deep-link into a filtered library.
+  const selectedTopics = useMemo(
+    () => searchParams.getAll("topic").filter(Boolean),
+    [searchParams],
+  );
+
+  function addTopicFilter(name: string) {
+    if (selectedTopics.includes(name)) return;
+    const params = new URLSearchParams(searchParams);
+    params.append("topic", name);
+    setSearchParams(params);
+  }
+
+  function clearTopics() {
+    const params = new URLSearchParams(searchParams);
+    params.delete("topic");
+    setSearchParams(params);
+  }
 
   const debounceQ = useDebouncedCallback((value: string) => {
     setDebouncedQ(value);
@@ -56,6 +79,7 @@ export default function Library() {
       favorite: favOnly || undefined,
       q: debouncedQ.trim() || undefined,
       tag: selectedTags.length ? selectedTags : undefined,
+      topic: selectedTopics.length ? selectedTopics : undefined,
       sort,
     })
       .then((rows) => {
@@ -70,7 +94,7 @@ export default function Library() {
     return () => {
       cancelled = true;
     };
-  }, [debouncedQ, favOnly, selectedTags, sort]);
+  }, [debouncedQ, favOnly, selectedTags, selectedTopics, sort]);
 
   function toggleTag(name: string, on: boolean) {
     setSelectedTags((prev) =>
@@ -100,12 +124,24 @@ export default function Library() {
   }
 
   const activeFilterCount =
-    (favOnly ? 1 : 0) + selectedTags.length + (debouncedQ.trim() ? 1 : 0);
+    (favOnly ? 1 : 0) +
+    selectedTags.length +
+    selectedTopics.length +
+    (debouncedQ.trim() ? 1 : 0);
 
   const tagNameSet = useMemo(() => new Set(allTags.map((t) => t.name)), [allTags]);
 
+  function clearAllFilters() {
+    setQ("");
+    setDebouncedQ("");
+    setFavOnly(false);
+    setSelectedTags([]);
+    clearTopics();
+  }
+
   return (
-    <main className="container max-w-screen-2xl space-y-4 py-8">
+    <TopicsLayout>
+      <main className="space-y-4">
       <h1 className="text-2xl font-bold">Library</h1>
 
       <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/20 p-2">
@@ -188,20 +224,25 @@ export default function Library() {
         </label>
 
         {activeFilterCount > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              setQ("");
-              setDebouncedQ("");
-              setFavOnly(false);
-              setSelectedTags([]);
-            }}
-          >
+          <Button variant="ghost" size="sm" onClick={clearAllFilters}>
             Clear
           </Button>
         )}
       </div>
+
+      {selectedTopics.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Topics:</span>
+          {selectedTopics.map((t) => (
+            <span
+              key={t}
+              className={`rounded-full px-2 py-0.5 font-medium ${topicColorClass(t)}`}
+            >
+              {t}
+            </span>
+          ))}
+        </div>
+      )}
 
       <p className="text-sm text-muted-foreground">
         {loading
@@ -261,6 +302,21 @@ export default function Library() {
                     ))}
                   </div>
                 )}
+                {p.topics.length > 0 && (
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {p.topics.map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => addTopicFilter(t)}
+                        title={`Filter by topic: ${t}`}
+                        className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium hover:opacity-80 ${topicColorClass(t)}`}
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-3 text-xs text-muted-foreground">
                 {p.citation_count !== null && p.citation_count !== undefined && (
@@ -284,6 +340,7 @@ export default function Library() {
           </Card>
         ))}
       </div>
-    </main>
+      </main>
+    </TopicsLayout>
   );
 }

@@ -48,6 +48,7 @@ class JobKind(str, Enum):
     download = "download"
     parse = "parse"
     summarize = "summarize"
+    topics = "topics"  # LLM topic classification from metadata
     embed = "embed"
     citations = "citations"  # refresh Semantic Scholar citation count + citing list
 
@@ -194,6 +195,35 @@ class PaperTag(SQLModel, table=True):
     # The composite PK already indexes paper_id (leftmost prefix); add an index
     # on tag_id for reverse lookups (deleting a tag, counting papers per tag).
     __table_args__ = (Index("ix_paper_tags_tag_id", "tag_id"),)
+
+
+class Topic(SQLModel, table=True):
+    """A system-generated research theme (LLM-assigned, shared across papers).
+
+    Distinct from user ``Tag``: topics form a controlled vocabulary the
+    classifier reuses and grows, enabling cross-paper browsing by topic.
+    """
+
+    __tablename__ = "topics"
+
+    id: int | None = Field(default=None, primary_key=True)
+    name: str = Field(index=True, unique=True, max_length=100)
+    description: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class PaperTopic(SQLModel, table=True):
+    """Association row between papers and topics (composite primary key)."""
+
+    __tablename__ = "paper_topics"
+
+    paper_id: str = Field(foreign_key="papers.id", primary_key=True, max_length=64)
+    topic_id: int = Field(foreign_key="topics.id", primary_key=True)
+
+    __table_args__ = (Index("ix_paper_topics_topic_id", "topic_id"),)
 
 
 class Job(SQLModel, table=True):

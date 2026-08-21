@@ -49,6 +49,7 @@ export interface PaperSummary {
   discovered_at: string | null;
   favorite: boolean;
   tags: string[];
+  topics: string[];
 }
 
 export interface PaperDetail extends PaperSummary {
@@ -101,6 +102,7 @@ export const listPapers = (params?: {
   in_library?: boolean;
   favorite?: boolean;
   tag?: string[];
+  topic?: string[];
   q?: string;
   sort?: string;
 }) => {
@@ -114,6 +116,7 @@ export const listPapers = (params?: {
   if (params?.q) q.set("q", params.q);
   if (params?.sort) q.set("sort", params.sort);
   if (params?.tag) for (const t of params.tag) q.append("tag", t);
+  if (params?.topic) for (const t of params.topic) q.append("topic", t);
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
 };
@@ -428,6 +431,30 @@ export const summarizePending = (limit = 20, background = false) =>
   request<Job[]>("/summarize", {
     method: "POST",
     body: JSON.stringify({ limit, background }),
+  });
+
+// ---- Topics (LLM classification into research themes) ----
+
+export interface TopicWithCount {
+  id: number;
+  name: string;
+  description: string | null;
+  paper_count: number;
+}
+
+export const listTopics = () => request<TopicWithCount[]>("/topics");
+
+export const classifyTopics = (
+  opts: { paperId?: string; limit?: number; background?: boolean; force?: boolean } = {},
+) =>
+  request<Job[]>("/topics", {
+    method: "POST",
+    body: JSON.stringify({
+      paper_id: opts.paperId,
+      limit: opts.limit ?? 20,
+      background: opts.background ?? false,
+      force: opts.force ?? false,
+    }),
   });
 
 export const importPaper = (body: {

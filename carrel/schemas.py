@@ -38,6 +38,7 @@ class PaperSummary(BaseModel):
     discovered_at: datetime | None = None
     favorite: bool = False
     tags: list[str] = []
+    topics: list[str] = []
 
 
 class PaperDetail(PaperSummary):
@@ -89,6 +90,19 @@ class TagOut(BaseModel):
 
 
 class TagWithCount(TagOut):
+    paper_count: int
+
+
+# -------- Topics (LLM classification) --------
+
+
+class TopicOut(BaseModel):
+    id: int
+    name: str
+    description: str | None = None
+
+
+class TopicWithCount(TopicOut):
     paper_count: int
 
 
@@ -257,6 +271,20 @@ class SummarizeRequest(BaseModel):
     If ``paper_id`` is given, only that paper is summarized; otherwise up to
     ``limit`` parsed-but-unsummarized papers are processed. ``force=True``
     regenerates fields that already exist (e.g. an S2-sourced ``tldr_en``).
+    """
+
+    paper_id: str | None = None
+    limit: int = 20
+    background: bool = False
+    force: bool = False
+
+
+class TopicsRequest(BaseModel):
+    """Trigger LLM topic classification for one paper or a batch.
+
+    If ``paper_id`` is given, only that paper is classified; otherwise up to
+    ``limit`` in-library papers with no topics are processed. ``force=True``
+    reclassifies, replacing that paper's existing topic assignments.
     """
 
     paper_id: str | None = None

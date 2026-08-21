@@ -6,6 +6,7 @@ import PaperDetail from "@/pages/PaperDetail";
 import Search from "@/pages/Search";
 import Subscriptions from "@/pages/Subscriptions";
 import SyncStatus from "@/pages/SyncStatus";
+import Topics from "@/pages/Topics";
 
 function Header() {
   return (
@@ -17,6 +18,7 @@ function Header() {
         <nav className="flex gap-4 text-sm text-muted-foreground">
           <Link to="/today" className="hover:text-foreground">Today</Link>
           <Link to="/library" className="hover:text-foreground">Library</Link>
+          <Link to="/topics" className="hover:text-foreground">Topics</Link>
           <Link to="/subscriptions" className="hover:text-foreground">Subscriptions</Link>
           <Link to="/sync" className="hover:text-foreground">Sync</Link>
         </nav>
@@ -34,6 +36,7 @@ export default function App() {
           <Route path="/" element={<Search />} />
           <Route path="/today" element={<Home />} />
           <Route path="/library" element={<Library />} />
+          <Route path="/topics" element={<Topics />} />
           <Route path="/subscriptions" element={<Subscriptions />} />
           <Route path="/sync" element={<SyncStatus />} />
           <Route path="/papers/:id" element={<PaperDetail />} />

@@ -11,7 +11,7 @@ from sqlalchemy import String, cast, func
 from sqlmodel import Session, col, or_, select
 
 from carrel.db import get_session_dep
-from carrel.models import Chunk, Paper, PaperTag, Tag
+from carrel.models import Chunk, Paper, PaperTag, PaperTopic, Tag, Topic
 from carrel.schemas import PaperDetail, PaperSummary
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/papers", tags=["papers"])
 
 
-def _to_summary(p: Paper, tags: list[str] | None = None) -> PaperSummary:
+def _to_summary(
+    p: Paper, tags: list[str] | None = None, topics: list[str] | None = None
+) -> PaperSummary:
     return PaperSummary(
         id=p.id,
         title=p.title,
@@ -37,10 +39,13 @@ def _to_summary(p: Paper, tags: list[str] | None = None) -> PaperSummary:
         discovered_at=p.discovered_at,
         favorite=p.favorite,
         tags=tags or [],
+        topics=topics or [],
     )
 
 
-def _to_detail(p: Paper, tags: list[str] | None = None) -> PaperDetail:
+def _to_detail(
+    p: Paper, tags: list[str] | None = None, topics: list[str] | None = None
+) -> PaperDetail:
     return PaperDetail(
         id=p.id,
         title=p.title,
@@ -58,6 +63,7 @@ def _to_detail(p: Paper, tags: list[str] | None = None) -> PaperDetail:
         discovered_at=p.discovered_at,
         favorite=p.favorite,
         tags=tags or [],
+        topics=topics or [],
         abstract=p.abstract,
         doi=p.doi,
         arxiv_id=p.arxiv_id,
@@ -94,6 +100,22 @@ def _load_tags_map(session: Session, paper_ids: list[str]) -> dict[str, list[str
     return out
 
 
+def _load_topics_map(session: Session, paper_ids: list[str]) -> dict[str, list[str]]:
+    """Return ``{paper_id: [topic_name, ...]}`` for the given papers in one query."""
+    if not paper_ids:
+        return {}
+    rows = session.exec(
+        select(PaperTopic.paper_id, Topic.name)
+        .join(Topic, Topic.id == PaperTopic.topic_id)
+        .where(PaperTopic.paper_id.in_(paper_ids))
+        .order_by(Topic.name)
+    ).all()
+    out: dict[str, list[str]] = {}
+    for pid, name in rows:
+        out.setdefault(pid, []).append(name)
+    return out
+
+
 @router.get("", response_model=list[PaperSummary])
 def list_papers(
     session: Session = Depends(get_session_dep),
@@ -108,6 +130,9 @@ def list_papers(
     favorite: bool | None = Query(None, description="Filter by favorite state"),
     tag: list[str] | None = Query(
         None, description="Filter by tag name(s); repeat for ?tag=a&tag=b (match ANY)"
+    ),
+    topic: list[str] | None = Query(
+        None, description="Filter by topic name(s); repeat for ?topic=a&topic=b (match ANY)"
     ),
     q: str | None = Query(
         None, description="Case-insensitive substring match on title or authors"
@@ -170,9 +195,22 @@ def list_papers(
                 .where(Tag.name.in_(names))
             )
             stmt = stmt.where(Paper.id.in_(tag_subq))
+    if topic:
+        names = [t.strip() for t in topic if t and t.strip()]
+        if names:
+            topic_subq = (
+                select(PaperTopic.paper_id)
+                .join(Topic, Topic.id == PaperTopic.topic_id)
+                .where(Topic.name.in_(names))
+            )
+            stmt = stmt.where(Paper.id.in_(topic_subq))
     rows = session.exec(stmt).all()
     tags_map = _load_tags_map(session, [p.id for p in rows])
-    return [_to_summary(p, tags_map.get(p.id, [])) for p in rows]
+    topics_map = _load_topics_map(session, [p.id for p in rows])
+    return [
+        _to_summary(p, tags_map.get(p.id, []), topics_map.get(p.id, []))
+        for p in rows
+    ]
 
 
 @router.get("/{paper_id}", response_model=PaperDetail)
@@ -184,7 +222,8 @@ def get_paper(
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
     tags_map = _load_tags_map(session, [p.id])
-    return _to_detail(p, tags_map.get(p.id, []))
+    topics_map = _load_topics_map(session, [p.id])
+    return _to_detail(p, tags_map.get(p.id, []), topics_map.get(p.id, []))
 
 
 @router.post("/{paper_id}/import")
@@ -255,11 +294,16 @@ def delete_paper(
     for c in chunks:
         session.delete(c)
 
-    # Same for tag associations.
+    # Same for tag and topic associations.
     links = session.exec(
         select(PaperTag).where(PaperTag.paper_id == paper_id)
     ).all()
     for link in links:
+        session.delete(link)
+    tp_links = session.exec(
+        select(PaperTopic).where(PaperTopic.paper_id == paper_id)
+    ).all()
+    for link in tp_links:
         session.delete(link)
 
     # Resolve the on-disk paper directory before deleting the row.

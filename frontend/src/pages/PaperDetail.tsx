@@ -7,6 +7,7 @@ import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
+import { topicColorClass } from "@/lib/topicColor";
 
 // Chat pulls in assistant-ui + markdown plugins; load it only on the article page.
 const PaperChat = lazy(() =>
@@ -380,6 +381,22 @@ export default function PaperDetail({ onProcessed }: Props) {
               className="h-7 w-36 rounded-md border border-input bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </div>
+
+          {p.topics && p.topics.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">Topics:</span>
+              {p.topics.map((t) => (
+                <Link
+                  key={t}
+                  to={`/library?topic=${encodeURIComponent(t)}`}
+                  title={`View papers in ${t}`}
+                  className={`rounded-full px-2 py-0.5 text-xs font-medium hover:opacity-80 ${topicColorClass(t)}`}
+                >
+                  {t}
+                </Link>
+              ))}
+            </div>
+          )}
 
           {running && (
             <Card>

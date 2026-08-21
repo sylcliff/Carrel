@@ -147,6 +147,20 @@ def process_paper(
             logger.info("summarize skipped/failed for %s: %s", paper_id, e)
         except Exception as e:  # noqa: BLE001 - never poison a successful parse
             logger.warning("summarize crashed for %s: %s", paper_id, e)
+        # Best-effort topic classification. Metadata-only (no PDF needed), so it
+        # runs after summarize; failures are non-fatal and never regress status.
+        try:
+            from carrel.pipeline.topics import TopicsError, topics_paper
+
+            _emit({"stage": "topics", "detail": "Classifying topics…"})
+            topics_paper(
+                session, cfg, paper.id,
+                on_progress=lambda d: _emit({"stage": "topics", **d}),
+            )
+        except TopicsError as e:
+            logger.info("topics skipped/failed for %s: %s", paper_id, e)
+        except Exception as e:  # noqa: BLE001 - never poison a successful parse
+            logger.warning("topics crashed for %s: %s", paper_id, e)
     except Exception as e:
         paper.status = PaperStatus.failed.value
         paper.error = f"{type(e).__name__}: {e}"[:1000]
