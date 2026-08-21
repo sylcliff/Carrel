@@ -2,7 +2,8 @@ PYTHON ?= python
 POETRY ?= uv
 NPM    ?= npm
 
-.PHONY: help install backend frontend up down psql mineru-install mineru-up mineru-down logs
+.PHONY: help install backend frontend up down psql mineru-install mineru-up mineru-down logs \
+        doctor heal start stop restart status
 
 help:
 	@echo "Carrel — common targets:"
@@ -12,8 +13,14 @@ help:
 	@echo "  make mineru-install  - one-time: pip-install MinerU (.venv-mineru) + pipeline models (CPU, Apple Silicon OK)"
 	@echo "  make mineru-up       - start native mineru-api on :8000"
 	@echo "  make mineru-down     - stop mineru-api"
-	@echo "  make backend         - run FastAPI dev server (uvicorn --reload)"
-	@echo "  make frontend        - run Vite dev server"
+	@echo "  make backend         - run FastAPI dev server in foreground (uvicorn --reload)"
+	@echo "  make frontend        - run Vite dev server in foreground"
+	@echo "  make start           - start backend+frontend detached (logs in /tmp/carrel-ops)"
+	@echo "  make stop            - stop backend+frontend"
+	@echo "  make restart         - restart backend+frontend, wait until healthy"
+	@echo "  make status          - show which dev servers are listening"
+	@echo "  make doctor          - run the ops health check (read-only)"
+	@echo "  make heal            - auto-fix safe issues (proxy bypass)"
 	@echo "  make psql            - open psql against the carrel DB"
 
 # --- Dependencies -------------------------------------------------------------
@@ -82,3 +89,30 @@ frontend:
 
 logs:
 	docker compose logs -f --tail=100
+
+# --- Dev server control (detached) -------------------------------------------
+# `backend`/`frontend` above run in the foreground for live logs. These targets
+# delegate to the ops skill's scripts for detached start/stop/restart that waits
+# on health endpoints, so "make restart" returns only when the app is reachable.
+# The scripts live inside the skill (.claude/skills/ops/scripts/) and resolve
+# their own paths, so these work from any cwd.
+
+OPS := .claude/skills/ops/scripts
+
+start:
+	@$(OPS)/dev.sh start
+
+stop:
+	@$(OPS)/dev.sh stop
+
+restart:
+	@$(OPS)/dev.sh restart
+
+status:
+	@$(OPS)/dev.sh status
+
+doctor:
+	@$(OPS)/doctor.sh
+
+heal:
+	@$(OPS)/heal.sh

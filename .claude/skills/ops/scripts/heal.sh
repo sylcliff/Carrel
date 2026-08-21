@@ -9,7 +9,7 @@
 #   - starting Tailscale Serve (one-time GUI/sudo grant)
 #   - (re)starting backend/frontend/postgres — user manages these for now
 #
-# Usage: scripts/ops/heal.sh [--dry-run] [--agent]
+# Usage: .claude/skills/ops/scripts/heal.sh [--dry-run] [--agent]
 #   --agent   quiet mode for periodic launchd runs; only emits when it fixes
 #             something (errors/warnings suppressed to keep the log clean).
 

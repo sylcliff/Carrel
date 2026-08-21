@@ -6,8 +6,11 @@ set -u
 
 # --- Paths -------------------------------------------------------------------
 
+# Scripts live at .claude/skills/ops/scripts/, four levels below the repo root.
+# Resolve from this file's location so callers work from any cwd.
 OPS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PROJECT_ROOT="$(cd "$OPS_DIR/../.." && pwd)"
+PROJECT_ROOT="$(cd "$OPS_DIR/../../../.." && pwd)"
+SKILL_DIR="$(cd "$OPS_DIR/.." && pwd)"
 BYPASS_FILE="$OPS_DIR/bypass-domains.txt"
 
 TS_CLI="/Applications/Tailscale.app/Contents/MacOS/Tailscale"

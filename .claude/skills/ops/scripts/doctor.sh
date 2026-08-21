@@ -2,7 +2,7 @@
 # Carrel ops health check. Read-only: reports status and exits non-zero if
 # anything needs attention. Run `heal.sh` to auto-fix what can be fixed safely.
 #
-# Usage: scripts/ops/doctor.sh [--json]
+# Usage: .claude/skills/ops/scripts/doctor.sh [--json]
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -52,12 +52,12 @@ if port_listening "$VITE_PORT"; then
   pid=$(lsof -nP -iTCP:$VITE_PORT -sTCP:LISTEN -t 2>/dev/null | head -1)
   record "Vite dev server (:$VITE_PORT)" ok "pid $pid, bound 0.0.0.0 (LAN/tailnet reachable)"
 else
-  record "Vite dev server (:$VITE_PORT)" bad "not running — make frontend"
+  record "Vite dev server (:$VITE_PORT)" bad "not running — make start (or: make restart)"
 fi
 if port_listening "$BACKEND_PORT"; then
   record "FastAPI backend (:$BACKEND_PORT)" ok "listening"
 else
-  record "FastAPI backend (:$BACKEND_PORT)" bad "not running — make backend"
+  record "FastAPI backend (:$BACKEND_PORT)" bad "not running — make start (or: make restart)"
 fi
 if port_listening "$POSTGRES_PORT"; then
   record "Postgres (:$POSTGRES_PORT)" ok
@@ -161,6 +161,6 @@ fi
 if [ "$issues" -eq 0 ]; then
   echo "${C_GREEN}All critical checks passed.${C_RESET}"
 else
-  echo "${C_RED}$issues issue(s).${C_RESET} Run ${C_BOLD}scripts/ops/heal.sh${C_RESET} to auto-fix."
+  echo "${C_RED}$issues issue(s).${C_RESET} Run ${C_BOLD}${OPS_DIR}/heal.sh${C_RESET} to auto-fix."
 fi
 exit "$issues"

@@ -6,13 +6,14 @@
 # makes the Tailscale/LAN access durable against FlashFox rewrites.
 #
 # Usage:
-#   scripts/ops/install-agent.sh install   # load (default)
-#   scripts/ops/install-agent.sh uninstall # unload and remove
-#   scripts/ops/install-agent.sh status
+#   .claude/skills/ops/scripts/install-agent.sh install   # load (default)
+#   .claude/skills/ops/scripts/install-agent.sh uninstall # unload and remove
+#   .claude/skills/ops/scripts/install-agent.sh status
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Scripts live at .claude/skills/ops/scripts/, four levels below repo root.
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 LABEL="com.carrel.ops-agent"
 PLIST_SRC="$SCRIPT_DIR/$LABEL.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -33,7 +34,7 @@ case "$action" in
     echo "  plist: $PLIST_DST"
     echo "  runs:  every 60s, calls heal.sh --agent"
     echo "  logs:  $LOG_DIR/agent.{out,err}  and  $LOG_DIR/heal.log"
-    echo "  tip:   scripts/ops/install-agent.sh status"
+    echo "  tip:   .claude/skills/ops/scripts/install-agent.sh status"
     ;;
   uninstall)
     launchctl unload "$PLIST_DST" 2>/dev/null || true
