@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
-from sqlmodel import Session, select
+from sqlmodel import Session, or_, select
 
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
@@ -181,12 +181,16 @@ def _step_download(
         logger.info("reuse existing PDF for %s", paper.id)
         return
 
-    if not paper.pdf_url:
+    # A stored pdf_url is not required: _pdf_candidates() synthesizes an arXiv
+    # PDF from arxiv_id and pulls repository copies from raw_meta. Only bail
+    # when no candidate exists at all (truly closed access, metadata only).
+    candidates = _pdf_candidates(paper)
+    if not candidates:
         raise ProcessError("no PDF URL available (closed access or metadata only)")
 
     dl = cfg.download
     _path, used_url = download_pdf_with_fallback(
-        _pdf_candidates(paper),
+        candidates,
         work_dir,
         filename=PDF_FILENAME,
         timeout=dl.request_timeout_seconds,
@@ -196,10 +200,14 @@ def _step_download(
     )
     # If a fallback candidate (e.g. an arXiv copy) succeeded where the stored
     # publisher URL served HTML, remember it so future retries don't repeat the
-    # bad URL.
+    # bad URL. We now have a verified PDF, so mark the paper OA regardless of
+    # what the source metadata claimed (heals metadata-only records that have
+    # an arxiv_id but no advertised pdf_url).
     if used_url != paper.pdf_url:
         logger.info("PDF for %s resolved via fallback %s", paper.id, used_url)
         paper.pdf_url = used_url
+    if paper.oa_status != "oa":
+        paper.oa_status = "oa"
     paper.pdf_path = f"{rel_prefix}/{PDF_FILENAME}"
     paper.status = PaperStatus.pdf_ready.value
     session.add(paper)
@@ -284,17 +292,20 @@ def _step_parse(
 
 
 def select_pending(session: Session, limit: int = 10) -> list[Paper]:
-    """Return papers that have a PDF URL and are not yet parsed.
+    """Return papers that can be downloaded and are not yet parsed.
 
     We pick ``pending`` plus previously ``failed`` papers (so a manual "process
-    pending" retry picks them up), newest first. Papers with no ``pdf_url``
-    (closed access) are excluded since they can never be downloaded.
+    pending" retry picks them up), newest first. A paper is eligible when it has
+    either a stored ``pdf_url`` *or* an ``arxiv_id`` — the latter yields an arXiv
+    PDF via ``_pdf_candidates`` even when the source record advertised no OA PDF.
+    Papers with neither (truly closed access, metadata only) are excluded since
+    they can never be downloaded.
     """
     stmt = (
         select(Paper)
         .where(
             Paper.in_library.is_(True),
-            Paper.pdf_url.is_not(None),
+            or_(Paper.pdf_url.is_not(None), Paper.arxiv_id.is_not(None)),
             Paper.status.in_(
                 [PaperStatus.pending.value, PaperStatus.failed.value]
             ),

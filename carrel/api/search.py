@@ -917,6 +917,25 @@ def _title_similarity(a: str, b: str) -> float:
 _TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
+def _arxiv_pdf_fallback(
+    pdf_url: str | None, oa_status: str, arxiv_id: str | None
+) -> tuple[str | None, str]:
+    """If no direct PDF was advertised but the work has an arXiv id, use the
+    canonical arXiv PDF.
+
+    arXiv always hosts a PDF for every preprint. Both OpenAlex and Semantic
+    Scholar sometimes return a record with an ArXiv external id but no
+    ``pdf_url``/``openAccessPdf``, which would otherwise mark the paper
+    metadata-only. This mirrors the sync path
+    (``normalize.enrich_with_openalex``) and the download-time fallback
+    (``process._pdf_candidates``) so imported papers are immediately
+    downloadable.
+    """
+    if not pdf_url and arxiv_id:
+        return f"https://arxiv.org/pdf/{arxiv_id}.pdf", "oa"
+    return pdf_url, oa_status
+
+
 @router.post("/import", response_model=ImportPaperOut)
 def import_external_paper(
     body: ImportPaperIn,
@@ -960,9 +979,18 @@ def import_external_paper(
     if existing is not None:
         # The paper already exists (library or sync-discovered inbox). Importing
         # from Search/citations moves it into the library if it wasn't already.
+        changed = False
         if not existing.in_library:
             existing.in_library = True
             existing.discarded = False
+            changed = True
+        # Heal a previously metadata-only record: if we now know an arXiv id
+        # but stored no pdf_url, the canonical arXiv PDF is always available.
+        if not existing.pdf_url and existing.arxiv_id:
+            existing.pdf_url = f"https://arxiv.org/pdf/{existing.arxiv_id}.pdf"
+            existing.oa_status = "oa"
+            changed = True
+        if changed:
             existing.updated_at = datetime.now(UTC)
             session.add(existing)
             session.commit()
@@ -978,7 +1006,10 @@ def import_external_paper(
         from fastapi import HTTPException
         raise HTTPException(status_code=502, detail="OpenAlex returned a work without an id")
 
-    pdf_url, oa_status = oa.work_pdf_url(work)
+    arxiv_id = oa.work_arxiv_id(work)
+    pdf_url, oa_status = _arxiv_pdf_fallback(
+        *oa.work_pdf_url(work), arxiv_id
+    )
     paper = Paper(
         id=pid,
         id_kind="openalex",
@@ -987,7 +1018,7 @@ def import_external_paper(
         publication_date=oa.work_publication_date(work),
         venue=oa.work_venue(work),
         doi=oa.work_doi(work),
-        arxiv_id=oa.work_arxiv_id(work),
+        arxiv_id=arxiv_id,
         pdf_url=pdf_url,
         oa_status=oa_status,
         source=SourceKind.openalex.value,
@@ -1029,7 +1060,12 @@ def _import_from_s2(session: Session, work: dict[str, Any], now: datetime) -> Im
     except ValueError:
         parsed_date = None
 
-    pdf_url = work.get("pdf_url")
+    arxiv_id = work.get("arxiv_id")
+    pdf_url, oa_status = _arxiv_pdf_fallback(
+        work.get("pdf_url"),
+        "oa" if work.get("pdf_url") else "none",
+        arxiv_id,
+    )
     paper = Paper(
         id=f"s2:{s2_pid}",
         id_kind="semanticscholar",
@@ -1038,10 +1074,10 @@ def _import_from_s2(session: Session, work: dict[str, Any], now: datetime) -> Im
         publication_date=parsed_date,
         venue=work.get("venue"),
         doi=work.get("doi"),
-        arxiv_id=work.get("arxiv_id"),
+        arxiv_id=arxiv_id,
         s2_paper_id=s2_pid,
         pdf_url=pdf_url,
-        oa_status="oa" if pdf_url else "none",
+        oa_status=oa_status,
         source=SourceKind.both.value,
         status=PaperStatus.pending.value,
         authors=work.get("authors") or [],

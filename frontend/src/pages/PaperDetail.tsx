@@ -226,8 +226,12 @@ export default function PaperDetail({ onProcessed }: Props) {
       <main className="container py-8 text-sm text-muted-foreground">Loading…</main>
     );
 
+  // A downloadable PDF exists when the record carries a pdf_url, or when it
+  // has an arXiv id (the backend synthesizes the canonical arXiv PDF even if
+  // the source advertised no direct pdf_url).
+  const pdfHref = p.pdf_url || (p.arxiv_id ? `https://arxiv.org/pdf/${p.arxiv_id}.pdf` : "");
   const canParse =
-    Boolean(p.pdf_url) && p.status !== "parsed" && p.status !== "summarized" && p.status !== "ready";
+    Boolean(pdfHref) && p.status !== "parsed" && p.status !== "summarized" && p.status !== "ready";
   // Embed is available when the paper is parsed/summarized but not yet ready,
   // or when a previous embed failed.
   const canEmbed =
@@ -251,7 +255,7 @@ export default function PaperDetail({ onProcessed }: Props) {
         <div className="min-w-0 space-y-6 xl:col-start-2">
           <div className="mx-auto w-full max-w-screen-2xl space-y-6">
             <div>
-              <Link to="/" className="text-sm text-muted-foreground hover:underline">
+              <Link to="/library" className="text-sm text-muted-foreground hover:underline">
                 ← Back
               </Link>
             </div>
@@ -332,10 +336,10 @@ export default function PaperDetail({ onProcessed }: Props) {
                 {running ? "Summarizing…" : hasSummary ? "Regenerate summary" : "Generate summary"}
               </Button>
             )}
-            {p.pdf_url && (
+            {pdfHref && (
               <Button
                 variant="outline"
-                onClick={() => window.open(p.pdf_url!, "_blank", "noopener")}
+                onClick={() => window.open(pdfHref, "_blank", "noopener")}
               >
                 Open original PDF
               </Button>
@@ -456,7 +460,7 @@ export default function PaperDetail({ onProcessed }: Props) {
             </Card>
           )}
 
-          {!p.pdf_url && (
+          {!pdfHref && (
             <Card>
               <CardContent className="pt-5 text-sm text-muted-foreground">
                 No open-access PDF is available for this paper — only metadata and the abstract
