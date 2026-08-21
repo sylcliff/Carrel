@@ -1,0 +1,19 @@
+# Authoritative system-proxy bypass list for Carrel.
+# One entry per line; lines starting with # and blank lines are ignored.
+# Tailscale's CGNAT range (100.64.0.0/10) and MagicDNS are the critical ones
+# so the local GUI proxy (FlashFox/闪狐云) does not intercept tailnet traffic.
+# macOS networksetup uses shell-style globs here, not CIDR — hence 100.*.
+localhost
+*.local
+127.*
+10.*
+172.16.*
+172.17.*
+172.18.*
+172.19.*
+172.2*
+172.30.*
+172.31.*
+192.168.*
+100.*
+*.ts.net

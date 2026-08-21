@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Carrel ops self-heal agent. Runs heal.sh --agent every 60s to re-apply the
+  system-proxy bypass list when the GUI proxy client (FlashFox/闪狐云) overwrites
+  it. Install with scripts/ops/install-agent.sh; __PROJECT_ROOT__ is substituted
+  at install time.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.carrel.ops-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__PROJECT_ROOT__/scripts/ops/heal.sh</string>
+        <string>--agent</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/carrel-ops/agent.out</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/carrel-ops/agent.err</string>
+</dict>
+</plist>
