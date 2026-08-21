@@ -11,13 +11,12 @@ function Header() {
   return (
     <header className="border-b">
       <div className="container max-w-screen-2xl flex h-14 items-center gap-6">
-        <Link to="/" className="text-lg font-semibold">
+        <Link to="/" className="text-lg font-semibold hover:text-foreground transition-colors">
           Carrel
         </Link>
         <nav className="flex gap-4 text-sm text-muted-foreground">
-          <Link to="/" className="hover:text-foreground">Today</Link>
+          <Link to="/today" className="hover:text-foreground">Today</Link>
           <Link to="/library" className="hover:text-foreground">Library</Link>
-          <Link to="/search" className="hover:text-foreground">Search</Link>
           <Link to="/subscriptions" className="hover:text-foreground">Subscriptions</Link>
           <Link to="/sync" className="hover:text-foreground">Sync</Link>
         </nav>
@@ -32,9 +31,9 @@ export default function App() {
       <div className="min-h-screen bg-background">
         <Header />
         <Routes>
-          <Route path="/" element={<Home />} />
+          <Route path="/" element={<Search />} />
+          <Route path="/today" element={<Home />} />
           <Route path="/library" element={<Library />} />
-          <Route path="/search" element={<Search />} />
           <Route path="/subscriptions" element={<Subscriptions />} />
           <Route path="/sync" element={<SyncStatus />} />
           <Route path="/papers/:id" element={<PaperDetail />} />
