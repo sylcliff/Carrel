@@ -10,6 +10,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@assistant-ui/react": "^0.15.16",
     "@radix-ui/react-tooltip": "^1.2.16",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",

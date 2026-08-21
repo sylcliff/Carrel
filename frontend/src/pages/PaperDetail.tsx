@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useParams, Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -7,6 +7,11 @@ import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
+
+// Chat pulls in assistant-ui + markdown plugins; load it only on the article page.
+const PaperChat = lazy(() =>
+  import("@/components/PaperChat").then((m) => ({ default: m.PaperChat })),
+);
 import {
   addPaperTag,
   embedPaper,
@@ -523,7 +528,12 @@ export default function PaperDetail({ onProcessed }: Props) {
         </div>
 
         <aside className="min-w-0 lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto lg:pr-1">
-          <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
+          <div className="space-y-6">
+            <Suspense fallback={<div className="h-[70vh] rounded-lg border bg-card" />}>
+              <PaperChat paperId={p.id} hasMarkdown={!!p.md_path} />
+            </Suspense>
+            <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
+          </div>
         </aside>
       </div>
     </main>

@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from carrel import embeddings
@@ -97,6 +97,66 @@ def chat_json(
             continue
 
     raise LLMError(f"all chat models failed; last error: {last_err}") from last_err
+
+
+def _select_model(model: str, fallback_model: str | None) -> tuple[str, str]:
+    """Pick (model, api_key) once before starting a stream.
+
+    Unlike :func:`chat_json`, a stream can't swap models mid-response once the
+    first token has been sent, so we resolve the key up front: use the primary
+    if it has a key, else fall back. Raises :class:`LLMError` if neither does.
+    """
+    key = embeddings._key_for(model)
+    if key:
+        return model, key
+    if fallback_model:
+        fb_key = embeddings._key_for(fallback_model)
+        if fb_key:
+            logger.info("no API key for primary model %r; using fallback %s", model, fallback_model)
+            return fallback_model, fb_key
+    raise LLMError(
+        f"No API key configured for {model!r}"
+        + (f" or fallback {fallback_model!r}" if fallback_model else "")
+        + "; set DEEPSEEK_API_KEY or VOLCANO_API_KEY (see .env.example)"
+    )
+
+
+def chat_stream(
+    messages: Sequence[dict[str, str]],
+    *,
+    model: str,
+    fallback_model: str | None = None,
+    temperature: float = 0.3,
+    timeout: int = 60,
+) -> Iterator[str]:
+    """Yield free-text completion deltas token-by-token (streaming, no JSON).
+
+    The model/api key is selected before streaming begins. No retry is
+    attempted once tokens are flowing — an error is raised so the caller can
+    emit it on the stream.
+    """
+    mdl, api_key = _select_model(model, fallback_model)
+
+    from litellm import completion  # imported lazily so tests without keys work
+
+    try:
+        resp: Any = completion(
+            model=mdl,
+            messages=list(messages),
+            temperature=temperature,
+            timeout=timeout,
+            api_key=api_key,
+            stream=True,
+        )
+        for chunk in resp:
+            try:
+                delta = chunk.choices[0].delta.content
+            except (AttributeError, IndexError, KeyError):
+                delta = None
+            if delta:
+                yield delta
+    except Exception as e:  # noqa: BLE001 - normalized for the streaming caller
+        raise LLMError(f"chat stream failed with {mdl}: {e}") from e
 
 
 def _chat_with_retry(

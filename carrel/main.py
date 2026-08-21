@@ -6,13 +6,20 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+# Load .env into os.environ as early as possible. pydantic-settings reads
+# .env on its own, but helpers like carrel.embeddings._key_for read os.environ
+# directly — without this they miss keys that only exist in the file.
+load_dotenv()
+
 from carrel import __version__
 from carrel.api import (
     annotations,
+    chat,
     citations,
     embed,
     health,
@@ -140,6 +147,7 @@ def create_app() -> FastAPI:
     app.include_router(summarize.router)
     app.include_router(embed.router)
     app.include_router(search.router)
+    app.include_router(chat.router)
 
     # Serve parsed markdown images (and PDFs) straight from storage. The
     # bootstrap step above created the directory, so StaticFiles can mount it.

@@ -87,6 +87,17 @@ class LLMConfig(BaseModel):
     # Max characters of parsed Markdown fed to the summarizer (after stripping
     # image markup). ~12k chars ≈ 2-3k tokens; keeps per-paper cost bounded.
     max_input_chars: int = 12000
+    # Per-paper RAG chat. chat_model/fallback default to the summarizer model
+    # when None. rag_top_k chunks are retrieved as context; chat_history_limit
+    # trims the conversation turns sent back to the model.
+    chat_model: str | None = None
+    chat_fallback_model: str | None = None
+    chat_temperature: float = 0.3
+    rag_top_k: int = 6
+    chat_history_limit: int = 6
+    # Full-text fallback (paper not yet embedded): max chars of the parsed
+    # markdown fed as context, after stripping image markup.
+    chat_fulltext_chars: int = 24000
 
 
 class EmbeddingsConfig(BaseModel):
