@@ -154,10 +154,11 @@ interface PaperChatProps {
 interface ChatThreadProps {
   paperId: string;
   disabled: boolean;
+  sources: string[] | null;
   onSources: (sources: string[] | null) => void;
 }
 
-function ChatThread({ paperId, disabled, onSources }: ChatThreadProps) {
+function ChatThread({ paperId, disabled, sources, onSources }: ChatThreadProps) {
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       async *run({ messages, abortSignal }) {
@@ -204,7 +205,7 @@ function ChatThread({ paperId, disabled, onSources }: ChatThreadProps) {
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadPrimitive.Root className="flex min-h-0 flex-1 flex-col">
-        <ThreadPrimitive.Viewport className="flex flex-col gap-4 overflow-y-auto pr-1">
+        <ThreadPrimitive.Viewport className="flex flex-1 flex-col gap-4 overflow-y-auto pr-1">
           <ThreadPrimitive.Empty>
             <div className="flex flex-1 items-center justify-center py-10 text-center text-sm text-muted-foreground">
               {disabled
@@ -217,13 +218,27 @@ function ChatThread({ paperId, disabled, onSources }: ChatThreadProps) {
           />
         </ThreadPrimitive.Viewport>
 
-        <ComposerPrimitive.Root className="mt-3 flex items-end gap-2 rounded-lg border bg-background p-2 focus-within:ring-1 focus-within:ring-ring">
+        {sources && sources.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {sources.map((s, i) => (
+              <span
+                key={i}
+                className="inline-flex max-w-full truncate rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
+                title={s}
+              >
+                {s}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <ComposerPrimitive.Root className="mt-auto flex items-end gap-2 rounded-lg border bg-background p-2 focus-within:ring-1 focus-within:ring-ring">
           <ComposerPrimitive.Input
-            rows={1}
+            rows={5}
             autoFocus
             disabled={disabled}
             placeholder={disabled ? "Parse the paper to enable chat…" : "Ask about this paper…"}
-            className="max-h-32 flex-1 resize-none bg-transparent px-1 py-1 text-sm outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
+            className="h-[7.5rem] max-h-[7.5rem] flex-1 resize-none bg-transparent px-1 py-1 text-sm leading-relaxed outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
           />
           <ThreadPrimitive.If running={false}>
             <ComposerPrimitive.Send asChild>
@@ -258,7 +273,7 @@ export function PaperChat({ paperId, hasMarkdown }: PaperChatProps) {
   const disabled = !hasMarkdown;
 
   return (
-    <Card>
+    <Card className="flex h-[70vh] flex-col xl:h-full xl:rounded-none xl:border-0 xl:shadow-none">
       <CardHeader className="flex-row items-center justify-between space-y-0 pb-3">
         <CardTitle className="flex items-center gap-2 text-base">
           <BookOpen className="h-4 w-4" />
@@ -276,26 +291,14 @@ export function PaperChat({ paperId, hasMarkdown }: PaperChatProps) {
           Clear
         </Button>
       </CardHeader>
-      <CardContent className="flex h-[70vh] flex-col gap-3 p-4 pt-0">
+      <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-4 pt-0">
         <ChatThread
           key={`${paperId}-${threadKey}`}
           paperId={paperId}
           disabled={disabled}
+          sources={sources}
           onSources={setSources}
         />
-        {sources && sources.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {sources.map((s, i) => (
-              <span
-                key={i}
-                className="inline-flex max-w-full truncate rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
-                title={s}
-              >
-                {s}
-              </span>
-            ))}
-          </div>
-        )}
       </CardContent>
     </Card>
   );

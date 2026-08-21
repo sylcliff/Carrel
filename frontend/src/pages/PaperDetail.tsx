@@ -242,51 +242,55 @@ export default function PaperDetail({ onProcessed }: Props) {
   const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
 
   return (
-    <main className="container max-w-screen-2xl space-y-6 py-8">
-      <div>
-        <Link to="/" className="text-sm text-muted-foreground hover:underline">
-          ← Back
-        </Link>
-      </div>
+    <main className="w-full space-y-6 px-6 py-8 xl:px-0">
+      <div className="grid gap-6 xl:gap-4 xl:grid-cols-[max(24rem,calc((100vw-98rem)/2))_minmax(0,1fr)_max(24rem,calc((100vw-98rem)/2))]">
+        <aside className="min-w-0 xl:col-start-1 xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+          <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
+        </aside>
 
-      <header className="space-y-2">
-        <h1 className="text-2xl font-bold">{p.title}</h1>
-        <div className="text-sm text-muted-foreground">
-          {p.authors.join(", ") || "—"}
-        </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          {p.venue && <span>📰 {p.venue}</span>}
-          {p.publication_date && <span>📅 {p.publication_date}</span>}
-          {p.doi && (
-            <a
-              href={p.doi}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline-offset-2 hover:text-foreground hover:underline"
-            >
-              DOI: {p.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")}
-            </a>
-          )}
-          {p.arxiv_id && (
-            <a
-              href={`https://arxiv.org/abs/${p.arxiv_id}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="underline-offset-2 hover:text-foreground hover:underline"
-            >
-              arXiv:{p.arxiv_id}
-            </a>
-          )}
-          {p.citation_count !== null && p.citation_count !== undefined && (
-            <span>🏆 {p.citation_count.toLocaleString()} cited</span>
-          )}
-          <span>status: {p.status}</span>
-          <span>oa: {p.oa_status}</span>
-        </div>
-      </header>
+        <div className="min-w-0 space-y-6 xl:col-start-2">
+          <div className="mx-auto w-full max-w-screen-2xl space-y-6">
+            <div>
+              <Link to="/" className="text-sm text-muted-foreground hover:underline">
+                ← Back
+              </Link>
+            </div>
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
-        <div className="min-w-0 space-y-6">
+            <header className="space-y-2 text-center">
+              <h1 className="text-2xl font-bold">{p.title}</h1>
+              <div className="text-sm text-muted-foreground">
+                {p.authors.join(", ") || "—"}
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                {p.venue && <span>📰 {p.venue}</span>}
+                {p.publication_date && <span>📅 {p.publication_date}</span>}
+                {p.doi && (
+                  <a
+                    href={p.doi}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    DOI: {p.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")}
+                  </a>
+                )}
+                {p.arxiv_id && (
+                  <a
+                    href={`https://arxiv.org/abs/${p.arxiv_id}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    arXiv:{p.arxiv_id}
+                  </a>
+                )}
+                {p.citation_count !== null && p.citation_count !== undefined && (
+                  <span>🏆 {p.citation_count.toLocaleString()} cited</span>
+                )}
+                <span>status: {p.status}</span>
+                <span>oa: {p.oa_status}</span>
+              </div>
+            </header>
           <div className="flex flex-wrap gap-2">
             <Button
               variant="outline"
@@ -525,16 +529,14 @@ export default function PaperDetail({ onProcessed }: Props) {
 
           <ReferencesCard paper={p} onChanged={load} />
           <CitationsCard paper={p} onChanged={load} />
-        </div>
-
-        <aside className="min-w-0 lg:sticky lg:top-4 lg:self-start lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto lg:pr-1">
-          <div className="space-y-6">
-            <Suspense fallback={<div className="h-[70vh] rounded-lg border bg-card" />}>
-              <PaperChat paperId={p.id} hasMarkdown={!!p.md_path} />
-            </Suspense>
-            <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
           </div>
-        </aside>
+        </div>
+      </div>
+
+      <div className="static xl:fixed xl:inset-y-0 xl:right-0 xl:z-30 xl:w-[max(24rem,calc((100vw-98rem)/2))] xl:border-l xl:bg-background xl:shadow-lg">
+        <Suspense fallback={<div className="h-[70vh] w-full animate-pulse bg-muted xl:h-full" />}>
+          <PaperChat paperId={p.id} hasMarkdown={!!p.md_path} />
+        </Suspense>
       </div>
     </main>
   );
