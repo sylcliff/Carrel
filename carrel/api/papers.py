@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import String, cast
+from sqlalchemy import String, cast, func
 from sqlmodel import Session, col, or_, select
 
 from carrel.db import get_session_dep
@@ -112,8 +112,36 @@ def list_papers(
     q: str | None = Query(
         None, description="Case-insensitive substring match on title or authors"
     ),
+    sort: str = Query("added", description="Sort order"),
 ) -> list[PaperSummary]:
-    stmt = select(Paper).order_by(Paper.created_at.desc()).offset(offset).limit(limit)
+    allowed_sorts = {
+        "added",
+        "updated",
+        "pub_newest",
+        "pub_oldest",
+        "citations",
+        "title_az",
+        "title_za",
+        "favorites",
+    }
+    if sort not in allowed_sorts:
+        sort = "added"
+    sort_clauses = {
+        "added": [Paper.created_at.desc()],
+        "updated": [Paper.updated_at.desc()],
+        "pub_newest": [Paper.publication_date.desc().nullslast()],
+        "pub_oldest": [Paper.publication_date.asc().nullslast()],
+        "citations": [Paper.citation_count.desc().nullslast()],
+        "title_az": [func.lower(Paper.title).asc()],
+        "title_za": [func.lower(Paper.title).desc()],
+        "favorites": [Paper.favorite.desc(), Paper.created_at.desc()],
+    }
+    stmt = (
+        select(Paper)
+        .order_by(*sort_clauses[sort])
+        .offset(offset)
+        .limit(limit)
+    )
     if status:
         stmt = stmt.where(Paper.status == status)
     if venue:

@@ -13,6 +13,16 @@ import {
 } from "@/api/client";
 import { useDebouncedCallback } from "@/lib/useDebouncedCallback";
 
+type SortKey =
+  | "added"
+  | "updated"
+  | "pub_newest"
+  | "pub_oldest"
+  | "citations"
+  | "title_az"
+  | "title_za"
+  | "favorites";
+
 export default function Library() {
   const [papers, setPapers] = useState<PaperSummary[]>([]);
   const [allTags, setAllTags] = useState<TagWithCount[]>([]);
@@ -26,6 +36,7 @@ export default function Library() {
   const [favOnly, setFavOnly] = useState(false);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagMenuOpen, setTagMenuOpen] = useState(false);
+  const [sort, setSort] = useState<SortKey>("added");
 
   const debounceQ = useDebouncedCallback((value: string) => {
     setDebouncedQ(value);
@@ -45,6 +56,7 @@ export default function Library() {
       favorite: favOnly || undefined,
       q: debouncedQ.trim() || undefined,
       tag: selectedTags.length ? selectedTags : undefined,
+      sort,
     })
       .then((rows) => {
         if (!cancelled) setPapers(rows);
@@ -58,7 +70,7 @@ export default function Library() {
     return () => {
       cancelled = true;
     };
-  }, [debouncedQ, favOnly, selectedTags]);
+  }, [debouncedQ, favOnly, selectedTags, sort]);
 
   function toggleTag(name: string, on: boolean) {
     setSelectedTags((prev) =>
@@ -106,6 +118,22 @@ export default function Library() {
           placeholder="Search title or author…"
           className="h-9 min-w-[12rem] flex-1 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
         />
+
+        <select
+          value={sort}
+          onChange={(e) => setSort(e.target.value as SortKey)}
+          className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+          aria-label="Sort papers"
+        >
+          <option value="added">Sort: Recently added</option>
+          <option value="updated">Sort: Recently updated</option>
+          <option value="pub_newest">Sort: Newest published</option>
+          <option value="pub_oldest">Sort: Oldest published</option>
+          <option value="citations">Sort: Most cited</option>
+          <option value="title_az">Sort: Title A–Z</option>
+          <option value="title_za">Sort: Title Z–A</option>
+          <option value="favorites">Sort: Favorites first</option>
+        </select>
 
         <div className="relative">
           <Button

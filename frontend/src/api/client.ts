@@ -102,6 +102,7 @@ export const listPapers = (params?: {
   favorite?: boolean;
   tag?: string[];
   q?: string;
+  sort?: string;
 }) => {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
@@ -111,6 +112,7 @@ export const listPapers = (params?: {
   if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
   if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
   if (params?.q) q.set("q", params.q);
+  if (params?.sort) q.set("sort", params.sort);
   if (params?.tag) for (const t of params.tag) q.append("tag", t);
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
