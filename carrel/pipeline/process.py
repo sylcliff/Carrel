@@ -63,6 +63,60 @@ def paper_paths(paper: Paper, cfg: CarrelYAML) -> tuple[Path, Path, Path, str]:
     return work_dir, work_dir / PDF_FILENAME, work_dir / MD_FILENAME, rel_prefix
 
 
+def _remote_identifier(paper: Paper) -> str | None:
+    """Pick the best identifier to send to the institutional jump host.
+
+    Prefer a journal DOI (the published version), then the stored DOI (with a
+    doi.org prefix stripped), then the version-stripped arXiv id.
+    """
+    from carrel.sources import remote_downloader as rd
+
+    if paper.journal_doi:
+        return rd.normalize_doi(paper.journal_doi)
+    if paper.doi:
+        return rd.normalize_doi(paper.doi)
+    if paper.arxiv_id:
+        return paper.arxiv_id.split("v", 1)[0]
+    return None
+
+
+def _try_remote_download(
+    session: Session, work_dir: Path, rel_prefix: str, paper: Paper
+) -> bool:
+    """Fallback: download via the institutional SSH jump host.
+
+    Returns True on success (paper updated and committed). Raises ProcessError
+    when the remote is configured and attempted but fails. Returns False when
+    the remote is not configured or the paper has no usable identifier (so the
+    caller preserves its original error).
+    """
+    from carrel.sources import remote_downloader as rd
+
+    if not rd.is_configured():
+        return False
+    ident = _remote_identifier(paper)
+    if not ident:
+        return False
+
+    try:
+        rd.download_paper(ident, work_dir, filename=PDF_FILENAME)
+    except rd.RemotePermanentError as e:
+        raise ProcessError(f"institutional download: {e}") from e
+    except rd.RemoteError as e:
+        raise ProcessError(f"institutional download failed: {e}") from e
+
+    paper.oa_status = "institutional"
+    paper.pdf_origin = "institutional"
+    paper.pdf_path = f"{rel_prefix}/{PDF_FILENAME}"
+    paper.status = PaperStatus.pdf_ready.value
+    session.add(paper)
+    session.commit()
+    logger.info(
+        "institutional download for %s via %s -> %s", paper.id, ident, paper.pdf_path
+    )
+    return True
+
+
 def _pdf_candidates(paper: Paper) -> list[str]:
     """Build an ordered list of PDF URLs to try for this paper.
 
@@ -196,37 +250,60 @@ def _step_download(
         return
 
     # A stored pdf_url is not required: _pdf_candidates() synthesizes an arXiv
-    # PDF from arxiv_id and pulls repository copies from raw_meta. Only bail
-    # when no candidate exists at all (truly closed access, metadata only).
+    # PDF from arxiv_id and pulls repository copies from raw_meta. When no
+    # candidate exists (truly closed access, metadata only) or every HTTP
+    # candidate fails, fall back to the institutional SSH jump host (if
+    # configured) before giving up.
     candidates = _pdf_candidates(paper)
-    if not candidates:
-        raise ProcessError("no PDF URL available (closed access or metadata only)")
-
     dl = cfg.download
-    _path, used_url = download_pdf_with_fallback(
-        candidates,
-        work_dir,
-        filename=PDF_FILENAME,
-        timeout=dl.request_timeout_seconds,
-        max_bytes=dl.max_bytes,
-        user_agent=dl.user_agent,
-        client=client,
-    )
-    # If a fallback candidate (e.g. an arXiv copy) succeeded where the stored
-    # publisher URL served HTML, remember it so future retries don't repeat the
-    # bad URL. We now have a verified PDF, so mark the paper OA regardless of
-    # what the source metadata claimed (heals metadata-only records that have
-    # an arxiv_id but no advertised pdf_url).
-    if used_url != paper.pdf_url:
-        logger.info("PDF for %s resolved via fallback %s", paper.id, used_url)
-        paper.pdf_url = used_url
-    if paper.oa_status != "oa":
+    http_error: Exception | None = None
+    used_url: str | None = None
+    if candidates:
+        try:
+            _path, used_url = download_pdf_with_fallback(
+                candidates,
+                work_dir,
+                filename=PDF_FILENAME,
+                timeout=dl.request_timeout_seconds,
+                max_bytes=dl.max_bytes,
+                user_agent=dl.user_agent,
+                client=client,
+            )
+        except Exception as e:  # noqa: BLE001 - converted to remote fallback below
+            http_error = e
+            used_url = None
+    else:
+        http_error = ProcessError(
+            "no PDF URL available (closed access or metadata only)"
+        )
+
+    if used_url is not None:
+        # If a fallback candidate (e.g. an arXiv copy) succeeded where the stored
+        # publisher URL served HTML, remember it so future retries don't repeat
+        # the bad URL. We now have a verified PDF, so mark the paper OA regardless
+        # of what the source metadata claimed.
+        if used_url != paper.pdf_url:
+            logger.info("PDF for %s resolved via fallback %s", paper.id, used_url)
+            paper.pdf_url = used_url
         paper.oa_status = "oa"
-    paper.pdf_path = f"{rel_prefix}/{PDF_FILENAME}"
-    paper.status = PaperStatus.pdf_ready.value
-    session.add(paper)
-    session.commit()
-    logger.info("downloaded PDF for %s -> %s", paper.id, paper.pdf_path)
+        paper.pdf_origin = (
+            "arxiv" if used_url.startswith("https://arxiv.org/pdf/") else "oa"
+        )
+        paper.pdf_path = f"{rel_prefix}/{PDF_FILENAME}"
+        paper.status = PaperStatus.pdf_ready.value
+        session.add(paper)
+        session.commit()
+        logger.info("downloaded PDF for %s -> %s", paper.id, paper.pdf_path)
+        return
+
+    # HTTP path failed or had no candidates. Try the institutional jump host.
+    if _try_remote_download(session, work_dir, rel_prefix, paper):
+        return
+    if isinstance(http_error, ProcessError):
+        raise http_error
+    raise ProcessError(
+        f"no PDF available (HTTP download failed: {http_error})"
+    ) from http_error
 
 
 def _step_parse(
@@ -312,14 +389,28 @@ def select_pending(session: Session, limit: int = 10) -> list[Paper]:
     pending" retry picks them up), newest first. A paper is eligible when it has
     either a stored ``pdf_url`` *or* an ``arxiv_id`` — the latter yields an arXiv
     PDF via ``_pdf_candidates`` even when the source record advertised no OA PDF.
-    Papers with neither (truly closed access, metadata only) are excluded since
-    they can never be downloaded.
+    When the institutional SSH jump host is configured, papers that only carry a
+    ``doi`` (or ``journal_doi``) are also eligible: ``_step_download`` will fall
+    back to the remote server for those closed-access records. Papers with no
+    identifier at all are still excluded.
     """
+    from carrel.sources import remote_downloader as rd
+
+    has_identifier = or_(
+        Paper.pdf_url.is_not(None),
+        Paper.arxiv_id.is_not(None),
+    )
+    if rd.is_configured():
+        has_identifier = or_(
+            has_identifier,
+            Paper.doi.is_not(None),
+            Paper.journal_doi.is_not(None),
+        )
     stmt = (
         select(Paper)
         .where(
             Paper.in_library.is_(True),
-            or_(Paper.pdf_url.is_not(None), Paper.arxiv_id.is_not(None)),
+            has_identifier,
             Paper.status.in_(
                 [PaperStatus.pending.value, PaperStatus.failed.value]
             ),

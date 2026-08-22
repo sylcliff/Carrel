@@ -76,6 +76,10 @@ def _to_detail(
         reference_count=p.reference_count,
         citations_updated_at=p.citations_updated_at,
         notes_markdown=p.notes_markdown,
+        pdf_origin=p.pdf_origin,
+        journal_doi=p.journal_doi,
+        pdf_files=p.pdf_files,
+        published_checked_at=p.published_checked_at,
         created_at=p.created_at,
         updated_at=p.updated_at,
         author_list=[

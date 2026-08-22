@@ -15,7 +15,9 @@ const PaperChat = lazy(() =>
 );
 import {
   addPaperTag,
+  checkPublication,
   embedPaper,
+  getHealth,
   getJob,
   getPaper,
   getPaperMarkdown,
@@ -58,7 +60,16 @@ export default function PaperDetail({ onProcessed }: Props) {
   const [tags, setTags] = useState<Tag[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [favBusy, setFavBusy] = useState(false);
+  const [remoteEnabled, setRemoteEnabled] = useState(false);
+  const [pdfVariant, setPdfVariant] = useState<"journal" | "arxiv">("journal");
   const timer = useRef<number | null>(null);
+
+  // Probe whether the institutional SSH download server is configured (once).
+  useEffect(() => {
+    getHealth()
+      .then((h) => setRemoteEnabled(h.remote))
+      .catch(() => setRemoteEnabled(false));
+  }, []);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -164,6 +175,20 @@ export default function PaperDetail({ onProcessed }: Props) {
     }
   }
 
+  async function onCheckPublication() {
+    if (!id) return;
+    setProcessing(true);
+    setErr(null);
+    setJob(null);
+    try {
+      const jobStarted = await checkPublication(id, true, Boolean(p?.journal_doi));
+      watchJob(jobStarted);
+    } catch (e) {
+      setProcessing(false);
+      setErr(String(e));
+    }
+  }
+
   useEffect(
     () => () => {
       if (timer.current) window.clearInterval(timer.current);
@@ -229,10 +254,23 @@ export default function PaperDetail({ onProcessed }: Props) {
 
   // A downloadable PDF exists when the record carries a pdf_url, or when it
   // has an arXiv id (the backend synthesizes the canonical arXiv PDF even if
-  // the source advertised no direct pdf_url).
+  // the source advertised no direct pdf_url). Closed papers with only a DOI
+  // can also be processed when the institutional SSH server is configured.
   const pdfHref = p.pdf_url || (p.arxiv_id ? `https://arxiv.org/pdf/${p.arxiv_id}.pdf` : "");
   const canParse =
-    Boolean(pdfHref) && p.status !== "parsed" && p.status !== "summarized" && p.status !== "ready";
+    (Boolean(pdfHref) || (remoteEnabled && Boolean(p.doi || p.arxiv_id || p.journal_doi))) &&
+    p.status !== "parsed" &&
+    p.status !== "summarized" &&
+    p.status !== "ready";
+  const variants = p.pdf_files || {};
+  const hasJournalVariant = Boolean(variants.journal);
+  const hasArxivVariant = Boolean(variants.arxiv);
+  const hasPdfVariants = hasJournalVariant && hasArxivVariant;
+  const activePdfPath = hasPdfVariants
+    ? variants[pdfVariant] || p.pdf_path
+    : p.pdf_path;
+  const showInstitutionalCard =
+    !pdfHref && !p.pdf_path && remoteEnabled && Boolean(p.doi || p.arxiv_id || p.journal_doi);
   // Embed is available when the paper is parsed/summarized but not yet ready,
   // or when a previous embed failed.
   const canEmbed =
@@ -288,16 +326,28 @@ export default function PaperDetail({ onProcessed }: Props) {
               <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 {p.venue && <span>📰 {p.venue}</span>}
                 {p.publication_date && <span>📅 {p.publication_date}</span>}
-                {p.doi && (
-                  <a
-                    href={p.doi}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline-offset-2 hover:text-foreground hover:underline"
-                  >
-                    DOI: {p.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")}
-                  </a>
-                )}
+                {(() => {
+                  const journalDoi = p.journal_doi || "";
+                  const fallbackDoi = !journalDoi && p.doi ? p.doi : "";
+                  const primaryDoi = journalDoi || fallbackDoi;
+                  if (!primaryDoi) return null;
+                  const bare = primaryDoi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "");
+                  const href = /^https?:\/\//i.test(primaryDoi)
+                    ? primaryDoi
+                    : `https://doi.org/${bare}`;
+                  return (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline-offset-2 hover:text-foreground hover:underline"
+                      title={journalDoi ? "Journal DOI" : "DOI"}
+                    >
+                      {journalDoi ? "📕 Journal DOI: " : "DOI: "}
+                      {bare}
+                    </a>
+                  );
+                })()}
                 {p.arxiv_id && (
                   <a
                     href={`https://arxiv.org/abs/${p.arxiv_id}`}
@@ -306,6 +356,17 @@ export default function PaperDetail({ onProcessed }: Props) {
                     className="underline-offset-2 hover:text-foreground hover:underline"
                   >
                     arXiv:{p.arxiv_id}
+                  </a>
+                )}
+                {p.arxiv_id && (
+                  <a
+                    href={`https://doi.org/10.48550/arXiv.${p.arxiv_id}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline-offset-2 hover:text-foreground hover:underline"
+                    title="arXiv DOI"
+                  >
+                    arXiv DOI
                   </a>
                 )}
                 {p.citation_count !== null && p.citation_count !== undefined && (
@@ -362,6 +423,16 @@ export default function PaperDetail({ onProcessed }: Props) {
                 onClick={() => window.open(pdfHref, "_blank", "noopener")}
               >
                 Open original PDF
+              </Button>
+            )}
+            {p.arxiv_id && (
+              <Button
+                variant="outline"
+                onClick={onCheckPublication}
+                disabled={running}
+                title="Check whether this arXiv preprint has been published in a journal, and fetch the journal PDF via institutional access"
+              >
+                {running ? "Checking…" : p.journal_doi ? "Re-check journal version" : "Check for journal version"}
               </Button>
             )}
             {p.pdf_path && (
@@ -445,7 +516,9 @@ export default function PaperDetail({ onProcessed }: Props) {
                   ? "Embedded successfully."
                   : job.kind === "summarize"
                     ? "Summary generated."
-                    : "Parsed successfully."}
+                    : job.kind === "publication_check"
+                      ? "Journal version check complete."
+                      : "Parsed successfully."}
               </CardContent>
             </Card>
           )}
@@ -498,22 +571,54 @@ export default function PaperDetail({ onProcessed }: Props) {
 
           {!pdfHref && (
             <Card>
-              <CardContent className="pt-5 text-sm text-muted-foreground">
-                No open-access PDF is available for this paper — only metadata and the abstract
-                are stored. Use “Open original PDF” if a publisher link exists.
+              <CardContent className="space-y-3 pt-5 text-sm text-muted-foreground">
+                {showInstitutionalCard ? (
+                  <>
+                    <p>
+                      No open-access PDF is available. A PDF can be fetched through your
+                      institutional access server.
+                    </p>
+                    <Button onClick={onParse} disabled={running} size="sm">
+                      {running ? "Fetching…" : "Download via institutional access"}
+                    </Button>
+                  </>
+                ) : (
+                  <p>
+                    No open-access PDF is available for this paper — only metadata and the
+                    abstract are stored. Use “Open original PDF” if a publisher link exists.
+                  </p>
+                )}
               </CardContent>
             </Card>
           )}
 
-          {pdfOpen && p.pdf_path ? (
+          {pdfOpen && activePdfPath ? (
             <Card className="overflow-hidden">
-              <CardHeader className="py-3">
+              <CardHeader className="flex-row items-center justify-between space-y-0 py-3">
                 <CardTitle className="text-base">PDF</CardTitle>
+                {hasPdfVariants && (
+                  <div className="inline-flex rounded-md border bg-muted p-0.5 text-xs" role="group" aria-label="PDF variant">
+                    <button
+                      type="button"
+                      onClick={() => setPdfVariant("journal")}
+                      className={`rounded px-2.5 py-1 ${pdfVariant === "journal" ? "bg-background shadow-sm font-medium" : "text-muted-foreground"}`}
+                    >
+                      Journal
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPdfVariant("arxiv")}
+                      className={`rounded px-2.5 py-1 ${pdfVariant === "arxiv" ? "bg-background shadow-sm font-medium" : "text-muted-foreground"}`}
+                    >
+                      arXiv
+                    </button>
+                  </div>
+                )}
               </CardHeader>
               <CardContent className="p-0">
                 <iframe
                   title={`${p.title} — PDF`}
-                  src={`/storage/${p.pdf_path}`}
+                  src={`/storage/${activePdfPath}`}
                   className="h-[calc(100vh-200px)] w-full border-0"
                 />
               </CardContent>

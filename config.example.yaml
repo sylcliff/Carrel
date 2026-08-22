@@ -79,6 +79,13 @@ chunking:
 schedule:
   enabled: false                       # set true to enable daily auto-sync (APScheduler, in-process)
   sync_cron: "0 8 * * *"              # 5-field crontab (minute hour dom month dow), local time. Default: 08:00 daily
+  # Retry downloading PDFs for closed papers via the institutional SSH server
+  # (requires REMOTE_SSH_ENABLED=true and the REMOTE_* vars in .env).
+  remote_fill_enabled: false
+  remote_fill_cron: "0 9 * * *"
+  # Check old arXiv papers for a published journal version.
+  publication_check_enabled: false
+  publication_check_cron: "0 10 * * 1"
 
 # ----- Subscriptions (M2) -----
 # Each entry is one of:

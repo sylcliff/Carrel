@@ -8,6 +8,7 @@ from sqlmodel import Session
 from carrel import __version__
 from carrel.db import get_session_dep
 from carrel.schemas import HealthResponse
+from carrel.sources import remote_downloader
 
 router = APIRouter(tags=["health"])
 
@@ -35,4 +36,5 @@ def health(session: Session = Depends(get_session_dep)) -> HealthResponse:
         version=__version__,
         db=db_status,
         mineru=cfg.mineru.base_url,
+        remote=remote_downloader.is_configured(),
     )

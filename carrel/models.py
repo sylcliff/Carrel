@@ -35,6 +35,7 @@ class OAStatus(str, Enum):
     oa = "oa"                    # open access PDF available
     closed = "closed"            # paywalled, no PDF cached
     none = "none"                # no PDF info
+    institutional = "institutional"  # fetched via the institutional SSH jump host
 
 
 class SourceKind(str, Enum):
@@ -52,6 +53,10 @@ class JobKind(str, Enum):
     authors_backfill = "authors_backfill"  # resolve author A-IDs from OpenAlex
     embed = "embed"
     citations = "citations"  # refresh Semantic Scholar citation count + citing list
+    # Download PDFs for closed papers via the institutional SSH jump host.
+    remote_fill = "remote_fill"
+    # Check an arXiv paper for a published journal version (and fetch it).
+    publication_check = "publication_check"
 
 
 class JobStatus(str, Enum):
@@ -80,10 +85,23 @@ class Paper(SQLModel, table=True):
     arxiv_id: str | None = Field(default=None, index=True, max_length=64)
 
     pdf_url: str | None = None
-    pdf_path: str | None = None  # relative to storage.root
+    pdf_path: str | None = None  # relative to storage.root; always the active PDF
     md_path: str | None = None
     oa_status: str = Field(default=OAStatus.none.value, max_length=16)
     source: str = Field(default=SourceKind.openalex.value, max_length=16)
+
+    # Where the active PDF came from: "oa" | "arxiv" | "institutional" | "journal".
+    pdf_origin: str | None = Field(default=None, max_length=16)
+    # Journal DOI for an arXiv paper that has been formally published.
+    journal_doi: str | None = Field(default=None, index=True, max_length=255)
+    # Named PDF variants on disk, e.g.
+    # {"arxiv": "papers/<slug>/arxiv.pdf", "journal": "papers/<slug>/journal.pdf"}.
+    # paper.pdf/pdf_path remains the active (parsed) file.
+    pdf_files: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    # Last time we queried S2/OA for a published version of an arXiv paper.
+    published_checked_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
 
     status: str = Field(default=PaperStatus.pending.value, max_length=16, index=True)
     error: str | None = None

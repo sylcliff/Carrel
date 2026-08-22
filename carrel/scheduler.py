@@ -55,29 +55,131 @@ def _scheduled_sync(lookback_hours: int) -> None:
             session.commit()
 
 
+# Default batch sizes for the periodic sweeps.
+DEFAULT_REMOTE_FILL_LIMIT = 50
+DEFAULT_PUBLICATION_CHECK_LIMIT = 50
+
+
+def _scheduled_remote_fill(limit: int) -> None:
+    """Try to download PDFs for closed papers via the institutional host."""
+    from carrel.main import app_config  # noqa: PLC0415
+    from carrel.pipeline.publication_check import fill_closed_papers
+    from carrel.sources import remote_downloader
+
+    if not remote_downloader.is_configured():
+        logger.info("scheduled remote_fill skipped: institutional SSH not configured")
+        return
+
+    engine = get_app_engine()
+    with Session(engine) as session:
+        job = Job(
+            kind=JobKind.remote_fill.value,
+            status=JobStatus.running.value,
+            message="scheduled remote fill",
+            started_at=datetime.now(UTC),
+            stats={"limit": limit, "scheduled": True},
+        )
+        session.add(job)
+        session.commit()
+        try:
+            counts = fill_closed_papers(session, app_config, limit=limit)
+            job.status = JobStatus.done.value
+            job.message = (
+                f"candidates={counts.get('candidates', 0)} "
+                f"parsed={counts.get('parsed', 0)} failed={counts.get('failed', 0)}"
+            )
+            job.stats = {**(job.stats or {}), **counts}
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("scheduled remote fill failed: %s", e)
+            job.status = JobStatus.failed.value
+            job.message = f"{type(e).__name__}: {e}"[:500]
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+
+
+def _scheduled_publication_check(limit: int) -> None:
+    """Check old arXiv papers for a published journal version."""
+    from carrel.main import app_config  # noqa: PLC0415
+    from carrel.pipeline.publication_check import check_pending
+
+    engine = get_app_engine()
+    with Session(engine) as session:
+        job = Job(
+            kind=JobKind.publication_check.value,
+            status=JobStatus.running.value,
+            message="scheduled publication check",
+            started_at=datetime.now(UTC),
+            stats={"limit": limit, "scheduled": True},
+        )
+        session.add(job)
+        session.commit()
+        try:
+            counts = check_pending(session, app_config, limit=limit)
+            job.status = JobStatus.done.value
+            job.message = (
+                f"candidates={counts.get('candidates', 0)} "
+                f"found={counts.get('found', 0)} failed={counts.get('failed', 0)}"
+            )
+            job.stats = {**(job.stats or {}), **counts}
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("scheduled publication check failed: %s", e)
+            job.status = JobStatus.failed.value
+            job.message = f"{type(e).__name__}: {e}"[:500]
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+
+
 def start_scheduler(cfg: CarrelYAML) -> AsyncIOScheduler | None:
-    """Start the scheduler if enabled. Idempotent — returns existing instance."""
+    """Start the scheduler for any enabled cron jobs. Idempotent."""
     global _scheduler
-    if not cfg.schedule.enabled:
-        logger.info("scheduler disabled (schedule.enabled=false)")
-        return None
     if _scheduler is not None:
         return _scheduler
 
-    trigger = CronTrigger.from_crontab(cfg.schedule.sync_cron)
+    sched = cfg.schedule
+    jobs: list[tuple[str, callable, str, list]] = []  # type: ignore[type-arg]
+    if sched.enabled:
+        jobs.append(("daily_sync", _scheduled_sync, sched.sync_cron, [DEFAULT_LOOKBACK_HOURS]))
+    if sched.remote_fill_enabled:
+        jobs.append((
+            "remote_fill",
+            _scheduled_remote_fill,
+            sched.remote_fill_cron,
+            [DEFAULT_REMOTE_FILL_LIMIT],
+        ))
+    if sched.publication_check_enabled:
+        jobs.append((
+            "publication_check",
+            _scheduled_publication_check,
+            sched.publication_check_cron,
+            [DEFAULT_PUBLICATION_CHECK_LIMIT],
+        ))
+
+    if not jobs:
+        logger.info("scheduler disabled (no schedule jobs enabled)")
+        return None
+
     scheduler = AsyncIOScheduler(daemon=True)
-    scheduler.add_job(
-        _scheduled_sync,
-        trigger=trigger,
-        args=[DEFAULT_LOOKBACK_HOURS],
-        id="daily_sync",
-        max_instances=1,
-        coalesce=True,
-        replace_existing=True,
-    )
+    for job_id, func, cron, args in jobs:
+        scheduler.add_job(
+            func,
+            trigger=CronTrigger.from_crontab(cron),
+            args=args,
+            id=job_id,
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        logger.info("scheduled job %s cron=%r", job_id, cron)
     scheduler.start()
     _scheduler = scheduler
-    logger.info("scheduler started: daily sync cron=%r", cfg.schedule.sync_cron)
     return scheduler
 
 

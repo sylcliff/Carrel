@@ -26,6 +26,7 @@ export interface Health {
   version: string;
   db: string;
   mineru: string;
+  remote: boolean;
 }
 
 export const getHealth = () => request<Health>("/health");
@@ -65,6 +66,10 @@ export interface PaperDetail extends PaperSummary {
   reference_count: number | null;
   citations_updated_at: string | null;
   notes_markdown: string | null;
+  pdf_origin: string | null;
+  journal_doi: string | null;
+  pdf_files: Record<string, string> | null;
+  published_checked_at: string | null;
   created_at: string;
   updated_at: string;
   author_list: AuthorRef[];
@@ -248,6 +253,13 @@ export const refreshPaperCitations = (id: string, background = true) =>
   request<Job>(`/papers/${encodeURIComponent(id)}/refresh-citations`, {
     method: "POST",
     body: JSON.stringify({ background }),
+  });
+
+// Check an arXiv paper for a published journal version (fetch + swap to it).
+export const checkPublication = (id: string, background = true, force = false) =>
+  request<Job>(`/papers/${encodeURIComponent(id)}/check-publication`, {
+    method: "POST",
+    body: JSON.stringify({ background, force }),
   });
 
 export interface ReferenceList {

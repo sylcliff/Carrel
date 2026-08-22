@@ -21,6 +21,7 @@ dependencies = [
     "apscheduler>=3.10",
     "python-multipart>=0.0.9",
     "symspellpy>=6.7",
+    "paramiko>=3.4",  # institutional SSH download fallback (optional at runtime)
 ]
 
 [project.optional-dependencies]

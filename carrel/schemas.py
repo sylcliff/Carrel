@@ -14,6 +14,7 @@ class HealthResponse(BaseModel):
     version: str
     db: str
     mineru: str
+    remote: bool = False  # institutional SSH download configured
 
 
 # -------- Papers --------
@@ -65,6 +66,11 @@ class PaperDetail(PaperSummary):
     reference_count: int | None = None
     citations_updated_at: datetime | None = None
     notes_markdown: str | None = None
+    # Institutional download + arXiv→journal detection.
+    pdf_origin: str | None = None
+    journal_doi: str | None = None
+    pdf_files: dict[str, Any] | None = None
+    published_checked_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -305,6 +311,13 @@ class ProcessRequest(BaseModel):
     paper_id: str | None = None
     limit: int = 10
     background: bool = False
+
+
+class PublicationCheckRequest(BaseModel):
+    """Check an arXiv paper for a published journal version."""
+
+    background: bool = False
+    force: bool = False  # re-check even if a journal_doi is already recorded
 
 
 class EmbedRequest(BaseModel):

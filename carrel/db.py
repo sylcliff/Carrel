@@ -74,6 +74,11 @@ def init_db(engine: Engine) -> None:
         # User annotations (M7).
         "favorite": "BOOLEAN DEFAULT FALSE NOT NULL",
         "notes_markdown": "TEXT",
+        # Institutional SSH download + arXiv→journal detection.
+        "pdf_origin": "VARCHAR(16)",
+        "journal_doi": "VARCHAR(255)",
+        "pdf_files": "JSON",
+        "published_checked_at": "TIMESTAMP",
     })
 
     # Backfill: papers created before the inbox feature existed are already in

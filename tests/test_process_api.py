@@ -128,3 +128,36 @@ def test_process_records_failure(client, session, monkeypatch):
     job = r.json()[0]
     assert job["status"] == "failed"
     assert "MinerU unavailable" in job["message"]
+
+
+def test_process_closed_doi_only_paper_via_institutional(client, session, monkeypatch):
+    """A DOI-only closed paper is accepted and the pipeline marks it
+    institutional when the SSH fallback succeeds (stubbed end-to-end)."""
+    pid = _seed_paper(
+        session, id="W-closed", pdf_url=None, arxiv_id=None,
+        doi="10.1021/acs.jctc.6c01122", oa_status="closed",
+    )
+
+    def fake_process(sess, cfg, paper_id, **kw):
+        p = sess.get(Paper, paper_id)
+        p.oa_status = "institutional"
+        p.pdf_origin = "institutional"
+        p.pdf_path = "papers/W-closed/paper.pdf"
+        p.status = PaperStatus.parsed.value
+        p.md_path = "papers/W-closed/paper.md"
+        sess.add(p)
+        sess.commit()
+        return p
+
+    monkeypatch.setattr("carrel.api.process.process_paper", fake_process)
+
+    r = client.post("/process", json={"paper_id": pid, "background": False})
+    assert r.status_code == 200, r.text
+    job = r.json()[0]
+    assert job["kind"] == "download"
+    assert job["status"] == "done"
+
+    from carrel.models import Paper as P
+
+    refreshed = session.get(P, pid)
+    assert refreshed.oa_status == "institutional"

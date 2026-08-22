@@ -134,6 +134,13 @@ class ChunkingConfig(BaseModel):
 class ScheduleConfig(BaseModel):
     enabled: bool = False
     sync_cron: str = "0 8 * * *"
+    # Periodically try to download PDFs for papers that have no open-access PDF
+    # (falls back to the institutional SSH server when configured).
+    remote_fill_enabled: bool = False
+    remote_fill_cron: str = "0 9 * * *"
+    # Periodically check arXiv papers for a published journal version.
+    publication_check_enabled: bool = False
+    publication_check_cron: str = "0 10 * * 1"
 
 
 SubKind = Literal["keyword", "author", "venue", "arxiv_category"]
@@ -189,6 +196,36 @@ class EnvSettings(BaseSettings):
     carrel_host: str = "127.0.0.1"
     carrel_port: int = 8787
     carrel_cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+
+    # ---- Institutional SSH download (optional; disabled by default) ----
+    # Generic SSH jump host running a paper-download CLI (e.g. scansci-pdf)
+    # on an institutional/campus IP. Nothing here is hardcoded; fill .env.
+    remote_ssh_enabled: bool = False
+    remote_ssh_host: str | None = None
+    remote_ssh_port: int = 22
+    remote_ssh_user: str | None = None
+    # Absolute path to a private key (Ed25519 or RSA).
+    remote_ssh_key_path: str | None = None
+    # If set, host keys are verified against this known_hosts file; otherwise
+    # AutoAddPolicy is used (with a one-time warning).
+    remote_ssh_known_hosts_path: str | None = None
+    remote_ssh_connect_timeout: int = 25
+    # Working directory on the remote host where downloaded PDFs land.
+    remote_work_dir: str | None = None
+    # Command run on the remote host. Supported placeholders: {id} (the
+    # DOI/arXiv identifier, whitelist-validated), {work_dir}, {timeout}.
+    # The CLI is expected to print "OK: <path>.pdf" on success.
+    remote_command_template: str | None = (
+        "mkdir -p '{work_dir}'; timeout {timeout} scansci-pdf get "
+        "'{id}' --output '{work_dir}' --strategy legal_only"
+    )
+    # Per-paper download timeout on the remote (seconds), and SSH retry count.
+    remote_dl_timeout: int = 240
+    remote_retries: int = 3
+    # arXiv→journal detection: don't even query until the arXiv <published>
+    # date is this old; throttle re-checks per paper.
+    remote_journal_min_age_days: int = 180
+    remote_journal_check_throttle_days: int = 30
 
 
 # ----------------------------- Loader -----------------------------

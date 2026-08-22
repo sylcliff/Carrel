@@ -39,9 +39,11 @@ class ArxivEntry:
     summary: str
     authors: list[str]
     categories: list[str]
-    updated: str  # ISO date string from arXiv
+    updated: str  # ISO date string from arXiv (last version)
     abs_url: str
     pdf_url: str | None
+    # ISO date string of the first arXiv version (used for age checks).
+    published: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ def _parse_entry(entry: ET.Element) -> ArxivEntry | None:
         if cat.get("term") and "arxiv.org" in (cat.get("scheme") or "")
     ]
     updated = _text(entry.find("atom:updated", ns))
+    published = _text(entry.find("atom:published", ns)) or None
 
     pdf_url: str | None = None
     for link in entry.findall("atom:link", ns):
@@ -151,6 +154,7 @@ def _parse_entry(entry: ET.Element) -> ArxivEntry | None:
         updated=updated,
         abs_url=abs_url,
         pdf_url=pdf_url,
+        published=published,
     )
 
 

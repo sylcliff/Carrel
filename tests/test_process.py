@@ -91,8 +91,11 @@ def test_process_paper_download_failure_marks_failed(session, cfg, tmp_path, mon
 
     monkeypatch.setattr(proc, "download_pdf_with_fallback", _boom)
 
-    with pytest.raises(DownloadError):
+    # With no institutional fallback configured, the HTTP failure is wrapped
+    # into a ProcessError (the pipeline's failure type) and recorded on the row.
+    with pytest.raises(proc.ProcessError) as exc:
         proc.process_paper(session, cfg, p.id)
+    assert "refusing HTML" in str(exc.value)
     session.refresh(p)
     assert p.status == PaperStatus.failed.value
     assert "refusing HTML" in (p.error or "")
@@ -251,3 +254,83 @@ def test_process_summarize_failure_does_not_poison_parse(session, cfg, tmp_path,
     # Parse still succeeds; paper stays parsed (NOT failed), error untouched.
     assert out.status == PaperStatus.parsed.value
     assert out.error is None
+
+
+# ---------------------------------------------------------------------------
+# Institutional SSH fallback
+# ---------------------------------------------------------------------------
+
+
+def test_process_falls_back_to_institutional_when_http_fails(
+    session, cfg, tmp_path, monkeypatch
+):
+    """An HTTP download failure should transparently try the SSH jump host."""
+    from carrel.sources import remote_downloader as rd
+
+    cfg.storage.root = tmp_path / "data"
+    # No OA candidate at all (closed, DOI-only).
+    p = _make_paper(
+        session, id="W-closed",
+        pdf_url=None, doi="10.1021/acs.jctc.6c01122", oa_status="closed",
+    )
+
+    def _http_boom(*a, **k):
+        raise DownloadError("paywall / HTML landing page")
+
+    monkeypatch.setattr(proc, "download_pdf_with_fallback", _http_boom)
+    monkeypatch.setattr(rd, "is_configured", lambda: True)
+
+    def _fake_remote(identifier, dest_dir, *, filename="paper.pdf", env=None):
+        dest = Path(dest_dir) / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"%PDF-1.7\ninstitutional pdf")
+        assert identifier == "10.1021/acs.jctc.6c01122"
+        return dest
+
+    monkeypatch.setattr(rd, "download_paper", _fake_remote)
+    monkeypatch.setattr(proc.mineru_client, "parse_pdf", _fake_parse_ok())
+
+    out = proc.process_paper(session, cfg, p.id)
+
+    assert out.oa_status == "institutional"
+    assert out.pdf_origin == "institutional"
+    assert out.pdf_path and out.pdf_path.endswith("paper.pdf")
+    # Parse succeeded; a chained (non-fatal) summarize may advance status past
+    # `parsed` when an LLM is configured in the environment.
+    assert out.status in (PaperStatus.parsed.value, PaperStatus.summarized.value)
+
+
+def test_process_no_candidate_and_remote_not_configured_fails(session, cfg, tmp_path, monkeypatch):
+    """Metadata-only paper with no remote configured keeps the old failure."""
+    from carrel.sources import remote_downloader as rd
+
+    cfg.storage.root = tmp_path / "data"
+    p = _make_paper(session, id="W-meta", pdf_url=None, oa_status="closed")
+
+    monkeypatch.setattr(rd, "is_configured", lambda: False)
+
+    with pytest.raises(proc.ProcessError) as exc:
+        proc.process_paper(session, cfg, p.id)
+    assert "no PDF URL" in str(exc.value)
+
+
+def test_select_pending_includes_doi_only_when_remote_configured(
+    session, cfg, tmp_path, monkeypatch
+):
+    from carrel.sources import remote_downloader as rd
+
+    cfg.storage.root = tmp_path / "data"
+    _make_paper(session, id="W-doi", pdf_url=None, arxiv_id=None, doi="10.1/x",
+                status=PaperStatus.pending.value)
+    _make_paper(session, id="W-url", pdf_url="https://x/1.pdf", arxiv_id=None, doi=None,
+                status=PaperStatus.pending.value)
+
+    # Remote OFF → only the URL paper is eligible (old behavior).
+    monkeypatch.setattr(rd, "is_configured", lambda: False)
+    ids_off = {r.id for r in proc.select_pending(session, limit=10)}
+    assert ids_off == {"W-url"}
+
+    # Remote ON → DOI-only closed paper joins the queue.
+    monkeypatch.setattr(rd, "is_configured", lambda: True)
+    ids_on = {r.id for r in proc.select_pending(session, limit=10)}
+    assert ids_on == {"W-url", "W-doi"}
