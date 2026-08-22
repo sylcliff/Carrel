@@ -12,7 +12,7 @@ import Topics from "@/pages/Topics";
 
 function Header() {
   return (
-    <header className="border-b">
+    <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
       <div className="container max-w-screen-2xl flex h-14 items-center gap-6">
         <Link to="/" className="text-lg font-semibold hover:text-foreground transition-colors">
           Carrel
