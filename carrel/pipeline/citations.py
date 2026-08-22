@@ -279,14 +279,28 @@ def enrich_papers(
 
 
 def select_stale(session: Session, limit: int = 50) -> list[Paper]:
-    """Return papers that have never had citations fetched (oldest first)."""
+    """Return in-library papers with the stalest citation data, oldest first.
+
+    Used by the daily sync to refresh cited-by/reference counts on a rolling
+    subset of the library. Papers that were never enriched
+    (``citations_updated_at IS NULL``) sort first, then enriched papers ordered
+    by oldest ``citations_updated_at``. Only papers with at least one
+    resolvable identifier (S2 id / DOI / arXiv id) are returned, matching
+    :func:`enrich_paper`.
+    """
     stmt = (
         select(Paper)
         .where(
             Paper.in_library.is_(True),
-            Paper.citations_updated_at.is_(None),
+            or_(
+                Paper.s2_paper_id.is_not(None),
+                Paper.doi.is_not(None),
+                Paper.arxiv_id.is_not(None),
+            ),
         )
-        .order_by(Paper.created_at.asc())
+        # NULLS FIRST so never-enriched papers are caught before refreshing
+        # already-enriched rows. Both SQLite and Postgres support this syntax.
+        .order_by(Paper.citations_updated_at.asc().nulls_first())
         .limit(limit)
     )
     return list(session.exec(stmt).all())

@@ -73,6 +73,11 @@ class SemanticScholarConfig(BaseModel):
     # Max reference-less papers (enriched before the references-list feature
     # shipped) to backfill per sync run.
     references_backfill_batch: int = 50
+    # Max already-enriched library papers to refresh per sync run — picks the
+    # stalest rows (oldest citations_updated_at) so cited-by/reference counts
+    # creep forward without re-hitting the whole library every night. Set to 0
+    # to disable periodic refresh.
+    citations_refresh_batch: int = 25
     search_enabled: bool = True
     search_per_page: int = 20
 

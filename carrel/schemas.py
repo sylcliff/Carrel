@@ -327,6 +327,61 @@ class SyncRequest(BaseModel):
     background: bool = False  # if true, fire-and-forget; else wait for result
 
 
+# -------- Scheduler --------
+
+
+class ScheduledJobOut(BaseModel):
+    """One cron job's current configuration + APScheduler runtime state."""
+
+    id: str
+    label: str
+    description: str = ""
+    enabled: bool
+    cron: str
+    running: bool = False
+    next_run_at: datetime | None = None
+    last_status: str | None = None
+    last_started_at: datetime | None = None
+    last_finished_at: datetime | None = None
+    last_message: str | None = None
+    last_stats: dict[str, Any] | None = None
+    requires: str | None = None  # e.g. "remote_ssh" when gating an optional dep
+    requirement_satisfied: bool = True
+
+
+class SchedulerStatus(BaseModel):
+    enabled: bool  # master switch (scheduler running at all)
+    jobs: list[ScheduledJobOut]
+
+
+class ScheduledJobUpdate(BaseModel):
+    enabled: bool | None = None
+    cron: str | None = None
+
+
+class SchedulerUpdate(BaseModel):
+    """PATCH /schedule body — any subset of the schedule settings.
+
+    Each top-level key mirrors a field in ``ScheduleConfig``. Cron strings are
+    validated by re-parsing them with APScheduler; an invalid string 422s.
+    """
+
+    enabled: bool | None = None
+    sync_cron: str | None = None
+    remote_fill_enabled: bool | None = None
+    remote_fill_cron: str | None = None
+    publication_check_enabled: bool | None = None
+    publication_check_cron: str | None = None
+
+
+class ScheduledRunAck(BaseModel):
+    """Returned by POST /schedule/{id}/run after the manual trigger is queued."""
+
+    job_id: str
+    running: bool  # true if the function was actually dispatched
+    message: str
+
+
 class ProcessRequest(BaseModel):
     """Trigger PDF download + MinerU parse.
 

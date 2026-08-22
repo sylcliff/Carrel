@@ -385,6 +385,52 @@ export const listJobs = (filter: JobFilter = {}) => {
 
 export const getJob = (id: number) => request<Job>(`/sync/jobs/${id}`);
 
+// -------- Schedule / cron --------
+
+export interface ScheduledJob {
+  id: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  cron: string;
+  running: boolean;
+  next_run_at: string | null;
+  last_status: string | null;
+  last_started_at: string | null;
+  last_finished_at: string | null;
+  last_message: string | null;
+  last_stats: Record<string, unknown> | null;
+  requires: string | null;
+  requirement_satisfied: boolean;
+}
+
+export interface SchedulerStatus {
+  enabled: boolean;
+  jobs: ScheduledJob[];
+}
+
+export const getSchedule = () =>
+  request<SchedulerStatus>("/schedule");
+
+export const updateSchedule = (body: {
+  enabled?: boolean;
+  sync_cron?: string;
+  remote_fill_enabled?: boolean;
+  remote_fill_cron?: string;
+  publication_check_enabled?: boolean;
+  publication_check_cron?: string;
+}) =>
+  request<SchedulerStatus>("/schedule", {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+
+export const runScheduledJob = (jobId: string) =>
+  request<{ job_id: string; running: boolean; message: string }>(
+    `/schedule/${encodeURIComponent(jobId)}/run`,
+    { method: "POST" },
+  );
+
 // -------- Search (M5) --------
 
 export type SearchSource = "library" | "openalex" | "semantic_scholar" | "arxiv";

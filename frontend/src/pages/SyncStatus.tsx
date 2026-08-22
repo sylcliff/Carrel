@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { listJobs, triggerSync, type Job } from "@/api/client";
+import ScheduledJobsCard from "@/components/ScheduledJobsCard";
 
 const ACTIVE = new Set(["queued", "running"]);
 const POLL_ACTIVE_MS = 2000;
@@ -15,7 +16,13 @@ const KIND_LABEL: Record<string, string> = {
   summarize: "Summarize",
   embed: "Embed",
   citations: "Citations",
+  topics: "Topics",
+  authors_backfill: "Author backfill",
+  remote_fill: "Remote fill",
+  publication_check: "Publication check",
 };
+const KIND_KEYS = Object.keys(KIND_LABEL) as Array<keyof typeof KIND_LABEL>;
+type KindFilter = "all" | (typeof KIND_KEYS)[number];
 
 function jobColor(status: string): string {
   if (status === "done") return "bg-green-500";
@@ -39,8 +46,6 @@ function duration(a: string | null, b: string | null): string {
   const m = Math.floor(s / 60);
   return m < 60 ? `${m}m${s % 60}s` : `${Math.floor(m / 60)}h${m % 60}m`;
 }
-
-type KindFilter = "all" | "sync" | "download" | "parse" | "embed" | "citations" | "summarize";
 
 export default function SyncStatus() {
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -162,7 +167,13 @@ export default function SyncStatus() {
         </Card>
       )}
 
-      <div className="mt-6 flex flex-wrap items-center gap-2 text-sm">
+      <div className="mt-6">
+        <ScheduledJobsCard />
+      </div>
+
+      <h2 className="mt-8 text-lg font-semibold">Recent jobs</h2>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
         <div className="flex rounded-md border overflow-hidden">
           {(["all", "active", "failed"] as const).map((s) => (
             <button

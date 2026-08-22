@@ -27,6 +27,7 @@ from carrel.api import (
     papers,
     process,
     publication,
+    schedule,
     scholars,
     search,
     subscriptions,
@@ -146,6 +147,7 @@ def create_app() -> FastAPI:
     app.include_router(citations.router)
     app.include_router(annotations.router)
     app.include_router(subscriptions.router)
+    app.include_router(schedule.router)
     app.include_router(sync.router)
     app.include_router(process.router)
     app.include_router(publication.router)

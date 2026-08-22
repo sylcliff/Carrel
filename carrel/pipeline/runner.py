@@ -363,8 +363,15 @@ def run_sync(
 
         # Best-effort citation enrichment. Newly *discovered* papers are in the
         # inbox (in_library=False) and are NOT enriched — don't spend S2 quota on
-        # papers the user hasn't kept. We only run a bounded backfill over
-        # library papers (reference_count set but references still NULL).
+        # papers the user hasn't kept. We run two bounded sweeps over library
+        # papers, then de-duplicate before calling enrich_papers:
+        #
+        #   1. Missing-references backfill: papers with reference_count set but
+        #      references still NULL (enriched before references shipped).
+        #   2. Stale-citation refresh: the N stalest rows by citations_updated_at
+        #      (NULLS FIRST, so it also catches papers that were never enriched).
+        #      This is what keeps cited-by counts creeping forward over time.
+        #
         # Failures here (rate limits, S2 downtime) must not fail the whole sync.
         if cfg.semantic_scholar.fetch_on_sync:
             from carrel.pipeline import citations as cite_pipe
@@ -374,8 +381,22 @@ def run_sync(
                     session, limit=cfg.semantic_scholar.references_backfill_batch
                 )
             ]
-            cite_ids: list[str] = list(backfill)
+            refresh_batch = cfg.semantic_scholar.citations_refresh_batch or 0
+            stale = [
+                p.id for p in cite_pipe.select_stale(session, limit=refresh_batch)
+            ] if refresh_batch > 0 else []
+
+            # De-dup while preserving order: missing-references backfill first,
+            # then any stale candidates not already in the backfill set.
+            seen: set[str] = set()
+            cite_ids: list[str] = []
+            for pid in backfill + stale:
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    cite_ids.append(pid)
+
             counts["references_backfilled"] = len(backfill)
+            counts["citations_refresh_candidates"] = len(stale)
 
             def _cite_progress(progress: dict) -> None:
                 if job is not None:
@@ -390,8 +411,10 @@ def run_sync(
                 counts["citations_enriched"] = cite_counts["enriched"]
                 counts["citations_failed"] = cite_counts["failed"]
                 logger.info(
-                    "citation enrichment: enriched=%d failed=%d (reference-backfill=%d)",
-                    cite_counts["enriched"], cite_counts["failed"], len(backfill),
+                    "citation enrichment: enriched=%d failed=%d "
+                    "(reference-backfill=%d stale-refresh=%d unique=%d)",
+                    cite_counts["enriched"], cite_counts["failed"],
+                    len(backfill), len(stale), len(cite_ids),
                 )
 
         logger.info(
