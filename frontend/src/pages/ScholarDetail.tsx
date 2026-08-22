@@ -9,13 +9,40 @@ import {
 } from "@/api/client";
 import { topicColorClass } from "@/lib/topicColor";
 
-function Stat({ label, value }: { label: string; value: number | string | null | undefined }) {
+function Stat({
+  label,
+  value,
+  href,
+}: {
+  label: string;
+  value: number | string | null | undefined;
+  href?: string;
+}) {
   if (value === null || value === undefined || value === "") return null;
-  return (
-    <div className="rounded-md border bg-muted/20 px-3 py-2">
+  const body = (
+    <>
       <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="text-sm font-semibold tabular-nums">{value}</div>
-    </div>
+      <div
+        className={`text-sm font-semibold tabular-nums ${
+          href ? "text-primary hover:underline" : ""
+        }`}
+      >
+        {value}
+      </div>
+    </>
+  );
+  const cls = "rounded-md border bg-muted/20 px-3 py-2";
+  return href ? (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={`${cls} block transition-colors hover:bg-muted/40`}
+    >
+      {body}
+    </a>
+  ) : (
+    <div className={cls}>{body}</div>
   );
 }
 
@@ -63,6 +90,13 @@ export default function ScholarDetailPage() {
 
   const { scholar, papers, profile } = data;
   const name = profile?.name || scholar.name;
+  // ORCID may arrive as a full URL or a bare 0000-... ID.
+  const orcidUrl =
+    profile?.orcid && /^https?:\/\//.test(profile.orcid)
+      ? profile.orcid
+      : profile?.orcid
+        ? `https://orcid.org/${profile.orcid}`
+        : null;
 
   return (
     <main className="container max-w-screen-2xl space-y-5 py-6">
@@ -118,10 +152,11 @@ export default function ScholarDetailPage() {
           <Stat label="OpenAlex works" value={profile.works_count} />
           <Stat label="Total citations" value={profile.cited_by_count} />
           <Stat label="h-index" value={profile.h_index} />
-          {profile.orcid && (
+          {orcidUrl && (
             <Stat
               label="ORCID"
-              value={profile.orcid.replace("https://orcid.org/", "")}
+              value={orcidUrl.replace("https://orcid.org/", "")}
+              href={orcidUrl}
             />
           )}
         </div>
