@@ -678,7 +678,7 @@ export default function PaperDetail({ onProcessed }: Props) {
         </div>
       </div>
 
-      <div className="static xl:fixed xl:inset-y-0 xl:right-0 xl:z-30 xl:w-[max(24rem,calc((100vw-98rem)/2))] xl:border-l xl:bg-background xl:shadow-lg">
+      <div className="static xl:fixed xl:top-14 xl:bottom-0 xl:right-0 xl:z-30 xl:w-[max(24rem,calc((100vw-98rem)/2))] xl:border-l xl:bg-background xl:shadow-lg">
         <Suspense fallback={<div className="h-[70vh] w-full animate-pulse bg-muted xl:h-full" />}>
           <PaperChat paperId={p.id} hasMarkdown={!!p.md_path} />
         </Suspense>

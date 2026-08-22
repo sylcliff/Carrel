@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,8 +27,13 @@ from carrel import embeddings as emb
 from carrel import llm
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
-from carrel.models import Chunk, Paper
+from carrel.models import ChatMessage, Chunk, Paper
 from carrel.pipeline.summarize import _prepare_body
+from carrel.schemas import (
+    ChatMessageOut,
+    ChatMessagesIn as ChatHistoryIn,
+    ChatMessagesOut as ChatHistoryOut,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +44,9 @@ _SYSTEM_PROMPT = (
     "- 回答使用与问题相同的语言（中文问题用中文，英文问题用英文）。\n"
     "- 引用相关内容时注明来自哪个章节标题。\n"
     "- 如果提供的片段不足以回答问题，明确说明，不要编造论文中没有的结果、数字或结论。\n"
-    "- 回答简洁、结构清晰，可使用 Markdown。"
+    "- 回答简洁、结构清晰，可使用 Markdown。\n"
+    "- 所有数学公式必须用 TeX 定界符包裹，前端才能渲染：行内公式用 $...$（如 $E=mc^2$），"
+    "独立成行的公式用 $$...$$。不要使用 Unicode 上下标或纯文本写法代替公式。"
 )
 
 # Sentinel terminal value consumed by the SSE generator.
@@ -268,3 +276,99 @@ def paper_chat(
             "X-Accel-Buffering": "no",  # don't let proxies buffer the stream
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Persisted transcript (cross-device / cross-browser)
+# ---------------------------------------------------------------------------
+
+# Reject absurdly large transcripts so a runaway client can't blow up the DB.
+_MAX_TURNS = 500
+_MAX_CONTENT_CHARS = 100_000
+
+
+@router.get("/{paper_id}/chat/messages", response_model=ChatHistoryOut)
+def get_chat_messages(
+    paper_id: str,
+    session: Session = Depends(get_session_dep),
+) -> ChatHistoryOut:
+    """Return the paper's saved chat transcript, oldest turn first."""
+    paper = session.get(Paper, paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    rows = session.exec(
+        select(ChatMessage)
+        .where(ChatMessage.paper_id == paper_id)
+        .order_by(ChatMessage.id)
+    ).all()
+    latest = rows[-1].updated_at if rows else None
+    return ChatHistoryOut(
+        paper_id=paper_id,
+        messages=[
+            ChatMessageOut(
+                id=r.id,  # type: ignore[arg-type]
+                role=r.role,
+                content=r.content,
+                created_at=r.created_at,
+                updated_at=r.updated_at,
+            )
+            for r in rows
+        ],
+        updated_at=latest,
+    )
+
+
+@router.put("/{paper_id}/chat/messages", response_model=ChatHistoryOut)
+def put_chat_messages(
+    paper_id: str,
+    body: ChatHistoryIn,
+    session: Session = Depends(get_session_dep),
+) -> ChatHistoryOut:
+    """Replace the paper's chat transcript with ``messages`` (whole-document PUT).
+
+    Same shape as notes: the client sends the full ordered list of turns and
+    the server replaces what it stored. Only ``user``/``assistant`` turns are
+    kept; empty content is dropped. Bumps ``papers.updated_at``.
+    """
+    paper = session.get(Paper, paper_id)
+    if paper is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+
+    if len(body.messages) > _MAX_TURNS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"too many messages (max {_MAX_TURNS})",
+        )
+
+    now = datetime.now(UTC)
+    # Replace all rows for this paper. Delete-then-insert is simplest and the
+    # transcript is small (<500 turns); ids change, which is fine for a
+    # single-user replace-all store.
+    existing = session.exec(
+        select(ChatMessage).where(ChatMessage.paper_id == paper_id)
+    ).all()
+    for row in existing:
+        session.delete(row)
+
+    for turn in body.messages:
+        role = turn.role.strip().lower()
+        content = turn.content.strip()
+        if role not in ("user", "assistant"):
+            continue
+        if not content or len(content) > _MAX_CONTENT_CHARS:
+            continue
+        session.add(
+            ChatMessage(
+                paper_id=paper_id,
+                role=role,
+                content=content,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    paper.updated_at = now
+    session.add(paper)
+    session.commit()
+
+    return get_chat_messages(paper_id, session)

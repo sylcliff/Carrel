@@ -197,6 +197,30 @@ export const getPaperMarkdown = (id: string) =>
     `/papers/${encodeURIComponent(id)}/markdown`
   );
 
+// ---- Per-paper chat transcript (server-persisted) ----
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface ChatMessage extends ChatTurn {
+  id: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export const getChatMessages = (id: string) =>
+  request<{ paper_id: string; messages: ChatMessage[]; updated_at: string | null }>(
+    `/papers/${encodeURIComponent(id)}/chat/messages`,
+  );
+
+export const saveChatMessages = (id: string, messages: ChatTurn[]) =>
+  request<{ paper_id: string; messages: ChatMessage[]; updated_at: string | null }>(
+    `/papers/${encodeURIComponent(id)}/chat/messages`,
+    { method: "PUT", body: JSON.stringify({ messages }) },
+  );
+
 // ---- Annotations: favorites, notes, tags ----
 
 export interface Tag {

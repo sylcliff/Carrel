@@ -245,6 +245,31 @@ class PaperTopic(SQLModel, table=True):
     __table_args__ = (Index("ix_paper_topics_topic_id", "topic_id"),)
 
 
+class ChatMessage(SQLModel, table=True):
+    """One turn in a paper's persisted RAG-chat transcript.
+
+    Stored server-side so the conversation follows the user across devices and
+    browsers (unlike a localStorage-only transcript). Ordered by ``id``; the
+    whole transcript for a paper is replaced on each save (whole-document PUT,
+    like notes).
+    """
+
+    __tablename__ = "chat_messages"
+
+    id: int | None = Field(default=None, primary_key=True)
+    paper_id: str = Field(foreign_key="papers.id", index=True, max_length=64)
+    role: str = Field(max_length=16)  # "user" | "assistant"
+    content: str = Field(sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
 class Job(SQLModel, table=True):
     __tablename__ = "jobs"
 

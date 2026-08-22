@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
+import "katex/dist/katex.min.css";
 import {
   AssistantRuntimeProvider,
   ComposerPrimitive,
@@ -13,20 +14,21 @@ import {
   useLocalRuntime,
   type ChatModelAdapter,
   type TextMessagePartProps,
+  type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { BookOpen, Send, Square } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { getChatMessages, saveChatMessages, type ChatTurn } from "@/api/client";
+import rehypeRawMath from "./rehypeRawMath";
 
 // ---------------------------------------------------------------------------
 // Types — mirror the backend SSE frames in carrel/api/chat.py
 // ---------------------------------------------------------------------------
 
-type ChatRole = "user" | "assistant" | "system";
-
 interface ChatRequestMessage {
-  role: ChatRole;
+  role: "user" | "assistant";
   content: string;
 }
 
@@ -34,6 +36,23 @@ type ServerEvent =
   | { sources: string[] }
   | { t: string }
   | { error: string };
+
+// ---------------------------------------------------------------------------
+// Persistence — the transcript lives on the server (one row per turn) so it
+// follows the user across devices and browsers. The client loads it on mount
+// and PUTs the full ordered turn list whenever the conversation settles.
+// ---------------------------------------------------------------------------
+
+function toMessageLikes(turns: ChatTurn[]): ThreadMessageLike[] {
+  return turns
+    .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
+    .map((m, i) => ({ id: `hist-${i}`, role: m.role, content: m.content }));
+}
+
+function sameTurns(a: ChatTurn[], b: ChatTurn[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((t, i) => t.role === b[i].role && t.content === b[i].content);
+}
 
 // ---------------------------------------------------------------------------
 // Flatten assistant-ui messages -> our wire format
@@ -97,7 +116,8 @@ async function* parseSSE(
 }
 
 // ---------------------------------------------------------------------------
-// Markdown answer — reuse the project's remark/rehype plugin stack
+// Markdown answer — reuse the project's remark/rehype plugin stack so math
+// (including $...$ inside raw HTML) renders exactly as it does in the reader.
 // ---------------------------------------------------------------------------
 
 function MarkdownAnswer(props: TextMessagePartProps) {
@@ -105,7 +125,7 @@ function MarkdownAnswer(props: TextMessagePartProps) {
     <div className="md-body text-sm leading-relaxed">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex, rehypeRaw]}
+        rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeKatex]}
       >
         {props.text}
       </ReactMarkdown>
@@ -156,9 +176,13 @@ interface ChatThreadProps {
   disabled: boolean;
   sources: string[] | null;
   onSources: (sources: string[] | null) => void;
+  initialTurns: ChatTurn[];
 }
 
-function ChatThread({ paperId, disabled, sources, onSources }: ChatThreadProps) {
+function ChatThread({ paperId, disabled, sources, onSources, initialTurns }: ChatThreadProps) {
+  // Snapshot saved history once per remount (paper change / explicit clear).
+  const initialMessages = useMemo(() => toMessageLikes(initialTurns), [initialTurns]);
+
   const adapter = useMemo<ChatModelAdapter>(
     () => ({
       async *run({ messages, abortSignal }) {
@@ -200,7 +224,76 @@ function ChatThread({ paperId, disabled, sources, onSources }: ChatThreadProps) 
     [paperId, onSources],
   );
 
-  const runtime = useLocalRuntime(adapter);
+  const runtime = useLocalRuntime(adapter, { initialMessages });
+
+  // Persist the transcript server-side whenever it settles. We skip writes
+  // while a run is streaming (each token would otherwise trigger a PUT) and
+  // flush shortly after running goes false. Only PUT when the turn list
+  // actually changed, and ignore results from superseded saves.
+  const saveTimer = useRef<number | null>(null);
+  const lastSaved = useRef<ChatTurn[]>(initialTurns);
+  const saveSeq = useRef(0);
+  useEffect(() => {
+    lastSaved.current = initialTurns;
+  }, [initialTurns]);
+
+  useEffect(() => {
+    const scheduleSave = () => {
+      const state = runtime.thread.getState();
+      if (state.isRunning) return;
+      const wire = toWireMessages(state.messages);
+      if (sameTurns(wire, lastSaved.current)) return;
+      if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        saveTimer.current = null;
+        const mySeq = ++saveSeq.current;
+        const snapshot = wire;
+        saveChatMessages(paperId, snapshot)
+          .then(() => {
+            if (mySeq !== saveSeq.current) return; // a newer save superseded
+            lastSaved.current = snapshot;
+          })
+          .catch((e) => {
+            // Transient failure — transcript stays in memory and saves again
+            // on the next settle.
+            console.warn("chat: save failed", e);
+          });
+      }, 800);
+    };
+    const unsubscribe = runtime.thread.subscribe(scheduleSave);
+    return () => {
+      unsubscribe();
+      if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    };
+  }, [runtime, paperId]);
+
+  // Best-effort flush on unmount / tab hide so the last answer isn't lost.
+  // Uses sendBeacon-style PUT via fetch keepalive; falls back silently.
+  useEffect(() => {
+    const flush = () => {
+      const state = runtime.thread.getState();
+      if (state.isRunning) return;
+      const wire = toWireMessages(state.messages);
+      if (sameTurns(wire, lastSaved.current)) return;
+      try {
+        fetch(`/api/papers/${encodeURIComponent(paperId)}/chat/messages`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: wire }),
+          keepalive: true,
+        }).catch(() => {});
+        lastSaved.current = wire;
+      } catch {
+        // ignore
+      }
+    };
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", flush);
+    return () => {
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", flush);
+    };
+  }, [runtime, paperId]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -267,10 +360,49 @@ function ChatThread({ paperId, disabled, sources, onSources }: ChatThreadProps) 
 export function PaperChat({ paperId, hasMarkdown }: PaperChatProps) {
   // Sources (chapter headings) for the latest answer, shown as small chips.
   const [sources, setSources] = useState<string[] | null>(null);
-  // Bumping this key remounts the whole runtime thread, clearing history.
+  // Server-persisted transcript, loaded on mount / paper change.
+  const [initialTurns, setInitialTurns] = useState<ChatTurn[]>([]);
+  const [historyReady, setHistoryReady] = useState(false);
+  // Bumping this key remounts the whole runtime thread (e.g. after Clear).
   const [threadKey, setThreadKey] = useState(0);
 
   const disabled = !hasMarkdown;
+
+  useEffect(() => {
+    let cancelled = false;
+    setHistoryReady(false);
+    getChatMessages(paperId)
+      .then((res) => {
+        if (cancelled) return;
+        setInitialTurns(
+          res.messages
+            .filter((m) => m.role === "user" || m.role === "assistant")
+            .map((m) => ({ role: m.role, content: m.content })),
+        );
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setInitialTurns([]);
+      })
+      .finally(() => {
+        if (!cancelled) setHistoryReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [paperId]);
+
+  async function onClear() {
+    setSources(null);
+    setInitialTurns([]);
+    // Optimistically reset the runtime; the server state follows.
+    setThreadKey((k) => k + 1);
+    try {
+      await saveChatMessages(paperId, []);
+    } catch (e) {
+      console.warn("chat: clear failed on server", e);
+    }
+  }
 
   return (
     <Card className="flex h-[70vh] flex-col xl:h-full xl:rounded-none xl:border-0 xl:shadow-none">
@@ -283,22 +415,26 @@ export function PaperChat({ paperId, hasMarkdown }: PaperChatProps) {
           variant="ghost"
           size="sm"
           className="h-7 px-2 text-xs"
-          onClick={() => {
-            setSources(null);
-            setThreadKey((k) => k + 1);
-          }}
+          onClick={onClear}
         >
           Clear
         </Button>
       </CardHeader>
       <CardContent className="flex min-h-0 flex-1 flex-col gap-3 p-4 pt-0">
-        <ChatThread
-          key={`${paperId}-${threadKey}`}
-          paperId={paperId}
-          disabled={disabled}
-          sources={sources}
-          onSources={setSources}
-        />
+        {!historyReady ? (
+          <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
+            Loading conversation…
+          </div>
+        ) : (
+          <ChatThread
+            key={`${paperId}-${threadKey}`}
+            paperId={paperId}
+            disabled={disabled}
+            sources={sources}
+            onSources={setSources}
+            initialTurns={initialTurns}
+          />
+        )}
       </CardContent>
     </Card>
   );

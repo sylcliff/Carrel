@@ -110,6 +110,32 @@ class TagWithCount(TagOut):
     paper_count: int
 
 
+# -------- Per-paper chat transcript --------
+
+
+class ChatTurnIn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatMessagesIn(BaseModel):
+    messages: list[ChatTurnIn]
+
+
+class ChatMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ChatMessagesOut(BaseModel):
+    paper_id: str
+    messages: list[ChatMessageOut]
+    updated_at: datetime | None = None
+
+
 # -------- Topics (LLM classification) --------
 
 
