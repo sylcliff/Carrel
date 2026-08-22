@@ -67,7 +67,50 @@ export interface PaperDetail extends PaperSummary {
   notes_markdown: string | null;
   created_at: string;
   updated_at: string;
+  author_list: AuthorRef[];
 }
+
+export interface AuthorRef {
+  name: string;
+  openalex_author_id: string;
+  affiliation: string | null;
+}
+
+// ---- Scholars (authors aggregated across the library) ----
+
+export interface ScholarSummary {
+  key: string; // OpenAlex A-ID, or "name:<exact name>" when unknown
+  name: string;
+  affiliation: string | null;
+  paper_count: number;
+  first_year: number | null;
+  last_year: number | null;
+  total_citations: number;
+  has_openalex: boolean;
+}
+
+export interface OpenAlexProfile {
+  id: string;
+  name: string | null;
+  affiliation: string | null;
+  works_count: number | null;
+  cited_by_count: number | null;
+  h_index: number | null;
+  orcid: string | null;
+  alternate_names: string[];
+}
+
+export interface ScholarDetail {
+  scholar: ScholarSummary;
+  papers: PaperSummary[];
+  profile: OpenAlexProfile | null;
+}
+
+export const listScholars = (q?: string) =>
+  request<ScholarSummary[]>(`/scholars${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+
+export const getScholar = (key: string) =>
+  request<ScholarDetail>(`/scholars/${encodeURIComponent(key)}`);
 
 export interface CitationItem {
   title: string | null;
@@ -443,6 +486,20 @@ export interface TopicWithCount {
 }
 
 export const listTopics = () => request<TopicWithCount[]>("/topics");
+
+// ---- Authors backfill (resolve OpenAlex Author IDs) ----
+
+export const backfillAuthors = (
+  opts: { paperId?: string; limit?: number; background?: boolean } = {},
+) =>
+  request<Job[]>("/authors-backfill", {
+    method: "POST",
+    body: JSON.stringify({
+      paper_id: opts.paperId,
+      limit: opts.limit ?? 100,
+      background: opts.background ?? false,
+    }),
+  });
 
 export const classifyTopics = (
   opts: { paperId?: string; limit?: number; background?: boolean; force?: boolean } = {},

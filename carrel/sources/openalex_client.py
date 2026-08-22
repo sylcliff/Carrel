@@ -196,6 +196,47 @@ def lookup_by_doi(doi: str) -> dict[str, Any] | None:
     return dict(w) if w else None
 
 
+def fetch_work_authors(
+    doi: str | None,
+    arxiv_id: str | None,
+    *,
+    title_hint: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """Resolve a paper's canonical authorship from OpenAlex.
+
+    Returns ``[{name, openalex_author_id, affiliation}, ...]`` or None when no
+    Work could be found. Tries, in order: the DOI via the low-budget ``doi:``
+    form, the arXiv DOI form (``10.48550/arXiv.<id>``), then the multi-step
+    arXiv search in :func:`lookup_by_arxiv_id`.
+
+    The ``doi:`` URL form is required — the ``/works/https://doi.org/...`` form
+    costs substantially more budget and quickly returns 429.
+    """
+
+    def _by_doi(ident: str) -> dict[str, Any] | None:
+        ident = (ident or "").strip()
+        if not ident:
+            return None
+        try:
+            w = Works()[f"doi:{ident}"]
+        except Exception as e:  # noqa: BLE001
+            logger.debug("OpenAlex doi: lookup for %s failed: %s", ident, e)
+            return None
+        return dict(w) if w else None
+
+    work: dict[str, Any] | None = None
+    if doi:
+        work = _by_doi(doi)
+    if work is None and arxiv_id:
+        work = _by_doi(f"10.48550/arXiv.{arxiv_id.strip()}")
+    if work is None and arxiv_id:
+        work = lookup_by_arxiv_id(arxiv_id, title_hint=title_hint)
+
+    if not work:
+        return None
+    return work_authors(work)
+
+
 def fetch_citing_works(
     identifier: str,
     *,
@@ -391,6 +432,36 @@ def search_authors(name: str, limit: int = 5) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def fetch_author(author_id: str) -> dict[str, Any] | None:
+    """Fetch one OpenAlex Author by bare ID (e.g. 'A5013214678').
+
+    Returns a compact profile dict for the Scholar detail page, or None on
+    any failure (network, rate limit, missing record). Callers should treat
+    None as "profile unavailable" rather than an error.
+    """
+    a_id = _strip_prefix(author_id, "A")
+    if not a_id:
+        return None
+    try:
+        d = dict(Authors()[a_id])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("OpenAlex author fetch failed for %s: %s", a_id, e)
+        return None
+    insts = d.get("last_known_institutions") or []
+    inst = (insts[0] or {}).get("display_name") if insts else None
+    summary = d.get("summary_stats") or {}
+    return {
+        "id": _strip_id_prefix(d.get("id", "")),
+        "name": d.get("display_name"),
+        "affiliation": inst,
+        "works_count": d.get("works_count"),
+        "cited_by_count": d.get("cited_by_count"),
+        "h_index": summary.get("h_index"),
+        "orcid": d.get("orcid"),
+        "alternate_names": d.get("display_name_alternatives") or [],
+    }
 
 
 def search_venues(name: str, limit: int = 5) -> list[dict[str, Any]]:

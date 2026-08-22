@@ -12,7 +12,7 @@ from sqlmodel import Session, col, or_, select
 
 from carrel.db import get_session_dep
 from carrel.models import Chunk, Paper, PaperTag, PaperTopic, Tag, Topic
-from carrel.schemas import PaperDetail, PaperSummary
+from carrel.schemas import AuthorRef, PaperDetail, PaperSummary
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,15 @@ def _to_detail(
         notes_markdown=p.notes_markdown,
         created_at=p.created_at,
         updated_at=p.updated_at,
+        author_list=[
+            AuthorRef(
+                name=a.get("name", ""),
+                openalex_author_id=a.get("openalex_author_id", "") or "",
+                affiliation=a.get("affiliation"),
+            )
+            for a in (p.authors or [])
+            if a.get("name")
+        ],
     )
 
 

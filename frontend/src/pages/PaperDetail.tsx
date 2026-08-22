@@ -264,7 +264,26 @@ export default function PaperDetail({ onProcessed }: Props) {
             <header className="space-y-2 text-center">
               <h1 className="text-2xl font-bold">{p.title}</h1>
               <div className="text-sm text-muted-foreground">
-                {p.authors.join(", ") || "—"}
+                {p.author_list && p.author_list.length > 0 ? (
+                  p.author_list.map((a, i) => {
+                    const key = a.openalex_author_id?.trim()
+                      ? a.openalex_author_id.trim()
+                      : `name:${a.name.trim()}`;
+                    return (
+                      <span key={`${a.name}-${i}`}>
+                        {i > 0 && ", "}
+                        <Link
+                          to={`/scholars/${encodeURIComponent(key)}`}
+                          className="hover:text-foreground hover:underline"
+                        >
+                          {a.name}
+                        </Link>
+                      </span>
+                    );
+                  })
+                ) : (
+                  p.authors.join(", ") || "—"
+                )}
               </div>
               <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 {p.venue && <span>📰 {p.venue}</span>}

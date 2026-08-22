@@ -49,6 +49,7 @@ class JobKind(str, Enum):
     parse = "parse"
     summarize = "summarize"
     topics = "topics"  # LLM topic classification from metadata
+    authors_backfill = "authors_backfill"  # resolve author A-IDs from OpenAlex
     embed = "embed"
     citations = "citations"  # refresh Semantic Scholar citation count + citing list
 

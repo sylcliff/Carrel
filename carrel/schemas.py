@@ -19,6 +19,14 @@ class HealthResponse(BaseModel):
 # -------- Papers --------
 
 
+class AuthorRef(BaseModel):
+    """One author on a paper, as stored (IDs/affiliation preserved)."""
+
+    name: str
+    openalex_author_id: str = ""
+    affiliation: str | None = None
+
+
 class PaperSummary(BaseModel):
     """Compact representation for card views / lists."""
 
@@ -50,6 +58,9 @@ class PaperDetail(PaperSummary):
     md_path: str | None = None
     summary_zh: str | None = None
     error: str | None = None
+    # Full author records (with IDs/affiliation) for clickable author links;
+    # the inherited `authors: list[str]` stays for compact display.
+    author_list: list[AuthorRef] = []
     influential_citation_count: int | None = None
     reference_count: int | None = None
     citations_updated_at: datetime | None = None
@@ -104,6 +115,45 @@ class TopicOut(BaseModel):
 
 class TopicWithCount(TopicOut):
     paper_count: int
+
+
+# -------- Scholars (author aggregation) --------
+
+
+class ScholarSummary(BaseModel):
+    """An author aggregated across in-library papers.
+
+    ``key`` is the OpenAlex Author ID (e.g. 'A5013214678') when known, else
+    ``'name:<exact name>'`` for arXiv/S2 records without an A-ID.
+    """
+
+    key: str
+    name: str
+    affiliation: str | None = None
+    paper_count: int
+    first_year: int | None = None
+    last_year: int | None = None
+    total_citations: int = 0
+    has_openalex: bool = True
+
+
+class OpenAlexProfile(BaseModel):
+    """Global OpenAlex metadata for an author (fetched live, cached)."""
+
+    id: str
+    name: str | None = None
+    affiliation: str | None = None
+    works_count: int | None = None
+    cited_by_count: int | None = None
+    h_index: float | None = None
+    orcid: str | None = None
+    alternate_names: list[str] = []
+
+
+class ScholarDetail(BaseModel):
+    scholar: ScholarSummary
+    papers: list[PaperSummary] = []
+    profile: OpenAlexProfile | None = None
 
 
 # -------- Citations (Semantic Scholar) --------
@@ -291,6 +341,14 @@ class TopicsRequest(BaseModel):
     limit: int = 20
     background: bool = False
     force: bool = False
+
+
+class AuthorsBackfillRequest(BaseModel):
+    """Trigger OpenAlex author-ID resolution for one paper or a batch."""
+
+    paper_id: str | None = None
+    limit: int = 100
+    background: bool = False
 
 
 # -------- Search (M5) full-text --------

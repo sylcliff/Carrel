@@ -19,12 +19,14 @@ load_dotenv()
 from carrel import __version__
 from carrel.api import (
     annotations,
+    authors_backfill,
     chat,
     citations,
     embed,
     health,
     papers,
     process,
+    scholars,
     search,
     subscriptions,
     summarize,
@@ -147,6 +149,8 @@ def create_app() -> FastAPI:
     app.include_router(process.router)
     app.include_router(summarize.router)
     app.include_router(topics.router)
+    app.include_router(scholars.router)
+    app.include_router(authors_backfill.router)
     app.include_router(embed.router)
     app.include_router(search.router)
     app.include_router(chat.router)
