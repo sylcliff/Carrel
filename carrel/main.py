@@ -34,6 +34,7 @@ from carrel.api import (
     summarize,
     sync,
     topics,
+    wiki,
 )
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
@@ -60,6 +61,9 @@ def _bootstrap_config() -> tuple[CarrelYAML, EnvSettings]:
     cfg.storage.root.mkdir(parents=True, exist_ok=True)
     cfg.storage.paper_dir().mkdir(parents=True, exist_ok=True)
     cfg.storage.attachments_dir().mkdir(parents=True, exist_ok=True)
+    cfg.storage.wiki_dir().mkdir(parents=True, exist_ok=True)
+    for kind in ("concept", "scholar", "question"):
+        cfg.storage.wiki_kind_dir(kind).mkdir(parents=True, exist_ok=True)
     return cfg, env
 
 
@@ -154,6 +158,7 @@ def create_app() -> FastAPI:
     app.include_router(summarize.router)
     app.include_router(topics.router)
     app.include_router(scholars.router)
+    app.include_router(wiki.router)
     app.include_router(authors_backfill.router)
     app.include_router(embed.router)
     app.include_router(search.router)

@@ -27,6 +27,8 @@ FIELD_KEYS: dict[str, type] = {
     "remote_fill_cron": str,
     "publication_check_enabled": bool,
     "publication_check_cron": str,
+    "wiki_compile_enabled": bool,
+    "wiki_compile_cron": str,
 }
 
 
@@ -94,6 +96,7 @@ def update_schedule(path: Path, updates: dict[str, Any]) -> dict[str, Any]:
         ("enabled", "sync_cron"),
         ("remote_fill_enabled", "remote_fill_cron"),
         ("publication_check_enabled", "publication_check_cron"),
+        ("wiki_compile_enabled", "wiki_compile_cron"),
     ):
         if getattr(validated, enabled_attr):
             try:

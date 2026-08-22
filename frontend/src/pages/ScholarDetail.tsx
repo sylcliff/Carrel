@@ -1,10 +1,15 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, RefreshCw } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import MarkdownReader from "@/components/MarkdownReader";
 import { PaperList } from "@/components/PaperList";
 import {
   getScholar,
+  getJob,
+  recompileWikiPage,
+  type Job,
   type ScholarDetail as ScholarDetailT,
 } from "@/api/client";
 import { topicColorClass } from "@/lib/topicColor";
@@ -51,6 +56,7 @@ export default function ScholarDetailPage() {
   const [data, setData] = useState<ScholarDetailT | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [wikiJob, setWikiJob] = useState<Job | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,6 +75,31 @@ export default function ScholarDetailPage() {
       cancelled = true;
     };
   }, [key]);
+
+  async function recompileProfile() {
+    if (!data?.wiki_page) return;
+    setError(null);
+    try {
+      const first = await recompileWikiPage(data.wiki_page.id);
+      setWikiJob(first);
+      const timer = window.setInterval(async () => {
+        try {
+          const next = await getJob(first.id);
+          setWikiJob(next);
+          if (next.status === "done" || next.status === "failed") {
+            window.clearInterval(timer);
+            if (next.status === "done") setData(await getScholar(key));
+            else setError(next.message || "Profile recompile failed.");
+          }
+        } catch (e) {
+          window.clearInterval(timer);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }, 1500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   if (loading) {
     return (
@@ -160,6 +191,17 @@ export default function ScholarDetailPage() {
             />
           )}
         </div>
+      )}
+
+      {data.wiki_page && (
+        <section className="space-y-3">
+          <div className="flex items-center justify-between gap-4">
+            <div><h2 className="text-lg font-semibold">Research profile</h2><p className="text-xs text-muted-foreground">{Math.round(data.wiki_page.confidence * 100)}% confidence · {data.wiki_page.evidence_count} evidence</p></div>
+            <Button variant="outline" size="sm" onClick={recompileProfile} disabled={!!wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed"}><RefreshCw className={`mr-2 h-3.5 w-3.5 ${wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed" ? "animate-spin" : ""}`} /> Recompile profile</Button>
+          </div>
+          {wikiJob && <p className="text-xs text-muted-foreground">{wikiJob.status}{wikiJob.message ? ` · ${wikiJob.message}` : ""}</p>}
+          <Card><CardContent className="p-5"><MarkdownReader body={data.wiki_page.body} mdPath={data.wiki_page.path} internal /></CardContent></Card>
+        </section>
       )}
 
       <section className="space-y-3">

@@ -186,6 +186,67 @@ class ScholarDetail(BaseModel):
     scholar: ScholarSummary
     papers: list[PaperSummary] = []
     profile: OpenAlexProfile | None = None
+    # Compiled scholar wiki page (M8), when one exists.
+    wiki_page: "WikiPageDetail | None" = None
+
+
+# -------- LLM-compiled wiki (M8) --------
+
+
+class WikiSourceOut(BaseModel):
+    """One provenance row for a wiki page (a backing paper)."""
+
+    paper_id: str
+    paper_title: str | None = None
+    year: int | None = None
+    heading: str | None = None
+    quote: str | None = None
+    role: str = "context"
+
+
+class WikiBacklink(BaseModel):
+    """A wiki page that links to this page."""
+
+    id: int
+    kind: str
+    slug: str
+    title: str
+
+
+class WikiPageSummary(BaseModel):
+    """Index row for a compiled wiki page (no file IO)."""
+
+    id: int
+    kind: str
+    slug: str
+    title: str
+    summary: str | None = None
+    tags: list[str] = []
+    links_in_count: int = 0
+    confidence: float = 0.0
+    evidence_count: int = 0
+    scholar_aid: str | None = None
+    question_status: str | None = None
+    compiled_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class WikiPageDetail(WikiPageSummary):
+    """Full wiki page: index row plus the on-disk Markdown and provenance."""
+
+    path: str
+    frontmatter: dict[str, Any] = {}
+    body: str = ""
+    sources: list[WikiSourceOut] = []
+    backlinks: list[WikiBacklink] = []
+
+
+class WikiCompileRequest(BaseModel):
+    """POST /wiki/compile — batch-compile stale scholar pages."""
+
+    limit: int = Field(default=20, ge=1, le=200)
+    background: bool = True
+    force: bool = False
 
 
 # -------- Citations (Semantic Scholar) --------
@@ -372,6 +433,8 @@ class SchedulerUpdate(BaseModel):
     remote_fill_cron: str | None = None
     publication_check_enabled: bool | None = None
     publication_check_cron: str | None = None
+    wiki_compile_enabled: bool | None = None
+    wiki_compile_cron: str | None = None
 
 
 class ScheduledRunAck(BaseModel):
@@ -477,3 +540,7 @@ class SemanticSearchResponse(BaseModel):
     query: str  # post-correction query we embedded and searched with
     corrected_from: str | None = None  # original if spelling was fixed
     results: list[SemanticSearchResult] = []
+
+# Resolve the forward reference from ScholarDetail.wiki_page to WikiPageDetail,
+# which is defined later in this module.
+ScholarDetail.model_rebuild()

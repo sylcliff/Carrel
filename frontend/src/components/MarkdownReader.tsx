@@ -5,6 +5,8 @@ import rehypeRaw from "rehype-raw";
 import rehypeKatex from "rehype-katex";
 import rehypeRawMath from "./rehypeRawMath";
 import rehypeCitations from "./rehypeCitations";
+import rehypeWikiLinks from "./rehypeWikiLinks";
+import { Link } from "react-router-dom";
 import "katex/dist/katex.min.css";
 
 // Resolve MinerU's relative image links (e.g. "images/fig1.png") against the
@@ -20,15 +22,17 @@ function resolveImageSrc(src: string | undefined, mdPath: string | null): string
 export default function MarkdownReader({
   body,
   mdPath,
+  internal = false,
 }: {
   body: string;
   mdPath: string | null;
+  internal?: boolean;
 }) {
   return (
     <div className="md-body text-justify">
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeCitations, rehypeKatex]}
+        rehypePlugins={[rehypeRawMath, rehypeRaw, rehypeCitations, rehypeWikiLinks, rehypeKatex]}
         components={{
           a: ({ href, children, ...rest }) => {
             // In-document anchors (citations, figures, sections) must stay in
@@ -36,6 +40,22 @@ export default function MarkdownReader({
             // target=_blank on a "#ref-n" link reopened the current page in a
             // new window instead of jumping to the reference.
             const isAnchor = typeof href === "string" && href.startsWith("#");
+            if (
+              internal &&
+              typeof href === "string" &&
+              href.startsWith("/") &&
+              !href.startsWith("/storage")
+            ) {
+              return (
+                <Link
+                  to={href}
+                  className="text-primary underline underline-offset-2 hover:opacity-80"
+                  {...rest}
+                >
+                  {children}
+                </Link>
+              );
+            }
             return (
               <a
                 href={href}

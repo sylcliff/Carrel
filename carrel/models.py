@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy.halfvec import HALFVEC
 from sqlalchemy import Column, Date, DateTime, Index, Text
 from sqlmodel import JSON, Field, SQLModel
 
@@ -17,6 +18,13 @@ from sqlmodel import JSON, Field, SQLModel
 # against SQLite for smoke testing). On PostgreSQL it is a real vector column;
 # on SQLite we use JSON so lists round-trip through sqlite3.
 VectorType = Vector(2048).with_variant(JSON(), "sqlite")
+
+# Half-precision vector (fp16) for the wiki layer. pgvector's HNSW caps the
+# `vector` type at 2000 dims, which our 2048-dim embedding model exceeds;
+# `halfvec` supports up to 4000 dims so it can carry a real HNSW index. The
+# existing chunks table stays on Vector(2048) (sequential scan) to avoid a
+# data migration. SQLite falls back to JSON like VectorType.
+HalfvecType = HALFVEC(2048).with_variant(JSON(), "sqlite")
 
 
 # ------------------ Enums (stored as VARCHAR) ------------------
@@ -57,6 +65,16 @@ class JobKind(str, Enum):
     remote_fill = "remote_fill"
     # Check an arXiv paper for a published journal version (and fetch it).
     publication_check = "publication_check"
+    # Compile the LLM wiki (batch across scholars/concepts/questions).
+    wiki_compile = "wiki_compile"
+    # Force-recompile a single wiki page.
+    wiki_recompile = "wiki_recompile"
+
+
+class WikiKind(str, Enum):
+    concept = "concept"
+    scholar = "scholar"
+    question = "question"
 
 
 class JobStatus(str, Enum):
@@ -267,6 +285,94 @@ class ChatMessage(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class WikiPage(SQLModel, table=True):
+    """A compiled wiki page — disk Markdown is the source of truth; this is the index.
+
+    One row per ``(kind, slug)``. The file lives at ``<storage.root>/<path>``
+    (e.g. ``wiki/scholars/A5013....md``) and can be rebuilt from disk with
+    ``reindex_wiki``. Frontmatter fields are mirrored here so list/filter views
+    never touch the filesystem.
+    """
+
+    __tablename__ = "wiki_pages"
+
+    id: int | None = Field(default=None, primary_key=True)
+    kind: str = Field(max_length=16, index=True)  # WikiKind.value
+    slug: str = Field(max_length=200, index=True)
+    title: str = Field(max_length=300)
+
+    # Scholar pages only: the OpenAlex A-ID joining the /scholars aggregation.
+    scholar_aid: str | None = Field(default=None, index=True, max_length=32)
+    # Question pages only: open|contested|partially_solved|resolved.
+    question_status: str | None = Field(default=None, max_length=24)
+
+    # Storage-root-relative path to the Markdown file.
+    path: str = Field(max_length=500)
+    # sha256 of the file bytes at the last sync.
+    checksum: str | None = Field(default=None, max_length=64)
+
+    # Frontmatter mirrors (list/filter without file IO).
+    summary: str | None = Field(default=None, sa_column=Column(Text))
+    tags: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    links_out: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    links_in_count: int = Field(default=0)
+    source_paper_ids: list[str] | None = Field(default=None, sa_column=Column(JSON))
+
+    # 0..1 corroboration score and count of distinct backing papers.
+    confidence: float = Field(default=0.0, index=True)
+    evidence_count: int = Field(default=0)
+    embedding: list[float] | None = Field(default=None, sa_column=Column(HalfvecType))
+
+    compiled_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_wiki_pages_kind_slug", "kind", "slug", unique=True),
+    )
+
+
+class WikiSource(SQLModel, table=True):
+    """Assertion-level provenance: a wiki page backed by a paper (and chunk).
+
+    Scholar pages cite the paper at the abstract level (chunk_id=NULL); concept
+    and question pages pin claims to a specific chunk. ``role`` classifies the
+    evidence for question pages (support/contradict/context).
+    """
+
+    __tablename__ = "wiki_sources"
+
+    id: int | None = Field(default=None, primary_key=True)
+    wiki_page_id: int = Field(
+        foreign_key="wiki_pages.id", index=True, ondelete="CASCADE"
+    )
+    paper_id: str = Field(
+        foreign_key="papers.id", index=True, max_length=64, ondelete="CASCADE"
+    )
+    chunk_id: int | None = Field(
+        default=None, foreign_key="chunks.id", ondelete="CASCADE"
+    )
+    heading: str | None = Field(default=None, max_length=300)
+    quote: str | None = Field(default=None, sa_column=Column(Text))
+    role: str = Field(default="context", max_length=16)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_wiki_sources_page_paper", "wiki_page_id", "paper_id"),
     )
 
 

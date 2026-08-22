@@ -20,12 +20,24 @@ class StorageConfig(BaseModel):
     root: Path = Path("./data")
     papers_subdir: str = "papers"
     attachments_subdir: str = "attachments"
+    wiki_subdir: str = "wiki"
 
     def paper_dir(self) -> Path:
         return self.root / self.papers_subdir
 
     def attachments_dir(self) -> Path:
         return self.root / self.attachments_subdir
+
+    def wiki_dir(self) -> Path:
+        return self.root / self.wiki_subdir
+
+    def wiki_kind_dir(self, kind: str) -> Path:
+        """Directory for one wiki kind, e.g. ``wiki/scholars``.
+
+        ``kind`` is the singular WikiKind value ("concept"/"scholar"/"question");
+        on disk each lives under its plural directory name.
+        """
+        return self.wiki_dir() / f"{kind}s"
 
 
 class HttpConfig(BaseModel):
@@ -146,6 +158,10 @@ class ScheduleConfig(BaseModel):
     # Periodically check arXiv papers for a published journal version.
     publication_check_enabled: bool = False
     publication_check_cron: str = "0 10 * * 1"
+    # Periodically compile the LLM wiki (scholar/concept/question pages) from
+    # in-library papers. Default off; the UI also offers a manual "Compile wiki".
+    wiki_compile_enabled: bool = False
+    wiki_compile_cron: str = "17 11 * * *"
 
 
 SubKind = Literal["keyword", "author", "venue", "arxiv_category"]

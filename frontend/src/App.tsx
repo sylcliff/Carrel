@@ -9,6 +9,9 @@ import ScholarDetail from "@/pages/ScholarDetail";
 import Subscriptions from "@/pages/Subscriptions";
 import SyncStatus from "@/pages/SyncStatus";
 import Topics from "@/pages/Topics";
+import WikiIndex from "@/pages/WikiIndex";
+import WikiPageList from "@/pages/WikiPageList";
+import WikiPageDetail from "@/pages/WikiPageDetail";
 
 function Header() {
   return (
@@ -22,6 +25,7 @@ function Header() {
           <Link to="/library" className="hover:text-foreground">Library</Link>
           <Link to="/topics" className="hover:text-foreground">Topics</Link>
           <Link to="/scholars" className="hover:text-foreground">Scholars</Link>
+          <Link to="/wiki" className="hover:text-foreground">Wiki</Link>
           <Link to="/subscriptions" className="hover:text-foreground">Subscriptions</Link>
           <Link to="/sync" className="hover:text-foreground">Sync</Link>
         </nav>
@@ -42,6 +46,9 @@ export default function App() {
           <Route path="/topics" element={<Topics />} />
           <Route path="/scholars" element={<Scholars />} />
           <Route path="/scholars/:key" element={<ScholarDetail />} />
+          <Route path="/wiki" element={<WikiIndex />} />
+          <Route path="/wiki/:kind" element={<WikiPageList />} />
+          <Route path="/wiki/:kind/:slug" element={<WikiPageDetail />} />
           <Route path="/subscriptions" element={<Subscriptions />} />
           <Route path="/sync" element={<SyncStatus />} />
           <Route path="/papers/:id" element={<PaperDetail />} />

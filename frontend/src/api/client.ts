@@ -105,10 +105,84 @@ export interface OpenAlexProfile {
   alternate_names: string[];
 }
 
+// ---- Wiki ----
+
+export interface WikiSourceOut {
+  paper_id: string;
+  paper_title: string | null;
+  year: number | null;
+  heading: string | null;
+  quote: string | null;
+  role: string;
+}
+
+export interface WikiBacklink {
+  id: number;
+  kind: string;
+  slug: string;
+  title: string;
+}
+
+export interface WikiPageSummary {
+  id: number;
+  kind: string;
+  slug: string;
+  title: string;
+  summary: string | null;
+  tags: string[];
+  links_in_count: number;
+  confidence: number;
+  evidence_count: number;
+  scholar_aid: string | null;
+  question_status: string | null;
+  compiled_at: string | null;
+  updated_at: string | null;
+}
+
+export interface WikiPageDetail extends WikiPageSummary {
+  path: string;
+  frontmatter: Record<string, unknown>;
+  body: string;
+  sources: WikiSourceOut[];
+  backlinks: WikiBacklink[];
+}
+
+export const listWikiPages = (params?: {
+  kind?: string;
+  q?: string;
+  limit?: number;
+  offset?: number;
+}) => {
+  const query = new URLSearchParams();
+  if (params?.kind) query.set("kind", params.kind);
+  if (params?.q) query.set("q", params.q);
+  if (params?.limit !== undefined) query.set("limit", String(params.limit));
+  if (params?.offset !== undefined) query.set("offset", String(params.offset));
+  const qs = query.toString();
+  return request<WikiPageSummary[]>(`/wiki/pages${qs ? `?${qs}` : ""}`);
+};
+
+export const getWikiPage = (id: number) => request<WikiPageDetail>(`/wiki/pages/${id}`);
+
+export const getWikiPageBySlug = (kind: string, slug: string) =>
+  request<WikiPageDetail>(
+    `/wiki/pages/by-kind-slug/${encodeURIComponent(kind)}/${encodeURIComponent(slug)}`,
+  );
+
+export const compileWiki = (body: {
+  limit?: number;
+  background?: boolean;
+  force?: boolean;
+}) => request<Job>("/wiki/compile", { method: "POST", body: JSON.stringify(body) });
+
+export const recompileWikiPage = (id: number) =>
+  request<Job>(`/wiki/pages/${id}/recompile`, { method: "POST" });
+
 export interface ScholarDetail {
   scholar: ScholarSummary;
   papers: PaperSummary[];
   profile: OpenAlexProfile | null;
+  wiki_page: WikiPageDetail | null;
 }
 
 export const listScholars = (q?: string) =>
@@ -360,6 +434,7 @@ export interface Job {
   started_at: string | null;
   finished_at: string | null;
   created_at: string;
+  progress?: number;
 }
 
 export const triggerSync = (lookbackHours = 24, background = false) =>

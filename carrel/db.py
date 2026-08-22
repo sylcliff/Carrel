@@ -131,6 +131,23 @@ def init_db(engine: Engine) -> None:
                 exc.orig,
             )
 
+        # Wiki/memory embeddings use halfvec(2048), which supports HNSW (the
+        # halfvec opclass accepts up to 4000 dims). Requires pgvector server
+        # extension >= 0.7.0; older versions fail here and fall back to a
+        # sequential scan without blocking startup.
+        try:
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "CREATE INDEX IF NOT EXISTS ix_wiki_pages_embedding_hnsw "
+                    "ON wiki_pages USING hnsw (embedding halfvec_cosine_ops)"
+                )
+        except OperationalError as exc:
+            logger.warning(
+                "Could not create HNSW index on wiki_pages.embedding; wiki "
+                "search will fall back to a sequential scan. Cause: %s",
+                exc.orig,
+            )
+
 
 def get_session_factory(engine: Engine) -> type[Session]:
     # SQLModel's Session is a thin wrapper; we just bind a default.

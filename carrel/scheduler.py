@@ -34,6 +34,7 @@ DEFAULT_LOOKBACK_HOURS = 26
 # Default batch sizes for the periodic sweeps.
 DEFAULT_REMOTE_FILL_LIMIT = 50
 DEFAULT_PUBLICATION_CHECK_LIMIT = 50
+DEFAULT_WIKI_COMPILE_LIMIT = 20
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -157,6 +158,56 @@ def _scheduled_publication_check(limit: int, *, manual: bool = False) -> None:
             session.commit()
 
 
+def _scheduled_wiki_compile(limit: int, *, manual: bool = False) -> None:
+    """Compile stale scholar wiki pages (M8a)."""
+    from carrel.main import app_config  # noqa: PLC0415
+    from carrel.pipeline.wiki.scholar_compile import compile_scholars_pending
+
+    prefix = "manual" if manual else "scheduled"
+    engine = get_app_engine()
+    with Session(engine) as session:
+        job = Job(
+            kind=JobKind.wiki_compile.value,
+            status=JobStatus.running.value,
+            message=f"{prefix} wiki compile",
+            started_at=datetime.now(UTC),
+            stats={"limit": limit, "scheduled": not manual},
+        )
+        session.add(job)
+        session.commit()
+
+        def _progress(p: dict[str, Any]) -> None:
+            job.stats = {**(job.stats or {}), **p}
+            idx, total, name = p.get("index"), p.get("total"), p.get("name", "")
+            detail = p.get("detail", "")
+            if idx and total:
+                job.message = f"[{idx}/{total}] {name} — {detail}" if detail else f"[{idx}/{total}] {name}"
+            elif detail:
+                job.message = detail
+            session.add(job)
+            session.commit()
+
+        try:
+            counts = compile_scholars_pending(
+                session, app_config, limit=limit, on_progress=_progress
+            )
+            job.status = JobStatus.done.value
+            job.message = (
+                f"compiled={counts.get('compiled', 0)} failed={counts.get('failed', 0)}"
+            )
+            job.stats = {**(job.stats or {}), **counts}
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.exception("%s wiki compile failed: %s", prefix, e)
+            job.status = JobStatus.failed.value
+            job.message = f"{type(e).__name__}: {e}"[:500]
+            job.finished_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
+
+
 # ---------------------------------------------------------------------------
 # Declarative job registry — single source of truth for both start_scheduler
 # and the /schedule status endpoint.
@@ -231,6 +282,22 @@ JOB_SPECS: tuple[JobSpec, ...] = (
         cron_attr="publication_check_cron",
         enabled_attr="publication_check_enabled",
         args=(DEFAULT_PUBLICATION_CHECK_LIMIT,),
+    ),
+    JobSpec(
+        id="wiki_compile",
+        label="Compile wiki",
+        description=(
+            "Compile scholar wiki pages from in-library paper metadata and "
+            "abstracts. Each scholar gets an interlinked, source-cited Markdown "
+            "page; pages whose authors have new papers are recompiled. User "
+            "notes in the protected section are preserved. "
+            "Cadence: e.g. '17 11 * * *' = every day at 11:17 server time."
+        ),
+        kind=JobKind.wiki_compile.value,
+        func=_scheduled_wiki_compile,
+        cron_attr="wiki_compile_cron",
+        enabled_attr="wiki_compile_enabled",
+        args=(DEFAULT_WIKI_COMPILE_LIMIT,),
     ),
 )
 
