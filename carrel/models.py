@@ -37,6 +37,10 @@ class PaperStatus(str, Enum):
     summarized = "summarized"    # LLM TLDR/abstract done
     ready = "ready"              # chunked + embedded
     failed = "failed"            # permanent failure (after retries)
+    # Set by paper dedup when this row has been merged into another via
+    # paper_aliases; user_state is cleared and the row is read through
+    # resolve_paper_id(). Distinct from any user-initiated archive.
+    merged = "merged"
 
 
 class OAStatus(str, Enum):
@@ -71,6 +75,10 @@ class JobKind(str, Enum):
     wiki_recompile = "wiki_recompile"
     # Cluster same-named A-IDs and apply high-confidence scholar merges.
     scholar_dedup = "scholar_dedup"
+    # Cluster near-duplicate paper records (DOI / arXiv / s2 / journal_doi
+    # bridge / LLM judge) and apply high-confidence paper merges into
+    # paper_aliases. UI surface is the Library page "Duplicates" panel.
+    paper_dedup = "paper_dedup"
 
 
 class WikiKind(str, Enum):
@@ -428,6 +436,107 @@ class ScholarAlias(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_scholar_aliases_alias_canon", "alias_aid", "canonical_aid", unique=True),
+    )
+
+
+class PaperAlias(SQLModel, table=True):
+    """Maps a duplicate paper record (``alias_paper_id``) to the canonical one.
+
+    The pipeline in :mod:`carrel.pipeline.paper_dedup` scores candidate pairs
+    and persists high-confidence matches here; the loser row is **kept** in
+    ``papers`` (user state is migrated to the canonical and the loser is
+    flagged ``status=merged``). Every read path goes through
+    :func:`carrel.pipeline.paper_dedup_ops.resolve_paper_id` so the alias is
+    transparent to the API consumer, and a merge is reversible by deleting
+    the alias row (user-state migration is best-effort, see ``PaperMergeEvent``
+    for the snapshot taken at merge time).
+
+    - ``source``: ``auto`` (scoring threshold) | ``user`` (manual accept) |
+      ``llm`` (LLM judge returned ``same``) | ``reject`` (user said "these are
+      different papers" — recorded to suppress future auto-suggestions).
+    - ``confidence``: 0..1 score from the pipeline; 1.0 for user actions.
+    - Alias rows are never deleted on re-dedup; a ``reject`` overrides an
+      earlier ``auto`` / ``user`` / ``llm`` merge.
+    """
+
+    __tablename__ = "paper_aliases"
+
+    id: int | None = Field(default=None, primary_key=True)
+    alias_paper_id: str = Field(index=True, max_length=64)
+    canonical_paper_id: str = Field(index=True, max_length=64)
+    display_label: str | None = Field(default=None, max_length=300)
+    source: str = Field(default="auto", max_length=16, index=True)
+    confidence: float = Field(default=0.0)
+    reasons: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    note: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_paper_aliases_pair", "alias_paper_id", "canonical_paper_id", unique=True),
+    )
+
+
+class PaperDedupVerdict(SQLModel, table=True):
+    """Cached LLM judge verdict for a paper pair.
+
+    Populated lazily by :class:`carrel.pipeline.paper_dedup_judge.LLMJudge`.
+    Lookup is symmetric: the pair is stored as ``(min(a,b), max(a,b))``. The
+    ``prompt_hash`` captures the input + model + prompt_version, so bumping
+    ``cfg.llm.paper_dedup_judge_prompt_version`` invalidates cached verdicts
+    without touching the ``paper_a_id``/``paper_b_id`` pair.
+    """
+
+    __tablename__ = "paper_dedup_verdicts"
+
+    id: int | None = Field(default=None, primary_key=True)
+    paper_a_id: str = Field(max_length=64)
+    paper_b_id: str = Field(max_length=64)
+    prompt_hash: str = Field(max_length=64, index=True)
+    model: str = Field(max_length=64)
+    prompt_version: int
+    verdict: str = Field(max_length=16)  # "same" | "different" | "uncertain"
+    confidence: float = Field(default=0.0)
+    reasons: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_paper_dedup_verdicts_pair", "paper_a_id", "paper_b_id"),
+    )
+
+
+class PaperMergeEvent(SQLModel, table=True):
+    """Append-only audit row for every paper merge.
+
+    Captures the loser's user state at the moment of merge so an operator
+    (or a future "undo with state restore" feature) can reconstruct what
+    the user had on the alias before it was absorbed. Does not block
+    subsequent merges of the same alias to other canonicals — each merge
+    writes its own event.
+    """
+
+    __tablename__ = "paper_merge_events"
+
+    id: int | None = Field(default=None, primary_key=True)
+    alias_paper_id: str = Field(max_length=64)
+    canonical_paper_id: str = Field(max_length=64)
+    source: str = Field(max_length=16)
+    confidence: float = Field(default=0.0)
+    reasons: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    user_state_snapshot: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    user_state_migrated: bool = Field(default=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_paper_merge_events_pair", "alias_paper_id", "canonical_paper_id"),
     )
 
 
