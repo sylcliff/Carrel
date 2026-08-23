@@ -106,9 +106,13 @@ def test_merge_skips_record_with_no_id(caplog):
 # ---- upsert_records ----
 
 def test_upsert_inserts_new(session):
-    counts = upsert_records(session, [_rec(), _rec(id="W2", title="Two")])
+    # Use distinct DOIs so cross-id dedup doesn't merge them.
+    counts = upsert_records(session, [
+        _rec(),
+        _rec(id="W2", title="Two", doi="10.1/xyz", arxiv_id="2401.00002"),
+    ])
     assert counts == {"new_discovered": 2, "updated": 0, "skipped": 0,
-                      "discovered_ids": ["W1", "W2"]}
+                      "cross_id_dedup": 0, "discovered_ids": ["W1", "W2"]}
     p1 = session.get(Paper, "W1")
     assert p1.title == "Paper One"
     assert p1.status == PaperStatus.pending.value
@@ -120,7 +124,8 @@ def test_upsert_inserts_new(session):
 
 def test_upsert_skips_no_id(session):
     counts = upsert_records(session, [_rec(id="")])
-    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1, "discovered_ids": []}
+    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1,
+                      "cross_id_dedup": 0, "discovered_ids": []}
     assert len(session.exec(select(Paper)).all()) == 0
 
 
@@ -167,17 +172,20 @@ def test_upsert_backfills_missing_fields_on_existing(session):
 def test_upsert_counts_skip_when_nothing_new(session):
     upsert_records(session, [_rec()])
     counts = upsert_records(session, [_rec()])
-    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1, "discovered_ids": []}
+    assert counts == {"new_discovered": 0, "updated": 0, "skipped": 1,
+                      "cross_id_dedup": 0, "discovered_ids": []}
 
 
 def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
     """If an earlier sync stored a paper as arxiv:<id> (OpenAlex enrichment
     failed then) and a later sync finds the canonical OpenAlex work, the
-    placeholder is removed and the canonical row is inserted — no duplicate."""
+    placeholder is removed and the canonical row is inserted — no duplicate.
+    Only fresh placeholders are eligible for promotion; an enriched row
+    (PDF downloaded, journal_doi set, etc.) takes the cross-id dedup path."""
     placeholder = _rec(
         id="arxiv:2401.00001", id_kind="arxiv", source="arxiv",
         arxiv_id="2401.00001", venue=None, doi=None, abstract=None,
-        pdf_url="https://arxiv.org/pdf/2401.00001",
+        pdf_url=None,  # a true placeholder: nothing enriched yet
     )
     upsert_records(session, [placeholder])
 
@@ -195,6 +203,123 @@ def test_upsert_promotes_arxiv_placeholder_to_canonical(session):
     # imported), so the canonical row stays out of the library.
     assert promoted.in_library is False
     assert len(session.exec(select(Paper)).all()) == 1
+
+
+def test_upsert_does_not_promote_enriched_placeholder(session):
+    """An enriched placeholder (PDF downloaded) must NOT be promoted, even
+    when the canonical OpenAlex record arrives — promotion would lose the
+    PDF and any user state. Cross-id dedup takes over instead."""
+    placeholder = _rec(
+        id="arxiv:2401.00001", id_kind="arxiv", source="arxiv",
+        arxiv_id="2401.00001", venue=None, doi=None, abstract=None,
+        pdf_url="https://arxiv.org/pdf/2401.00001",
+    )
+    upsert_records(session, [placeholder])
+
+    canonical = _rec(
+        id="W500", id_kind="openalex", source="openalex",
+        arxiv_id="2401.00001", venue="arXiv",
+    )
+    counts = upsert_records(session, [canonical])
+
+    # Cross-id dedup found the existing placeholder and refreshed it in place.
+    assert counts["cross_id_dedup"] == 1
+    assert counts["new_discovered"] == 0
+    # W500 was NOT inserted; the placeholder is still there with its PDF.
+    assert session.get(Paper, "W500") is None
+    p = session.get(Paper, "arxiv:2401.00001")
+    assert p is not None
+    assert p.pdf_url == "https://arxiv.org/pdf/2401.00001"
+    assert p.venue == "arXiv"  # backfilled
+
+
+def test_upsert_cross_id_dedup_via_doi(session):
+    """A record whose primary key is unknown but whose DOI matches an
+    existing row must refresh the existing row, not insert a duplicate."""
+    upsert_records(session, [_rec(
+        id="W1", doi="10.1/abc", arxiv_id=None,
+        venue=None, abstract=None,
+    )])
+
+    # Incoming record: different id (s2:...), same DOI, fills in venue+abstract.
+    incoming = _rec(
+        id="s2:abc", id_kind="s2", doi="10.1/abc", arxiv_id=None,
+        title="S2 Title", venue="S2 Venue", abstract="S2 abs",
+    )
+    counts = upsert_records(session, [incoming])
+
+    assert counts["cross_id_dedup"] == 1
+    assert counts["new_discovered"] == 0
+    # No duplicate row was inserted.
+    assert len(session.exec(select(Paper)).all()) == 1
+    # W1's empty venue and abstract are backfilled from the new record.
+    p = session.get(Paper, "W1")
+    assert p.venue == "S2 Venue"
+    assert p.abstract == "S2 abs"
+    assert p.title == "Paper One"  # not overwritten (existing was stronger)
+
+
+def test_upsert_cross_id_dedup_via_journal_doi_bridge(session):
+    """An arxiv-only row whose journal_doi == an incoming DOI is the
+    published version of the same paper — refresh, don't duplicate."""
+    preprint = _rec(
+        id="arxiv:2401.00003", id_kind="arxiv", source="arxiv",
+        doi=None, arxiv_id="2401.00003", venue=None, abstract=None,
+        pdf_url="https://arxiv.org/pdf/2401.00003",
+    )
+    upsert_records(session, [preprint])
+
+    # journal_doi is set by publication_check after the arxiv row exists, not
+    # by sync itself. Simulate that here so the bridge has something to match.
+    preprint_row = session.get(Paper, "arxiv:2401.00003")
+    preprint_row.journal_doi = "10.1/published"
+    session.add(preprint_row)
+    session.commit()
+
+    # Incoming record: different id (W...), has the published DOI and venue.
+    published = _rec(
+        id="W300", id_kind="openalex", source="openalex",
+        doi="10.1/published", arxiv_id="2401.00003", venue="NeurIPS",
+        abstract="Full abstract",
+    )
+    counts = upsert_records(session, [published])
+
+    assert counts["cross_id_dedup"] == 1
+    assert counts["new_discovered"] == 0
+    # Only the preprint row remains; W300 was NOT inserted.
+    assert len(session.exec(select(Paper)).all()) == 1
+    preprint_row = session.get(Paper, "arxiv:2401.00003")
+    assert preprint_row.venue == "NeurIPS"
+    assert preprint_row.abstract == "Full abstract"
+
+
+def test_upsert_cross_id_dedup_via_arxiv_id(session):
+    """A record whose primary key is unknown but whose arxiv_id matches an
+    existing row is the same paper."""
+    upsert_records(session, [_rec(
+        id="W1", doi=None, arxiv_id="2401.00007", venue=None, abstract=None,
+    )])
+    incoming = _rec(
+        id="arxiv:2401.00007", id_kind="arxiv", source="arxiv",
+        doi=None, arxiv_id="2401.00007", venue="NeurIPS", abstract="abs",
+    )
+    counts = upsert_records(session, [incoming])
+
+    assert counts["cross_id_dedup"] == 1
+    assert counts["new_discovered"] == 0
+    p = session.get(Paper, "W1")
+    assert p.venue == "NeurIPS"
+    assert p.abstract == "abs"
+
+
+def test_upsert_no_cross_id_dedup_when_no_match(session):
+    """Sanity: two records with no shared identifier both go in."""
+    counts = upsert_records(session, [
+        _rec(id="W1", doi="10.1/a", arxiv_id="2401.00001"),
+        _rec(id="W2", doi="10.1/b", arxiv_id="2401.00002"),
+    ])
+    assert counts["cross_id_dedup"] == 0
+    assert counts["new_discovered"] == 2
 
 
 # ---- Zenodo records are filtered out at the source ----

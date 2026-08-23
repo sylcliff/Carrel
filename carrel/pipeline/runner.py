@@ -22,6 +22,10 @@ from carrel.config import CarrelYAML
 from carrel.models import Job, JobStatus, Paper, PaperStatus, Subscription
 from carrel.sources import arxiv as arxiv_src
 from carrel.sources import openalex_client as oa
+from carrel.sources.merge import (
+    _clean_doi,
+    _strip_arxiv_version,
+)
 from carrel.sources.normalize import (
     PaperRecord,
     enrich_with_openalex,
@@ -210,6 +214,67 @@ def _is_stronger(a: PaperRecord, b: PaperRecord) -> bool:
     return score(a) > score(b)
 
 
+def _is_fresh_placeholder(paper: Paper) -> bool:
+    """True if the paper is an arxiv-only placeholder that hasn't been enriched.
+
+    A fresh placeholder is still in the inbox (in_library=False, not discarded),
+    still pending processing, has no PDF, no journal_doi, no LLM outputs, and
+    no user annotations. In that state it is safe to delete-and-recreate under
+    a new canonical id without losing any user-visible work.
+    """
+    if paper.in_library:
+        return False
+    if paper.discarded:
+        return False
+    if paper.status and paper.status != PaperStatus.pending.value:
+        return False
+    if paper.pdf_path or paper.pdf_url:
+        return False
+    if paper.journal_doi:
+        return False
+    if paper.tldr_en or paper.tldr_zh or paper.summary_zh:
+        return False
+    if paper.notes_markdown or paper.favorite:
+        return False
+    if paper.abstract:
+        return False
+    return True
+
+
+def _find_existing_paper(session: Session, rec: PaperRecord) -> Paper | None:
+    """Cross-id dedup at sync time: a record whose primary key is unknown may
+    still be the same paper as an existing row identified by a different id
+    (DOI, arXiv, or the journal-doi bridge between an arxiv row and its
+    published version).
+
+    Returns the existing Paper if a match is found, else None. Caller is
+    responsible for refreshing empty fields; this helper does not mutate.
+    """
+    if rec.doi:
+        bare = _clean_doi(rec.doi)
+        if bare:
+            hit = session.exec(
+                select(Paper).where(Paper.doi == bare)
+            ).first()
+            if hit is not None:
+                return hit
+            # journal_doi bridge: an arxiv-only row whose journal_doi equals
+            # this incoming DOI is the published version of the same paper.
+            hit = session.exec(
+                select(Paper).where(Paper.journal_doi == bare)
+            ).first()
+            if hit is not None:
+                return hit
+    if rec.arxiv_id:
+        bare = _strip_arxiv_version(rec.arxiv_id)
+        if bare:
+            hit = session.exec(
+                select(Paper).where(Paper.arxiv_id == bare)
+            ).first()
+            if hit is not None:
+                return hit
+    return None
+
 
 def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, object]:
     """Discover records: insert new ones into the inbox, refresh existing ones.
@@ -221,14 +286,25 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
     refreshed, but their ``in_library`` / ``discarded`` flags are never changed
     by a sync.
 
-    Returns counters ``{new_discovered, updated, skipped, discovered_ids}`` where
-    ``discovered_ids`` are the paper IDs newly inserted into the inbox this pass
-    (used by the caller, e.g. to avoid citation enrichment on non-library rows).
+    Cross-id dedup: if the primary key misses AND no promotion candidate, we
+    look for a row sharing the DOI / arXiv id (or the journal-doi bridge). A
+    match means the new record refers to the same paper under a different id
+    — we refresh the existing row's empty fields from the new one and do not
+    insert a duplicate. The background
+    :func:`carrel.pipeline.paper_dedup.run_dedup` will later discover the
+    relationship and write a :class:`PaperAlias` indirection so the
+    alternative id resolves correctly.
+
+    Returns counters ``{new_discovered, updated, skipped, cross_id_dedup,
+    discovered_ids}`` where ``discovered_ids`` are the paper IDs newly
+    inserted into the inbox this pass (used by the caller, e.g. to avoid
+    citation enrichment on non-library rows).
     """
     now = datetime.now(UTC)
     new_count = 0
     updated_count = 0
     skipped_count = 0
+    cross_id_dedup_count = 0
     discovered_ids: list[str] = []
 
     for rec in records:
@@ -252,8 +328,16 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
             # is safe; preserve any fields (e.g. the arXiv PDF URL) the
             # canonical record lacks, plus the placeholder's inbox/library
             # state so a promotion never silently re-imports or un-discards.
+            #
+            # A placeholder that has been enriched (PDF downloaded, journal_doi
+            # backfilled by publication_check, parsed, summarized, or already in
+            # the library) is NOT safe to promote — promotion deletes the row
+            # and would lose chunks/notes/embeddings. In that case we fall
+            # through to cross-id dedup, which refreshes the placeholder in
+            # place. The background paper_dedup.run_dedup will later write a
+            # PaperAlias so the canonical id resolves to the placeholder.
             placeholder = session.get(Paper, f"arxiv:{rec.arxiv_id}")
-            if placeholder is not None:
+            if placeholder is not None and _is_fresh_placeholder(placeholder):
                 logger.info(
                     "promoting placeholder arxiv:%s -> %s", rec.arxiv_id, rec.id
                 )
@@ -266,6 +350,25 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
                 was_discarded = placeholder.discarded
                 prior_discovered_at = placeholder.discovered_at
                 session.delete(placeholder)
+            elif placeholder is not None:
+                logger.info(
+                    "placeholder arxiv:%s has been enriched; "
+                    "skipping promotion, will cross-id dedup instead",
+                    rec.arxiv_id,
+                )
+
+        # Cross-id dedup: primary key missed AND no promotion candidate.
+        # Look for a row sharing the DOI / arXiv / journal_doi bridge.
+        if existing is None:
+            cross_existing = _find_existing_paper(session, rec)
+            if cross_existing is not None:
+                existing = cross_existing
+                cross_id_dedup_count += 1
+                logger.info(
+                    "cross-id dedup at sync: incoming %s (%s) matches existing %s (%s)",
+                    rec.id, rec.doi or rec.arxiv_id or rec.title[:40],
+                    existing.id, existing.doi or existing.arxiv_id or "",
+                )
 
         if existing is None:
             paper = Paper(
@@ -326,6 +429,7 @@ def upsert_records(session: Session, records: list[PaperRecord]) -> dict[str, ob
         "new_discovered": new_count,
         "updated": updated_count,
         "skipped": skipped_count,
+        "cross_id_dedup": cross_id_dedup_count,
         "discovered_ids": discovered_ids,
     }
 
