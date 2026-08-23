@@ -5,6 +5,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { StatusDot } from "@/components/StatusDot";
 import { TopicsLayout } from "@/components/TopicsLayout";
+import PaperDedupPanel from "@/components/PaperDedupPanel";
 import {
   deletePaper,
   listPapers,
@@ -40,6 +41,7 @@ export default function Library() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagMenuOpen, setTagMenuOpen] = useState(false);
   const [sort, setSort] = useState<SortKey>("added");
+  const [showDuplicates, setShowDuplicates] = useState(false);
 
   // Topics are URL-driven (?topic=X&topic=Y) so sidebar links, detail-page
   // chips and the Topics page all deep-link into a filtered library.
@@ -223,12 +225,23 @@ export default function Library() {
           Favorites
         </label>
 
+        <Button
+          variant={showDuplicates ? "default" : "outline"}
+          size="sm"
+          onClick={() => setShowDuplicates((v) => !v)}
+          title="Review duplicate paper rows (DOI / arXiv / s2 / journal-doi bridge)"
+        >
+          {showDuplicates ? "Hide duplicates" : "Duplicates"}
+        </Button>
+
         {activeFilterCount > 0 && (
           <Button variant="ghost" size="sm" onClick={clearAllFilters}>
             Clear
           </Button>
         )}
       </div>
+
+      {showDuplicates && <PaperDedupPanel />}
 
       {selectedTopics.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5 text-xs">

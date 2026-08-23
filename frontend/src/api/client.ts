@@ -776,6 +776,97 @@ export const deleteScholarAlias = (aliasAid: string, canonicalAid: string) =>
     { method: "DELETE" },
   );
 
+// ---- Paper dedup (merge duplicate paper rows: DOI / arXiv / s2 / bridge) ----
+
+export interface PaperDedupSuggestion {
+  a: string;
+  b: string;
+  score: number;
+  title: number;
+  authors: number;
+  strong_anchors: string[];
+  reasons: string[];
+  llm_verdict: {
+    verdict: string;
+    confidence: number;
+    model: string | null;
+    reasons: string[];
+  } | null;
+  title_a: string | null;
+  title_b: string | null;
+  year_a: number | null;
+  year_b: number | null;
+  doi_a: string | null;
+  doi_b: string | null;
+  arxiv_id_a: string | null;
+  arxiv_id_b: string | null;
+  s2_paper_id_a: string | null;
+  s2_paper_id_b: string | null;
+}
+
+export interface PaperDedupAlias {
+  alias_paper_id: string;
+  canonical_paper_id: string;
+  display_label: string | null;
+  source: "auto" | "user" | "llm" | "reject";
+  confidence: number;
+  reasons: string[];
+}
+
+export interface PaperDedupComponent {
+  canonical_id: string;
+  alias_ids: string[];
+  display_label: string | null;
+  reasons: string[];
+  avg_score: number;
+  sources: string[];
+}
+
+export interface PaperDedupSnapshot {
+  suggestions: PaperDedupSuggestion[];
+  applied: PaperDedupAlias[];
+  rejected: PaperDedupAlias[];
+  components: PaperDedupComponent[];
+}
+
+export const getPaperDedupSnapshot = (signal?: AbortSignal) =>
+  request<PaperDedupSnapshot>("/paper-dedup/suggestions", { signal });
+
+export const runPaperDedup = (opts: { autoApply?: boolean; background?: boolean } = {}) =>
+  request<Job>("/paper-dedup/run", {
+    method: "POST",
+    body: JSON.stringify({
+      auto_apply: opts.autoApply ?? true,
+      background: opts.background ?? true,
+    }),
+  });
+
+export const mergePaper = (body: {
+  alias_paper_id: string;
+  canonical_paper_id: string;
+  display_label?: string | null;
+}) =>
+  request<PaperDedupAlias>("/paper-dedup/merge", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const rejectPaperPair = (body: {
+  a: string;
+  b: string;
+  display_label?: string | null;
+}) =>
+  request<PaperDedupAlias>("/paper-dedup/reject", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const deletePaperAlias = (aliasPaperId: string, canonicalPaperId: string) =>
+  request<{ deleted: boolean }>(
+    `/paper-dedup/aliases/${encodeURIComponent(aliasPaperId)}/${encodeURIComponent(canonicalPaperId)}`,
+    { method: "DELETE" },
+  );
+
 export const classifyTopics = (
   opts: { paperId?: string; limit?: number; background?: boolean; force?: boolean } = {},
 ) =>
