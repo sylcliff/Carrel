@@ -116,6 +116,20 @@ class LLMConfig(BaseModel):
     # markdown fed as context, after stripping image markup.
     chat_fulltext_chars: int = 24000
 
+    # ---- Paper dedup LLM judge (M10.6) ----
+    # paper_dedup_judge_model defaults to the summarizer so the LLM judge uses
+    # whatever model is already authenticated. paper_dedup_judge_fallback
+    # defaults to the existing chat fallback chain.
+    paper_dedup_judge_model: str | None = None
+    paper_dedup_judge_fallback: str | None = None
+    # Bump prompt_version when the SYSTEM/USER prompts change; cached verdicts
+    # are keyed on this so a bumped version transparently invalidates them.
+    paper_dedup_judge_prompt_version: int = 1
+    # Single-scan budget for LLM calls so a large borderline queue can't run
+    # the meter away. The pipeline stops calling the LLM after this many
+    # calls in one run_dedup; remaining pairs are left as suggestions.
+    paper_dedup_judge_max_calls_per_run: int = 200
+
 
 class EmbeddingsConfig(BaseModel):
     provider: str = "volcengine"
