@@ -204,6 +204,39 @@ export const listScholars = (q?: string) =>
 export const getScholar = (key: string) =>
   request<ScholarDetail>(`/scholars/${encodeURIComponent(key)}`);
 
+export interface ScholarWork {
+  openalex_id: string;
+  title: string;
+  year: number | null;
+  venue: string | null;
+  doi: string | null;
+  arxiv_id: string | null;
+  cited_by_count: number | null;
+  is_oa: boolean;
+  pdf_url: string | null;
+  in_library: boolean;
+  library_id: string | null;
+}
+
+export interface ScholarWorksResponse {
+  items: ScholarWork[];
+  next_cursor: string | null;
+}
+
+export const getScholarWorks = (
+  key: string,
+  opts: { cursor?: string | null; limit?: number; signal?: AbortSignal } = {},
+) => {
+  const params = new URLSearchParams();
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return request<ScholarWorksResponse>(
+    `/scholars/${encodeURIComponent(key)}/works${qs ? `?${qs}` : ""}`,
+    opts.signal ? { signal: opts.signal } : undefined,
+  );
+};
+
 export interface CitationItem {
   title: string | null;
   year: number | null;

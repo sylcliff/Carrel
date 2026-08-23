@@ -285,6 +285,47 @@ def fetch_recent_by_author(
     return [dict(w) for w in results]
 
 
+def fetch_author_works(
+    author_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = 25,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Page one OpenAlex author's published works (newest first).
+
+    Returns ``(items, next_cursor)``. ``next_cursor`` is ``None`` when OpenAlex
+    signals there are no more pages; pass it back as ``cursor`` to load the
+    next page. ``limit`` is clamped to OpenAlex's per-page range of [1, 200].
+
+    Unlike :func:`fetch_recent_by_author` this is not time-windowed — the
+    author page is a "show me everything" list, not a "since X" sync feed.
+    """
+    a_id = _strip_prefix(author_id, "A")
+    if not a_id:
+        return [], None
+    per_page = min(max(limit, 1), 50)
+    try:
+        results = (
+            Works()
+            .filter(author={"id": a_id})
+            .sort(publication_date="desc", cited_by_count="desc")
+            .get(per_page=per_page, cursor=cursor)
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("OpenAlex author-works fetch failed for %s: %s", a_id, e)
+        return [], None
+    items = [dict(w) for w in results]
+    next_cursor = None
+    try:
+        # pyalex's OpenAlexResponseList exposes the response meta on .meta.
+        # The first page is requested with cursor=None (not "*"); pyalex still
+        # returns a meta block with next_cursor when more pages exist.
+        next_cursor = (results.meta or {}).get("next_cursor") or None
+    except AttributeError:
+        next_cursor = None
+    return items, next_cursor
+
+
 def fetch_recent_by_venue(
     source_id: str,
     *,

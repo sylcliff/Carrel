@@ -190,6 +190,34 @@ class ScholarDetail(BaseModel):
     wiki_page: "WikiPageDetail | None" = None
 
 
+class ScholarWorkOut(BaseModel):
+    """One published work for a scholar, sourced from OpenAlex.
+
+    ``in_library`` and ``library_id`` are joined in by the
+    :mod:`carrel.api.scholars` endpoint so the UI can show an "In library"
+    badge or an "Import" button without a second round-trip.
+    """
+
+    openalex_id: str
+    title: str
+    year: int | None = None
+    venue: str | None = None
+    doi: str | None = None
+    arxiv_id: str | None = None
+    cited_by_count: int | None = None
+    is_oa: bool = False
+    pdf_url: str | None = None
+    in_library: bool = False
+    # Carrel Paper.id of the matching library row, when ``in_library`` is True.
+    library_id: str | None = None
+
+
+class ScholarWorksResponse(BaseModel):
+    items: list[ScholarWorkOut] = []
+    # OpenAlex's opaque next-cursor string. ``None`` when no more pages.
+    next_cursor: str | None = None
+
+
 # -------- LLM-compiled wiki (M8) --------
 
 

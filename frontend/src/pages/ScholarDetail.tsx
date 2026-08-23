@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
@@ -7,10 +7,13 @@ import MarkdownReader from "@/components/MarkdownReader";
 import { PaperList } from "@/components/PaperList";
 import {
   getScholar,
+  getScholarWorks,
   getJob,
+  importPaper,
   recompileWikiPage,
   type Job,
   type ScholarDetail as ScholarDetailT,
+  type ScholarWork,
 } from "@/api/client";
 import { topicColorClass } from "@/lib/topicColor";
 
@@ -208,6 +211,243 @@ export default function ScholarDetailPage() {
         <h2 className="text-lg font-semibold">Papers in library</h2>
         <PaperList papers={papers} />
       </section>
+
+      <section className="space-y-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold">Published articles</h2>
+            <p className="text-xs text-muted-foreground">
+              All works indexed on OpenAlex for this author — newest first.
+            </p>
+          </div>
+        </div>
+        <PublishedArticles key={key} scholarKey={key} hasOpenAlex={data.scholar.has_openalex} />
+      </section>
     </main>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PublishedArticles — paginated OpenAlex works for a scholar, with per-row
+// "Import" (or "In library" link) and a "Load more" button.
+// ---------------------------------------------------------------------------
+
+function PublishedArticles({
+  scholarKey,
+  hasOpenAlex,
+}: {
+  scholarKey: string;
+  hasOpenAlex: boolean;
+}) {
+  const [items, setItems] = useState<ScholarWork[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  // Per-openalex_id, so the same paper imported twice only shows a spinner
+  // on the actual click — the previous click is already done.
+  const [importing, setImporting] = useState<Set<string>>(new Set());
+  const seqRef = useRef(0);
+
+  // Reset everything when the URL key changes (navigating between scholars
+  // without unmounting the page).
+  useEffect(() => {
+    seqRef.current += 1;
+    const seq = seqRef.current;
+    setItems([]);
+    setCursor(null);
+    setError(null);
+    setDone(false);
+    setLoading(true);
+
+    if (!hasOpenAlex) {
+      // Name-only author — the backend returns 422, so don't even try.
+      setError(
+        "This author has no OpenAlex ID yet, so their published works can't be listed. Run 'Resolve authors' on the Scholars page first.",
+      );
+      setLoading(false);
+      setDone(true);
+      return;
+    }
+
+    const ctrl = new AbortController();
+    getScholarWorks(scholarKey, { signal: ctrl.signal })
+      .then((res) => {
+        if (seq !== seqRef.current) return;
+        setItems(res.items);
+        setCursor(res.next_cursor);
+        setDone(res.next_cursor === null);
+      })
+      .catch((e) => {
+        if (seq !== seqRef.current) return;
+        if ((e as Error).name === "AbortError") return;
+        setError(e instanceof Error ? e.message : String(e));
+        setDone(true);
+      })
+      .finally(() => {
+        if (seq === seqRef.current) setLoading(false);
+      });
+    return () => ctrl.abort();
+  }, [scholarKey, hasOpenAlex]);
+
+  const loadMore = useCallback(async () => {
+    if (!cursor || loading) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await getScholarWorks(scholarKey, { cursor });
+      setItems((prev) => [...prev, ...res.items]);
+      setCursor(res.next_cursor);
+      setDone(res.next_cursor === null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [cursor, loading, scholarKey]);
+
+  async function handleImport(w: ScholarWork) {
+    if (importing.has(w.openalex_id) || w.in_library) return;
+    setImporting((prev) => new Set(prev).add(w.openalex_id));
+    try {
+      // Reuse the same POST /import that Search / citations use: it accepts
+      // any of openalex_id / doi / arxiv_id, dedups, and moves an existing
+      // inbox row into the library. The OA id is the strongest key.
+      await importPaper({ openalex_id: w.openalex_id, title: w.title });
+      // Mark the row in-place rather than re-fetching the whole page.
+      setItems((prev) =>
+        prev.map((it) =>
+          it.openalex_id === w.openalex_id
+            ? { ...it, in_library: true }
+            : it,
+        ),
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setImporting((prev) => {
+        const next = new Set(prev);
+        next.delete(w.openalex_id);
+        return next;
+      });
+    }
+  }
+
+  if (loading && items.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">Loading published works…</p>
+    );
+  }
+
+  if (error && items.length === 0) {
+    return (
+      <p className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
+        {error}
+      </p>
+    );
+  }
+
+  if (items.length === 0) {
+    return (
+      <p className="rounded border border-dashed border-border/70 px-3 py-4 text-center text-xs text-muted-foreground">
+        No published works found on OpenAlex.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <ul className="space-y-1.5">
+        {items.map((w) => (
+          <li
+            key={w.openalex_id}
+            className="rounded border border-border/60 px-3 py-2"
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                {w.in_library && w.library_id ? (
+                  <Link
+                    to={`/papers/${encodeURIComponent(w.library_id)}`}
+                    className="text-sm font-medium hover:underline"
+                  >
+                    {w.title}
+                  </Link>
+                ) : (
+                  <span className="text-sm font-medium">{w.title}</span>
+                )}
+                <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                  {w.year && <span>{w.year}</span>}
+                  {w.venue && <span>{w.venue}</span>}
+                  {w.cited_by_count != null && w.cited_by_count > 0 && (
+                    <span>🏆 {w.cited_by_count} cites</span>
+                  )}
+                  {w.is_oa && (
+                    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-400">
+                      OA
+                    </span>
+                  )}
+                  {w.doi && (
+                    <a
+                      href={w.doi}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline"
+                    >
+                      doi
+                    </a>
+                  )}
+                  {w.arxiv_id && (
+                    <a
+                      href={`https://arxiv.org/abs/${w.arxiv_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="hover:underline"
+                    >
+                      arXiv
+                    </a>
+                  )}
+                </div>
+              </div>
+              <div className="shrink-0">
+                {w.in_library ? (
+                  <span
+                    className="inline-flex items-center rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-700 dark:text-emerald-400"
+                    title="Already in your library"
+                  >
+                    In library
+                  </span>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleImport(w)}
+                    disabled={importing.has(w.openalex_id)}
+                  >
+                    {importing.has(w.openalex_id) ? "Importing…" : "Import"}
+                  </Button>
+                )}
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+      {!done && (
+        <div className="pt-1 text-center">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={loadMore}
+            disabled={loading}
+          >
+            {loading ? "Loading…" : "Load more"}
+          </Button>
+        </div>
+      )}
+      {error && items.length > 0 && (
+        <p className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-700 dark:text-red-400">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
