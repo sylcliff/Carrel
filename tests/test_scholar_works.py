@@ -121,6 +121,39 @@ def test_works_returns_page_with_in_library_match(
     assert by_id["W9"]["doi"] == "https://doi.org/10.1/a"
 
 
+def test_works_passes_cursor_start_on_first_call(monkeypatch):
+    """Regression: pyalex's Works.get(per_page=N) defaults to PAGE pagination,
+    which returns no next_cursor. The fetch wrapper must pass cursor='*' on
+    the first call so pyalex switches to cursor mode and yields a real
+    next_cursor when more pages exist. Tested at the openalex_client layer
+    (the endpoint always passes cursor=None to the wrapper; the wrapper
+    itself is responsible for turning that into cursor='*')."""
+    from carrel.sources import openalex_client as oa
+
+    captured: dict[str, object] = {}
+
+    class _Resp(list):
+        meta = {"next_cursor": "CURSOR-X", "count": 9999}
+
+    def fake_get(self, *args, **kwargs):
+        captured["cursor"] = kwargs.get("cursor")
+        captured["per_page"] = kwargs.get("per_page")
+        return _Resp([{"id": "https://openalex.org/W1", "title": "x"}])
+
+    monkeypatch.setattr("pyalex.Works.get", fake_get)
+    items, nc = oa.fetch_author_works("A123", cursor=None, limit=10)
+    assert captured["cursor"] == "*", captured
+    assert captured["per_page"] == 10
+    assert items and items[0]["title"] == "x"
+    assert nc == "CURSOR-X"
+
+    # Subsequent call should pass the returned cursor through unchanged.
+    captured.clear()
+    items, nc = oa.fetch_author_works("A123", cursor="CURSOR-X", limit=10)
+    assert captured["cursor"] == "CURSOR-X"
+    assert nc == "CURSOR-X"
+
+
 def test_works_match_by_arxiv_id_when_oa_id_differs(
     session: Session, client: TestClient, monkeypatch
 ):

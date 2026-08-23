@@ -299,17 +299,24 @@ def fetch_author_works(
 
     Unlike :func:`fetch_recent_by_author` this is not time-windowed — the
     author page is a "show me everything" list, not a "since X" sync feed.
+
+    Pyalex gotcha: ``Works().get(per_page=N)`` defaults to *page* pagination,
+    which returns ``meta["page"]`` rather than ``meta["next_cursor"]``. To get
+    cursor tokens back we must pass ``cursor="*"`` (pyalex's
+    ``Paginator.VALUE_CURSOR_START``) on the first call. Subsequent calls
+    pass the returned token; an empty/null token means "no more pages".
     """
     a_id = _strip_prefix(author_id, "A")
     if not a_id:
         return [], None
     per_page = min(max(limit, 1), 50)
+    page_cursor = cursor if cursor else "*"
     try:
         results = (
             Works()
             .filter(author={"id": a_id})
             .sort(publication_date="desc", cited_by_count="desc")
-            .get(per_page=per_page, cursor=cursor)
+            .get(per_page=per_page, cursor=page_cursor)
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("OpenAlex author-works fetch failed for %s: %s", a_id, e)
@@ -317,9 +324,6 @@ def fetch_author_works(
     items = [dict(w) for w in results]
     next_cursor = None
     try:
-        # pyalex's OpenAlexResponseList exposes the response meta on .meta.
-        # The first page is requested with cursor=None (not "*"); pyalex still
-        # returns a meta block with next_cursor when more pages exist.
         next_cursor = (results.meta or {}).get("next_cursor") or None
     except AttributeError:
         next_cursor = None
