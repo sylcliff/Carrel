@@ -229,8 +229,12 @@ export default function ScholarDetailPage() {
 
 // ---------------------------------------------------------------------------
 // PublishedArticles — paginated OpenAlex works for a scholar, with per-row
-// "Import" (or "In library" link) and a "Load more" button.
+// "Import" (or "In library" link) and a "Load all" button that drains the
+// remaining pages in a single click. Default page size is 50; for an author
+// with a few hundred works a single click is enough to surface everything.
 // ---------------------------------------------------------------------------
+
+const PAGE_SIZE = 50;
 
 function PublishedArticles({
   scholarKey,
@@ -241,9 +245,14 @@ function PublishedArticles({
 }) {
   const [items, setItems] = useState<ScholarWork[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
+  const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  // True while a "Load all" click is auto-paginating through every remaining
+  // page. Distinct from the initial ``loading`` so we can show a per-page
+  // "Loaded N of M" progress hint vs. the first-page "Loading…" placeholder.
+  const [loadingAll, setLoadingAll] = useState(false);
   // Per-openalex_id, so the same paper imported twice only shows a spinner
   // on the actual click — the previous click is already done.
   const [importing, setImporting] = useState<Set<string>>(new Set());
@@ -256,8 +265,10 @@ function PublishedArticles({
     const seq = seqRef.current;
     setItems([]);
     setCursor(null);
+    setTotal(null);
     setError(null);
     setDone(false);
+    setLoadingAll(false);
     setLoading(true);
 
     if (!hasOpenAlex) {
@@ -271,11 +282,12 @@ function PublishedArticles({
     }
 
     const ctrl = new AbortController();
-    getScholarWorks(scholarKey, { signal: ctrl.signal })
+    getScholarWorks(scholarKey, { limit: PAGE_SIZE, signal: ctrl.signal })
       .then((res) => {
         if (seq !== seqRef.current) return;
         setItems(res.items);
         setCursor(res.next_cursor);
+        setTotal(res.total ?? null);
         setDone(res.next_cursor === null);
       })
       .catch((e) => {
@@ -290,21 +302,44 @@ function PublishedArticles({
     return () => ctrl.abort();
   }, [scholarKey, hasOpenAlex]);
 
-  const loadMore = useCallback(async () => {
-    if (!cursor || loading) return;
-    setLoading(true);
+  // Drain the remaining pages in one go. Used by the "Load all" button. Each
+  // call updates ``items`` + ``cursor`` incrementally so the user sees a
+  // growing list rather than waiting for every page to come back at once.
+  const loadAll = useCallback(async () => {
+    if (done || loadingAll || loading) return;
+    setLoadingAll(true);
     setError(null);
+    let nextCursor = cursor;
+    // Local accumulator merged into state at the end so we don't fight React
+    // batching on each page. We still set items on each step so a long
+    // chain produces a smooth scroll-in rather than a blank → final jump.
+    let accumulated = items;
+    let stop = false;
     try {
-      const res = await getScholarWorks(scholarKey, { cursor });
-      setItems((prev) => [...prev, ...res.items]);
-      setCursor(res.next_cursor);
-      setDone(res.next_cursor === null);
+      while (nextCursor && !stop) {
+        const res = await getScholarWorks(scholarKey, {
+          cursor: nextCursor,
+          limit: PAGE_SIZE,
+        });
+        accumulated = [...accumulated, ...res.items];
+        setItems(accumulated);
+        setTotal(res.total ?? total);
+        nextCursor = res.next_cursor;
+        if (!res.next_cursor) {
+          stop = true;
+        }
+      }
+      setCursor(null);
+      setDone(true);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      // Stash whatever we have so the user can still see partial results.
+      setItems(accumulated);
+      setCursor(nextCursor);
     } finally {
-      setLoading(false);
+      setLoadingAll(false);
     }
-  }, [cursor, loading, scholarKey]);
+  }, [cursor, done, loading, loadingAll, items, scholarKey, total]);
 
   async function handleImport(w: ScholarWork) {
     if (importing.has(w.openalex_id) || w.in_library) return;
@@ -355,8 +390,15 @@ function PublishedArticles({
     );
   }
 
+  const remaining = total != null ? Math.max(total - items.length, 0) : null;
+  const counter =
+    total != null
+      ? `Showing ${items.length} of ${total}`
+      : `Showing ${items.length}`;
+
   return (
     <div className="space-y-2">
+      <p className="text-xs text-muted-foreground">{counter}</p>
       <ul className="space-y-1.5">
         {items.map((w) => (
           <li
@@ -432,15 +474,26 @@ function PublishedArticles({
         ))}
       </ul>
       {!done && (
-        <div className="pt-1 text-center">
+        <div className="flex flex-col items-center gap-1 pt-1">
           <Button
             variant="outline"
             size="sm"
-            onClick={loadMore}
-            disabled={loading}
+            onClick={loadAll}
+            disabled={loadingAll}
           >
-            {loading ? "Loading…" : "Load more"}
+            {loadingAll
+              ? `Loading more… ${items.length}${
+                  total != null ? ` of ${total}` : ""
+                }`
+              : remaining != null && remaining > 0
+                ? `Load all ${remaining} more`
+                : "Load more"}
           </Button>
+          {loadingAll && total != null && (
+            <p className="text-xs text-muted-foreground">
+              {items.length} of {total} loaded…
+            </p>
+          )}
         </div>
       )}
       {error && items.length > 0 && (

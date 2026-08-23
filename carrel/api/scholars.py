@@ -243,7 +243,7 @@ def list_scholar_works(
         None,
         description="Opaque OpenAlex next-cursor from the previous page",
     ),
-    limit: int = Query(25, ge=1, le=50),
+    limit: int = Query(50, ge=1, le=50),
     session: Session = Depends(get_session_dep),
 ) -> ScholarWorksResponse:
     """OpenAlex works authored by this scholar (newest first), paginated.
@@ -251,6 +251,10 @@ def list_scholar_works(
     Each item is annotated with ``in_library`` (and ``library_id``) by
     matching against the local Paper table. Only A-ID scholars can be
     resolved through OpenAlex — name-only authors (no A-ID) return 422.
+
+    ``total`` is OpenAlex's reported work count for this author and is the
+    same on every page; the UI uses it to render a "Showing X of Y" counter
+    on the section header.
     """
     # Mirror /scholars/{key}: only authors that exist in the local aggregation
     # are addressable here. This blocks casual enumeration of OpenAlex from
@@ -269,9 +273,9 @@ def list_scholar_works(
             ),
         )
 
-    works, next_cursor = oa.fetch_author_works(key, cursor=cursor, limit=limit)
+    works, next_cursor, total = oa.fetch_author_works(key, cursor=cursor, limit=limit)
     if not works and not next_cursor:
-        return ScholarWorksResponse(items=[], next_cursor=None)
+        return ScholarWorksResponse(items=[], next_cursor=None, total=total)
 
     matches = _batch_library_match(session, works)
     items: list[ScholarWorkOut] = []
@@ -297,4 +301,4 @@ def list_scholar_works(
                 library_id=match.id if match else None,
             )
         )
-    return ScholarWorksResponse(items=items, next_cursor=next_cursor)
+    return ScholarWorksResponse(items=items, next_cursor=next_cursor, total=total)

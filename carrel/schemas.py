@@ -216,6 +216,10 @@ class ScholarWorksResponse(BaseModel):
     items: list[ScholarWorkOut] = []
     # OpenAlex's opaque next-cursor string. ``None`` when no more pages.
     next_cursor: str | None = None
+    # Total works OpenAlex has for this author (from response meta.count).
+    # ``None`` when the count couldn't be read; the UI should fall back to
+    # "Showing N" without "of M" in that case.
+    total: int | None = None
 
 
 # -------- LLM-compiled wiki (M8) --------

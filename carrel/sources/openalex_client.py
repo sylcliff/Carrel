@@ -290,12 +290,15 @@ def fetch_author_works(
     *,
     cursor: str | None = None,
     limit: int = 25,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], str | None, int | None]:
     """Page one OpenAlex author's published works (newest first).
 
-    Returns ``(items, next_cursor)``. ``next_cursor`` is ``None`` when OpenAlex
-    signals there are no more pages; pass it back as ``cursor`` to load the
-    next page. ``limit`` is clamped to OpenAlex's per-page range of [1, 200].
+    Returns ``(items, next_cursor, total)``. ``next_cursor`` is ``None`` when
+    OpenAlex signals there are no more pages; pass it back as ``cursor`` to
+    load the next page. ``limit`` is clamped to OpenAlex's per-page range of
+    [1, 200]. ``total`` is OpenAlex's reported work count for this author
+    (from response ``meta.count``); it is the same on every page so callers
+    can use the first page's value to render "Showing X of Y".
 
     Unlike :func:`fetch_recent_by_author` this is not time-windowed — the
     author page is a "show me everything" list, not a "since X" sync feed.
@@ -308,7 +311,7 @@ def fetch_author_works(
     """
     a_id = _strip_prefix(author_id, "A")
     if not a_id:
-        return [], None
+        return [], None, None
     per_page = min(max(limit, 1), 50)
     page_cursor = cursor if cursor else "*"
     try:
@@ -320,14 +323,20 @@ def fetch_author_works(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("OpenAlex author-works fetch failed for %s: %s", a_id, e)
-        return [], None
+        return [], None, None
     items = [dict(w) for w in results]
     next_cursor = None
+    total = None
     try:
-        next_cursor = (results.meta or {}).get("next_cursor") or None
+        meta = results.meta or {}
+        next_cursor = meta.get("next_cursor") or None
+        raw = meta.get("count")
+        total = int(raw) if raw is not None else None
     except AttributeError:
-        next_cursor = None
-    return items, next_cursor
+        pass
+    except (TypeError, ValueError):
+        pass
+    return items, next_cursor, total
 
 
 def fetch_recent_by_venue(

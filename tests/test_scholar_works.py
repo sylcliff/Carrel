@@ -72,7 +72,7 @@ def _seed_paper(
     return p
 
 
-def _patch_oa(monkeypatch, *, page1=(), page2=(), next_cursor="NEXT"):
+def _patch_oa(monkeypatch, *, page1=(), page2=(), next_cursor="NEXT", total=99):
     """Patch fetch_author_works to return two pages of pre-canned work dicts."""
     from carrel.api import scholars as sm
 
@@ -81,9 +81,9 @@ def _patch_oa(monkeypatch, *, page1=(), page2=(), next_cursor="NEXT"):
     def fake(author_id, *, cursor=None, limit=25):
         calls.append((author_id, cursor, limit))
         if cursor is None:
-            return list(page1), next_cursor
+            return list(page1), next_cursor, total
         # Second page only returned when a cursor was supplied.
-        return list(page2), None
+        return list(page2), None, total
 
     monkeypatch.setattr(sm.oa, "fetch_author_works", fake)
     return calls
@@ -141,17 +141,19 @@ def test_works_passes_cursor_start_on_first_call(monkeypatch):
         return _Resp([{"id": "https://openalex.org/W1", "title": "x"}])
 
     monkeypatch.setattr("pyalex.Works.get", fake_get)
-    items, nc = oa.fetch_author_works("A123", cursor=None, limit=10)
+    items, nc, total = oa.fetch_author_works("A123", cursor=None, limit=10)
     assert captured["cursor"] == "*", captured
     assert captured["per_page"] == 10
     assert items and items[0]["title"] == "x"
     assert nc == "CURSOR-X"
+    assert total == 9999
 
     # Subsequent call should pass the returned cursor through unchanged.
     captured.clear()
-    items, nc = oa.fetch_author_works("A123", cursor="CURSOR-X", limit=10)
+    items, nc, total = oa.fetch_author_works("A123", cursor="CURSOR-X", limit=10)
     assert captured["cursor"] == "CURSOR-X"
     assert nc == "CURSOR-X"
+    assert total == 9999
 
 
 def test_works_match_by_arxiv_id_when_oa_id_differs(
@@ -264,10 +266,25 @@ def test_works_empty_page_returns_empty_items(
     session: Session, client: TestClient, monkeypatch
 ):
     _seed_paper(session, pid="W9", id_kind="openalex", doi="10.1/a")
-    _patch_oa(monkeypatch, page1=[], next_cursor=None)
+    _patch_oa(monkeypatch, page1=[], next_cursor=None, total=0)
     r = client.get("/scholars/A123/works")
     assert r.status_code == 200, r.text
-    assert r.json() == {"items": [], "next_cursor": None}
+    assert r.json() == {"items": [], "next_cursor": None, "total": 0}
+
+
+def test_works_response_includes_total(
+    session: Session, client: TestClient, monkeypatch
+):
+    _seed_paper(session, pid="W9", id_kind="openalex", doi="10.1/a")
+    _patch_oa(
+        monkeypatch,
+        page1=[_oa_work(w_id="W9", doi="10.1/a")],
+        next_cursor="MORE",
+        total=230,
+    )
+    r = client.get("/scholars/A123/works")
+    body = r.json()
+    assert body["total"] == 230  # echoed on every page so the UI can show "X of 230"
 
 
 def test_works_limit_clamped_to_50(

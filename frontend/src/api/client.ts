@@ -221,6 +221,10 @@ export interface ScholarWork {
 export interface ScholarWorksResponse {
   items: ScholarWork[];
   next_cursor: string | null;
+  // OpenAlex's reported total work count for this author — same on every
+  // page. ``null`` when the count couldn't be read; the UI shows just
+  // "Showing N" without "of M" in that case.
+  total: number | null;
 }
 
 export const getScholarWorks = (
