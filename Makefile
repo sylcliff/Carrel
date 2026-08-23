@@ -3,7 +3,7 @@ POETRY ?= uv
 NPM    ?= npm
 
 .PHONY: help install backend frontend up down psql mineru-install mineru-up mineru-down logs \
-        doctor heal start stop restart status
+        doctor heal start stop restart status migrate-paper-dedup
 
 help:
 	@echo "Carrel — common targets:"
@@ -116,3 +116,9 @@ doctor:
 
 heal:
 	@$(OPS)/heal.sh
+
+# One-shot: scan the library and auto-merge strong-anchor paper duplicates
+# (M10.7). Take a database snapshot before running. Pass --dry-run to score
+# without writing.
+migrate-paper-dedup:
+	@$(POETRY) run python scripts/migrate_paper_dedup.py $(ARGS)
