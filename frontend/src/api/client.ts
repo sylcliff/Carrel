@@ -135,6 +135,11 @@ export interface WikiPageSummary {
   evidence_count: number;
   scholar_aid: string | null;
   question_status: string | null;
+  // Stable, kind-qualified identity the catalog reconciles against
+  // (e.g. "scholar:A5013214678" or "scholar:name:he-li"). Redirect shells
+  // have entity_key=null and redirects_to set to the canonical key.
+  entity_key: string | null;
+  redirects_to: string | null;
   compiled_at: string | null;
   updated_at: string | null;
 }
@@ -145,6 +150,10 @@ export interface WikiPageDetail extends WikiPageSummary {
   body: string;
   sources: WikiSourceOut[];
   backlinks: WikiBacklink[];
+  // Set when the slug the user requested now resolves to a redirect shell
+  // — the server followed the redirect and tagged the response with the
+  // original slug so the UI can show a "this page moved" notice.
+  redirected_from: WikiPageSummary | null;
 }
 
 export const listWikiPages = (params?: {
@@ -152,12 +161,16 @@ export const listWikiPages = (params?: {
   q?: string;
   limit?: number;
   offset?: number;
+  includeRedirects?: boolean;
 }) => {
   const query = new URLSearchParams();
   if (params?.kind) query.set("kind", params.kind);
   if (params?.q) query.set("q", params.q);
   if (params?.limit !== undefined) query.set("limit", String(params.limit));
   if (params?.offset !== undefined) query.set("offset", String(params.offset));
+  // Default is to hide redirects; pass `false` explicitly to be safe with
+  // FastAPI's optional-bool semantics.
+  if (params?.includeRedirects) query.set("include_redirects", "true");
   const qs = query.toString();
   return request<WikiPageSummary[]>(`/wiki/pages${qs ? `?${qs}` : ""}`);
 };
@@ -657,6 +670,74 @@ export const backfillAuthors = (
       background: opts.background ?? false,
     }),
   });
+
+// ---- Scholar dedup (merge duplicate OpenAlex A-IDs) ----
+
+export interface DedupSuggestion {
+  a: string;
+  b: string;
+  display_name: string | null;
+  score: number;
+  coauthor: number;
+  affiliation: number;
+  topic: number;
+  reasons: string[];
+  paper_counts: Record<string, number>;
+  affiliations: Record<string, string | null>;
+}
+
+export interface DedupAlias {
+  alias_aid: string;
+  canonical_aid: string;
+  display_name: string | null;
+  source: "auto" | "user" | "reject";
+  confidence: number;
+  reasons: string[];
+}
+
+export interface DedupSnapshot {
+  suggestions: DedupSuggestion[];
+  applied: DedupAlias[];
+  rejected: DedupAlias[];
+}
+
+export const getDedupSnapshot = (signal?: AbortSignal) =>
+  request<DedupSnapshot>("/scholar-dedup/suggestions", { signal });
+
+export const runDedup = (opts: { autoApply?: boolean; background?: boolean } = {}) =>
+  request<Job>("/scholar-dedup/run", {
+    method: "POST",
+    body: JSON.stringify({
+      auto_apply: opts.autoApply ?? true,
+      background: opts.background ?? true,
+    }),
+  });
+
+export const mergeScholar = (body: {
+  alias_aid: string;
+  canonical_aid: string;
+  display_name?: string | null;
+}) =>
+  request<DedupAlias>("/scholar-dedup/merge", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const rejectScholarPair = (body: {
+  a: string;
+  b: string;
+  display_name?: string | null;
+}) =>
+  request<DedupAlias>("/scholar-dedup/reject", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const deleteScholarAlias = (aliasAid: string, canonicalAid: string) =>
+  request<{ deleted: boolean }>(
+    `/scholar-dedup/aliases/${encodeURIComponent(aliasAid)}/${encodeURIComponent(canonicalAid)}`,
+    { method: "DELETE" },
+  );
 
 export const classifyTopics = (
   opts: { paperId?: string; limit?: number; background?: boolean; force?: boolean } = {},

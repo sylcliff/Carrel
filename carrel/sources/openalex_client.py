@@ -452,6 +452,10 @@ def fetch_author(author_id: str) -> dict[str, Any] | None:
     insts = d.get("last_known_institutions") or []
     inst = (insts[0] or {}).get("display_name") if insts else None
     summary = d.get("summary_stats") or {}
+    topics = []
+    for t in d.get("topics") or []:
+        if isinstance(t, dict) and t.get("id"):
+            topics.append({"id": _strip_id_prefix(t.get("id", "")), "name": t.get("display_name")})
     return {
         "id": _strip_id_prefix(d.get("id", "")),
         "name": d.get("display_name"),
@@ -461,6 +465,7 @@ def fetch_author(author_id: str) -> dict[str, Any] | None:
         "h_index": summary.get("h_index"),
         "orcid": d.get("orcid"),
         "alternate_names": d.get("display_name_alternatives") or [],
+        "topics": topics,
     }
 
 

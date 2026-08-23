@@ -52,6 +52,10 @@ def reindex_wiki(session: Session, cfg: CarrelYAML) -> dict[str, int]:
     root = Path(cfg.storage.root)
     indexed = 0
     seen_paths: set[str] = set()
+    # Clear the resolve_target cache: a reindex may have moved pages (the
+    # canonical's slug changed, a new redirect shell was written), so prior
+    # cached target ids point at stale rows.
+    _links.clear_resolve_cache()
 
     for dirname, kind in _KIND_DIRS.items():
         kind_dir = root / "wiki" / dirname
@@ -90,18 +94,27 @@ def _upsert_row(
     meta: dict[str, Any],
     text: str,
 ) -> WikiPage:
-    """Upsert a WikiPage row from frontmatter + parsed links."""
+    """Upsert a WikiPage row from frontmatter + parsed links.
+
+    Recognizes a ``redirects_to`` frontmatter key and turns the row into a
+    redirect shell: ``entity_key`` is cleared, content mirrors are zeroed,
+    and wikilinks inside the stub body are ignored (the body is a single
+    line and counting it would double-count backlinks).  ``entity_key`` from
+    frontmatter is mirrored to the column for non-redirect rows so manual
+    renames survive a reindex.
+    """
     page = session.exec(
         select(WikiPage).where(WikiPage.kind == kind, WikiPage.slug == slug)
     ).first()
     now = datetime.now(UTC)
-    links = [href for _label, href in _links.extract_wikilinks(text)]
     source_ids = meta.get("source_paper_ids") or []
     if not isinstance(source_ids, list):
         source_ids = []
     tags = meta.get("tags") or []
     if not isinstance(tags, list):
         tags = []
+    redirects_to = meta.get("redirects_to")
+    is_redirect = isinstance(redirects_to, str) and redirects_to.strip() != ""
 
     if page is None:
         page = WikiPage(
@@ -115,12 +128,31 @@ def _upsert_row(
     page.title = meta.get("title") or slug
     page.path = rel_path
     page.checksum = _sha256(text)
-    page.summary = meta.get("summary")
-    page.tags = [str(t) for t in tags]
-    page.links_out = links
-    page.source_paper_ids = [str(p) for p in source_ids]
-    page.confidence = float(meta.get("confidence") or 0.0)
-    page.evidence_count = int(meta.get("evidence_count") or 0)
+    if is_redirect:
+        # Redirect shell: collapse content fields, remember the target.
+        page.redirects_to = redirects_to.strip()
+        page.entity_key = None
+        page.summary = None
+        page.tags = []
+        page.links_out = []
+        page.source_paper_ids = []
+        page.confidence = 0.0
+        page.evidence_count = 0
+    else:
+        # Live page: extract wikilinks from the body (the stub body of a
+        # redirect shell is one line, so excluding it is automatic when the
+        # file is also a shell).
+        links = [href for _label, href in _links.extract_wikilinks(text)]
+        page.summary = meta.get("summary")
+        page.tags = [str(t) for t in tags]
+        page.links_out = links
+        page.source_paper_ids = [str(p) for p in source_ids]
+        page.confidence = float(meta.get("confidence") or 0.0)
+        page.evidence_count = int(meta.get("evidence_count") or 0)
+        # Mirror the canonical entity_key if the file declares it. Falls
+        # back to a kind-aware derivation (scholar_aid for scholars) so
+        # legacy pages without an explicit entity_key still get a key.
+        page.entity_key = _entity_key_from_meta(kind, meta)
     if kind == WikiKind.scholar.value:
         aid = meta.get("openalex_id")
         page.scholar_aid = aid if isinstance(aid, str) and aid.startswith("A") else None
@@ -134,6 +166,24 @@ def _upsert_row(
         page.compiled_at = now
     page.updated_at = now
     return page
+
+
+def _entity_key_from_meta(kind: str, meta: dict[str, Any]) -> str | None:
+    """Resolve the canonical ``entity_key`` from frontmatter fields.
+
+    Priority: explicit ``entity_key`` → scholar_aid (scholar kind) → None
+    (rely on the next backfill pass).  We don't try to derive a key from
+    the slug here — the slug is a presentation detail and the catalog
+    already has rows whose slug is an old address.
+    """
+    ek = meta.get("entity_key")
+    if isinstance(ek, str) and ek.strip():
+        return ek.strip()
+    if kind == WikiKind.scholar.value:
+        aid = meta.get("openalex_id")
+        if isinstance(aid, str) and aid.startswith("A"):
+            return f"scholar:{aid}"
+    return None
 
 
 def upsert_page_from_disk(
@@ -155,18 +205,22 @@ def upsert_page_from_disk(
 def recompute_backlinks(session: Session) -> int:
     """Refresh ``links_in_count`` for every page from current ``links_out``.
 
-    Returns the number of pages touched.
+    Routes each outbound link through :func:`_links.resolve_target` so a page
+    that points at a now-redirected slug still counts as a backlink to the
+    canonical page.  Returns the number of pages touched.
     """
+    _links.clear_resolve_cache()
     pages = session.exec(select(WikiPage)).all()
-    by_kind_slug = {(p.kind, p.slug): p for p in pages}
     counts: dict[int, int] = {}
     for p in pages:
+        if p.redirects_to is not None:
+            # Redirect shells have a stub body; their outbound links would
+            # only point at the canonical they're redirecting to, so we
+            # skip them to avoid self-counting.
+            continue
         for href in p.links_out or []:
-            target = _links.resolve_link(p.path, href)
-            if target is None:
-                continue
-            tpage = by_kind_slug.get(target)
-            if tpage is not None:
+            tpage = _links.resolve_target(session, p.path, href)
+            if tpage is not None and tpage.id != p.id:
                 counts[tpage.id] = counts.get(tpage.id, 0) + 1
     touched = 0
     for p in pages:

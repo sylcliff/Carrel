@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from carrel.pipeline.wiki._names import normalize_name
+
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _AID = re.compile(r"^A\d+$")
 
@@ -23,10 +25,14 @@ def slugify(text: str) -> str:
 
 
 def scholar_slug(aid: str | None, name: str | None) -> str:
-    """Slug for a scholar page: A-ID when known, else ``name--<safe-name>``."""
+    """Slug for a scholar page: A-ID when known, else ``name--<safe-name>``.
+
+    ``name`` is normalized first so "He Li" and "He-Li" produce the same
+    slug. The display name on the page is still the original spelling.
+    """
     if aid and _AID.match(aid.strip()):
         return aid.strip()
-    base = slugify(name or "unknown")
+    base = slugify(normalize_name(name) or "unknown")
     return f"name--{base}"
 
 

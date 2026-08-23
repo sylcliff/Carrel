@@ -69,6 +69,8 @@ class JobKind(str, Enum):
     wiki_compile = "wiki_compile"
     # Force-recompile a single wiki page.
     wiki_recompile = "wiki_recompile"
+    # Cluster same-named A-IDs and apply high-confidence scholar merges.
+    scholar_dedup = "scholar_dedup"
 
 
 class WikiKind(str, Enum):
@@ -309,6 +311,19 @@ class WikiPage(SQLModel, table=True):
     # Question pages only: open|contested|partially_solved|resolved.
     question_status: str | None = Field(default=None, max_length=24)
 
+    # Stable, kind-qualified identity (e.g. "scholar:A5002874269",
+    # "scholar:name:he-li"). Independent of slug/path so that identity
+    # changes (A-ID assigned, aliases merged, name spelling normalized)
+    # do not break the catalog. The partial unique index over this column
+    # (uq_wiki_pages_entity_key_live, created in init_db) guarantees
+    # exactly one *live* page per entity; redirect shells are allowed to
+    # have the same entity_key as their canonical.
+    entity_key: str | None = Field(default=None, index=True, max_length=200)
+    # String form of the target entity_key when this row is a redirect
+    # shell. Stored as a string (not a self-FK) so that reindex can rebuild
+    # the row from disk and cycles never produce a 500.
+    redirects_to: str | None = Field(default=None, max_length=200)
+
     # Storage-root-relative path to the Markdown file.
     path: str = Field(max_length=500)
     # sha256 of the file bytes at the last sync.
@@ -340,6 +355,9 @@ class WikiPage(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_wiki_pages_kind_slug", "kind", "slug", unique=True),
+        # entity_key is already indexed via `Field(index=True)`; a separate
+        # redirects_to index helps the resolve_target lookup during reindex.
+        Index("ix_wiki_pages_redirects_to", "redirects_to"),
     )
 
 
@@ -373,6 +391,43 @@ class WikiSource(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_wiki_sources_page_paper", "wiki_page_id", "paper_id"),
+    )
+
+
+class ScholarAlias(SQLModel, table=True):
+    """Maps a duplicate OpenAlex Author ID (``alias_aid``) to the canonical one.
+
+    OpenAlex frequently splits one real person across several A-IDs (common for
+    Chinese names and early-career authors). The dedup pipeline scores clusters
+    of same-named A-IDs and records high-confidence merges here; the scholar
+    aggregator resolves every A-ID through this map before grouping so that
+    wiki pages and the Scholars page treat the aliases as one person.
+
+    - ``source``: ``auto`` (scoring threshold) | ``user`` (manual accept) |
+      ``reject`` (user said "these are different people" — recorded to suppress
+      future auto-suggestions).
+    - ``confidence``: 0..1 score from the pipeline; 1.0 for user actions.
+    - Alias rows are never deleted on re-dedup; a ``reject`` overrides an
+      earlier ``auto`` merge.
+    """
+
+    __tablename__ = "scholar_aliases"
+
+    id: int | None = Field(default=None, primary_key=True)
+    alias_aid: str = Field(index=True, max_length=32)
+    canonical_aid: str = Field(index=True, max_length=32)
+    display_name: str | None = Field(default=None, max_length=300)
+    source: str = Field(default="auto", max_length=16, index=True)
+    confidence: float = Field(default=0.0)
+    reasons: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    note: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_scholar_aliases_alias_canon", "alias_aid", "canonical_aid", unique=True),
     )
 
 

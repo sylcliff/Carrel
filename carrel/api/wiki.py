@@ -60,6 +60,8 @@ def _to_summary(row: WikiPage) -> WikiPageSummary:
         evidence_count=row.evidence_count,
         scholar_aid=row.scholar_aid,
         question_status=row.question_status,
+        entity_key=row.entity_key,
+        redirects_to=row.redirects_to,
         compiled_at=row.compiled_at,
         updated_at=row.updated_at,
     )
@@ -103,15 +105,23 @@ def _sources_for(session: Session, page_id: int) -> list[WikiSourceOut]:
 
 
 def _backlinks_for(session: Session, row: WikiPage) -> list[WikiBacklink]:
-    """Pages whose links_out resolve to this (kind, slug)."""
+    """Pages whose links_out resolve to this (kind, slug) — including via redirects.
+
+    A page that links to an old slug (now a redirect shell) still counts as
+    a backlink to the canonical page it points at.  Using
+    :func:`_links.resolve_target` (rather than the literal ``(kind, slug)``
+    match) preserves those backlinks across renames.
+    """
     pages = session.exec(select(WikiPage)).all()
-    target = (row.kind, row.slug)
     out: list[WikiBacklink] = []
+    seen: set[int] = set()
     for p in pages:
-        if p.id == row.id or not p.links_out:
+        if p.id == row.id or p.redirects_to is not None or not p.links_out:
             continue
         for href in p.links_out:
-            if _links.resolve_link(p.path, href) == target:
+            target = _links.resolve_target(session, p.path, href)
+            if target is not None and target.id == row.id and target.id not in seen:
+                seen.add(target.id)
                 out.append(
                     WikiBacklink(
                         id=p.id or 0, kind=p.kind, slug=p.slug, title=p.title
@@ -153,6 +163,10 @@ def list_pages(
     q: str | None = Query(None, description="Substring match on title/summary"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    include_redirects: bool = Query(
+        False,
+        description="Include redirect shells (default: hide them).",
+    ),
     session: Session = Depends(get_session_dep),
 ) -> list[WikiPageSummary]:
     stmt = select(WikiPage)
@@ -160,6 +174,8 @@ def list_pages(
         if kind not in {k.value for k in WikiKind}:
             raise HTTPException(status_code=422, detail=f"unknown kind: {kind}")
         stmt = stmt.where(WikiPage.kind == kind)
+    if not include_redirects:
+        stmt = stmt.where(WikiPage.redirects_to.is_(None))
     rows = list(session.exec(stmt).all())
     if q:
         needle = q.strip().lower()
@@ -202,7 +218,35 @@ def get_page_by_kind_slug(
     ).first()
     if row is None:
         raise HTTPException(status_code=404, detail="wiki page not found")
-    return _page_detail(session, row)
+    # If the row is a redirect shell, follow it to the canonical.  The
+    # response includes a ``redirected_from`` summary so the frontend can
+    # show a "this page moved" notice without making a second round-trip.
+    redirected_from: WikiPageSummary | None = None
+    if row.redirects_to is not None:
+        redirected_from = _to_summary(row)
+        target = _links.resolve_target(session, row.path, f"../{kind}s/{slug}.md")
+        if target is None or target.id == row.id:
+            # Broken redirect (e.g. target entity was deleted).  Surface the
+            # shell so the user sees the redirect notice rather than a 404.
+            return _page_detail_with_redirected_from(
+                session, row, redirected_from=redirected_from
+            )
+        row = target
+    return _page_detail_with_redirected_from(
+        session, row, redirected_from=redirected_from
+    )
+
+
+def _page_detail_with_redirected_from(
+    session: Session,
+    row: WikiPage,
+    *,
+    redirected_from: WikiPageSummary | None,
+) -> WikiPageDetail:
+    """Build a WikiPageDetail, optionally tagging it with the slug the user
+    originally requested when that slug is now a redirect shell."""
+    detail = _page_detail(session, row)
+    return detail.model_copy(update={"redirected_from": redirected_from})
 
 
 # ---------------------------------------------------------------------------

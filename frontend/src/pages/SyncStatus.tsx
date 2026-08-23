@@ -18,6 +18,7 @@ const KIND_LABEL: Record<string, string> = {
   citations: "Citations",
   topics: "Topics",
   authors_backfill: "Author backfill",
+  scholar_dedup: "Scholar dedup",
   remote_fill: "Remote fill",
   publication_check: "Publication check",
 };

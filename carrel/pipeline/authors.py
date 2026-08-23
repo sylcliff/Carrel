@@ -73,26 +73,55 @@ def _merge_authors(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Merge canonical OpenAlex authorship into the stored author list.
 
-    When both lists have the same length, align by position and fill in the
-    A-ID / affiliation / canonical name while preserving author order (which
-    typically matches between S2/arXiv and OpenAlex). When lengths differ,
+    When both lists have the same length, align by position and fill in any
+    missing A-ID / affiliation / canonical name while preserving author order
+    (which typically matches between S2/arXiv and OpenAlex). An existing
+    non-empty A-ID is **never overwritten** — OpenAlex itself can mis-attach an
+    A-ID to an authorship, and an existing A-ID may have been confirmed by a
+    previous backfill or by the scholar dedup pipeline. When lengths differ,
     replace wholesale with OpenAlex's ordering — this is rarer and safer than
-    a guessy alignment.
+    a guessy alignment (and we still preserve any existing A-IDs that match the
+    new position by name).
 
     Returns ``(merged_authors, replaced)``.
     """
     same_len = len(existing) == len(canonical) and len(canonical) > 0
     if not same_len:
-        return [dict(a) for a in canonical], True
+        # Whole-list replacement, but keep any existing A-ID whose name matches
+        # the new entry at the same position, to avoid clobbering confirmed IDs
+        # when OpenAlex merely reorders the author list.
+        merged: list[dict[str, Any]] = []
+        for i, new in enumerate(canonical):
+            old = existing[i] if i < len(existing) and isinstance(existing[i], dict) else {}
+            old_aid = (old.get("openalex_author_id") or "").strip()
+            old_name = (old.get("name") or "").strip().lower()
+            new_name = (new.get("name") or "").strip().lower()
+            aid = (new.get("openalex_author_id") or "").strip()
+            if old_aid and old_name and new_name and old_name == new_name and not aid:
+                aid = old_aid
+            merged.append({
+                "name": new.get("name") or old.get("name") or "",
+                "openalex_author_id": aid,
+                "affiliation": new.get("affiliation") or old.get("affiliation"),
+            })
+        return merged, True
 
-    merged: list[dict[str, Any]] = []
+    merged = []
     for old, new in zip(existing, canonical, strict=True):
         if not isinstance(old, dict):
             old = {}
+        old_aid = (old.get("openalex_author_id") or "").strip()
+        new_aid = (new.get("openalex_author_id") or "").strip()
+        # Prefer the existing A-ID if it's set and the new one differs; only
+        # adopt the canonical A-ID when the slot was previously empty. This
+        # makes backfill idempotent and prevents OpenAlex's own A-ID churn from
+        # clobbering confirmed identities (the dedup pipeline resolves real
+        # duplicates via scholar_aliases instead).
+        aid = old_aid or new_aid
         merged.append(
             {
                 "name": new.get("name") or old.get("name") or "",
-                "openalex_author_id": new.get("openalex_author_id") or "",
+                "openalex_author_id": aid,
                 "affiliation": new.get("affiliation") or old.get("affiliation"),
             }
         )

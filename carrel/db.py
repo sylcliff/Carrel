@@ -80,6 +80,11 @@ def init_db(engine: Engine) -> None:
         "pdf_files": "JSON",
         "published_checked_at": "TIMESTAMP",
     })
+    _ensure_columns(engine, "wiki_pages", {
+        # Wiki identity decoupling (M-reconcile): see carrel/pipeline/wiki/_entities.py
+        "entity_key": "VARCHAR(200)",
+        "redirects_to": "VARCHAR(200)",
+    })
 
     # Backfill: papers created before the inbox feature existed are already in
     # the library. Only touches rows whose column came back NULL (SQLite treats
@@ -106,6 +111,14 @@ def init_db(engine: Engine) -> None:
             conn.exec_driver_sql(
                 "UPDATE papers SET favorite=0 WHERE favorite IS NULL"
             )
+
+    # Wiki identity reconciliation.  The order matters: backfill entity_key
+    # for existing rows, then retire duplicates (writing redirect shells
+    # *before* creating the partial unique index — otherwise the index
+    # creation would fail on the duplicates it was meant to prevent).
+    backfill_wiki_identity(engine)
+    retire_duplicate_wiki_pages(engine)
+    _ensure_wiki_identity_index(engine)
 
     # HNSW index for cosine similarity over chunk embeddings. Built once at
     # startup (IF NOT EXISTS makes it idempotent). HNSW defaults (m=16,
@@ -177,6 +190,233 @@ def _ensure_columns(engine: Engine, table: str, columns: dict[str, str]) -> None
             conn.exec_driver_sql(
                 f"ALTER TABLE {qtable} ADD COLUMN {qcol} {col_type}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Wiki identity (entity_key, redirects_to) — see carrel/pipeline/wiki/_entities.py
+# ---------------------------------------------------------------------------
+
+# Partial unique index DDL.  The same statement works on both Postgres and
+# SQLite (3.8+ in `CREATE INDEX` form); the `WHERE` predicate is honored on
+# both engines.  We can't use SQLAlchemy's `Index(unique=True, postgresql_where=...)`
+# because the `where=` clause is silently dropped on SQLite, which would turn
+# the index into a global unique constraint and break redirect shells (they
+# share an entity_key with their canonical on purpose).
+_WIKI_ENTITY_KEY_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_wiki_pages_entity_key_live "
+    "ON wiki_pages (entity_key) "
+    "WHERE redirects_to IS NULL AND entity_key IS NOT NULL"
+)
+
+
+def _ensure_wiki_identity_index(engine: Engine) -> None:
+    """Create the partial unique index over live (non-redirect) wiki pages.
+
+    Safe to call repeatedly: `IF NOT EXISTS` short-circuits when the index
+    already exists.  Catches OperationalError (Postgres) and sqlite's
+    IntegrityError-equivalent on rare lock-contention scenarios so a
+    transient failure does not brick startup.
+    """
+    with engine.begin() as conn:
+        conn.exec_driver_sql(_WIKI_ENTITY_KEY_INDEX_DDL)
+
+
+def backfill_wiki_identity(engine: Engine) -> dict[str, int]:
+    """Populate ``entity_key`` for existing ``wiki_pages`` rows.
+
+    Idempotent — rows whose ``entity_key`` is already set are left alone.
+    Returns counts of rows touched.  Called by :func:`init_db` and by the
+    standalone cleanup script; safe to run on a fresh database.
+    """
+    from datetime import UTC, datetime
+    from sqlmodel import Session, select
+
+    from carrel.models import WikiPage
+
+    counts = {"updated": 0, "skipped": 0}
+    with Session(engine) as session:
+        rows = session.exec(
+            select(WikiPage).where(WikiPage.entity_key.is_(None))
+        ).all()
+        if not rows:
+            return counts
+        for row in rows:
+            key = _derive_entity_key(row)
+            if key is None:
+                counts["skipped"] += 1
+                continue
+            row.entity_key = key
+            session.add(row)
+            counts["updated"] += 1
+        session.commit()
+    return counts
+
+
+def _derive_entity_key(row) -> str | None:
+    """Compute the canonical ``entity_key`` for a wiki page row."""
+    # Imported lazily to avoid a circular import at module load — db.py is
+    # imported by the very modules _scholars_agg / _names depend on.
+    from carrel.pipeline.wiki._names import normalize_name
+
+    if row.kind == "scholar":
+        if row.scholar_aid:
+            return f"scholar:{row.scholar_aid}"
+        if row.slug and row.slug.startswith("name--"):
+            # The slug form is "name--<normalized-name>"; turn it back into
+            # the same key the aggregator produces.  ``title`` may be
+            # the original display spelling.
+            base = row.slug[len("name--"):]
+            if base:
+                return f"scholar:name:{base}"
+        # Fallback: a non-AID scholar page whose slug doesn't follow the
+        # name-- convention.  We synthesize from the title so a future
+        # reconcile can repair it once the slug is fixed.
+        if row.title:
+            return f"scholar:slug:{normalize_name(row.title)}"
+    # Future kinds: a placeholder keyed by slug.  When the concept/question
+    # enumerators are implemented, a subsequent reconcile pass will replace
+    # these with their real entity_key.
+    if row.slug:
+        return f"{row.kind}:slug:{row.slug}"
+    return None
+
+
+def retire_duplicate_wiki_pages(engine: Engine) -> dict[str, int]:
+    """Convert duplicate ``entity_key`` content pages into redirect shells.
+
+    For each ``entity_key`` with more than one non-redirect row, pick the
+    canonical (the row whose ``scholar_aid`` matches the current aggregated
+    key for that entity, or the one with the most ``wiki_sources`` as a
+    tiebreaker) and convert the rest:
+
+      * DB: ``entity_key = NULL``, ``redirects_to = canonical.entity_key``,
+        ``title = canonical.title``, ``summary = NULL``,
+        ``confidence = 0``, ``evidence_count = 0``, ``compiled_at = now()``.
+      * On disk: rewrite the loser's ``.md`` file as a redirect shell
+        (frontmatter ``redirects_to:`` + one-line body stub).  Files that
+        do not exist (never-compiled rows) are left alone.
+      * ``wiki_sources``: re-point every loser's rows to the canonical id
+        so the canonical's "Sources" footer still cites them.
+
+    Idempotent — re-running on a clean DB is a no-op.  Returns counters.
+    """
+    from datetime import UTC, datetime
+    from sqlmodel import Session, select
+
+    from carrel.models import WikiPage, WikiSource
+    from carrel.pipeline.wiki._frontmatter import dump
+
+    counts = {"retired": 0, "skipped": 0, "moved_sources": 0}
+    with Session(engine) as session:
+        # Group by entity_key, filter to non-redirect rows with > 1 entry.
+        all_live = session.exec(
+            select(WikiPage).where(WikiPage.redirects_to.is_(None))
+        ).all()
+        groups: dict[str, list[WikiPage]] = {}
+        for row in all_live:
+            if not row.entity_key:
+                continue
+            groups.setdefault(row.entity_key, []).append(row)
+        now = datetime.now(UTC)
+        for key, rows in groups.items():
+            if len(rows) <= 1:
+                counts["skipped"] += 1
+                continue
+            canonical = _pick_canonical(rows)
+            for row in rows:
+                if row.id == canonical.id:
+                    continue
+                # DB row → redirect shell
+                row.entity_key = None
+                row.redirects_to = canonical.entity_key
+                row.title = canonical.title
+                row.summary = None
+                row.confidence = 0.0
+                row.evidence_count = 0
+                row.compiled_at = now
+                session.add(row)
+                # Move WikiSource rows to the canonical id
+                sources = session.exec(
+                    select(WikiSource).where(WikiSource.wiki_page_id == row.id)
+                ).all()
+                for s in sources:
+                    s.wiki_page_id = canonical.id
+                    session.add(s)
+                counts["moved_sources"] += len(sources)
+                # Rewrite the file on disk (if it exists). The page's ``path``
+                # field is storage-root-relative. Try the configured storage
+                # root first (the dev app's normal layout), then fall back to
+                # CWD so the standalone cleanup script works regardless of
+                # where it was invoked from.
+                try:
+                    from pathlib import Path
+
+                    full = _resolve_storage_path(row.path)
+                    if full.exists():
+                        meta = {"redirects_to": canonical.entity_key}
+                        body = (
+                            f"# Redirected\n\n"
+                            f"This page moved to "
+                            f"[[{canonical.title}]]({_rel_link(row, canonical)}).\n"
+                        )
+                        text = dump(meta, body)
+                        tmp = full.with_suffix(full.suffix + ".tmp")
+                        tmp.write_text(text, encoding="utf-8")
+                        tmp.replace(full)
+                except OSError:
+                    pass
+                counts["retired"] += 1
+        session.commit()
+    # Recreate the partial unique index — callers that drop it (e.g. a
+    # one-off migration in psql) get the guarantee back automatically.
+    _ensure_wiki_identity_index(engine)
+    return counts
+
+
+def _rel_link(row, canonical) -> str:
+    """Best-effort relative path from a redirect shell to its canonical."""
+    from urllib.parse import quote
+    return f"../{row.kind}s/{quote(canonical.slug)}.md"
+
+
+def _resolve_storage_path(rel: str) -> Path:
+    """Resolve a storage-root-relative path to an absolute filesystem path.
+
+    Looks at the app's YAML config (when available) for ``storage.root``;
+    falls back to the current working directory so the standalone cleanup
+    script works whether or not the app engine is initialized.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(rel)
+    if p.is_absolute():
+        return p
+    # Prefer the app's configured storage root; fall back to CWD.
+    root: _Path | None = None
+    try:
+        from carrel.config import CarrelYAML
+        root = CarrelYAML().storage.root
+    except Exception:
+        root = None
+    base = root if root else _Path.cwd()
+    return base / p
+
+
+def _pick_canonical(rows) -> WikiPage:
+    """Pick the row that should remain a content page.
+
+    Preference order:
+      1. The row whose ``scholar_aid`` (if set) is currently aggregated as a
+         live author key — verified indirectly by preferring rows that are
+         *not* ``name--`` slugs over rows that are.
+      2. The row with the most ``wiki_sources`` rows (most provenance).
+      3. The oldest row (stable tiebreak).
+    """
+    # Preference: A-ID rows beat name-- rows; among ties, evidence wins.
+    def _score(r):
+        is_aid = bool(r.scholar_aid and r.scholar_aid.startswith("A"))
+        return (1 if is_aid else 0, r.evidence_count, -(r.id or 0))
+    return max(rows, key=_score)
 
 
 def session_dep(

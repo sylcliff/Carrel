@@ -74,7 +74,7 @@ def test_compile_scholar_writes_indexes_sources_and_is_idempotent(session, tmp_p
 
 def test_name_only_confidence_is_lower(session, tmp_path, monkeypatch):
     cfg = _cfg(tmp_path); _paper(session, aid="", name="Jane Doe"); _fakes(monkeypatch)
-    page = sc.compile_scholar(session, cfg, "name:Jane Doe")
+    page = sc.compile_scholar(session, cfg, "name:jane doe")
     assert page.slug == "name--jane-doe" and page.scholar_aid is None
     assert page.confidence < 0.45
 

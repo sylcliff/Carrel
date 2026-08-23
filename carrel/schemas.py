@@ -227,6 +227,14 @@ class WikiPageSummary(BaseModel):
     evidence_count: int = 0
     scholar_aid: str | None = None
     question_status: str | None = None
+    # ``entity_key`` is the stable, kind-qualified identity the catalog
+    # reconciles against (see carrel/pipeline/wiki/_entities.py).  ``None``
+    # for rows that pre-date the identity migration.
+    entity_key: str | None = None
+    # Set when this row is a redirect shell — points at the entity_key of
+    # the canonical.  A live page has ``redirects_to=None``; a shell has
+    # both ``entity_key=None`` and ``redirects_to=<canonical key>``.
+    redirects_to: str | None = None
     compiled_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -239,6 +247,10 @@ class WikiPageDetail(WikiPageSummary):
     body: str = ""
     sources: list[WikiSourceOut] = []
     backlinks: list[WikiBacklink] = []
+    # When the user requested a slug that now resolves to a redirect shell,
+    # the API follows the redirect and tags the response with the summary
+    # of the slug they originally asked for.  ``None`` for direct hits.
+    redirected_from: "WikiPageSummary | None" = None
 
 
 class WikiCompileRequest(BaseModel):

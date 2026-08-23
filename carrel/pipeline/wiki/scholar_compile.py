@@ -365,20 +365,38 @@ def _aid_for_key(key: str) -> str | None:
 
 
 def _existing_page(session: Session, key: str, name: str) -> WikiPage | None:
+    """Look up the canonical (non-redirect) page for a scholar key.
+
+    Lookup is by ``entity_key`` so the function is invariant to which slug
+    was previously used.  A redirect shell for the same entity is ignored —
+    we want the live page, never the shell (reconcile has already
+    consolidated shells before the compiler runs).
+
+    Falls back to the (kind, slug) only when ``entity_key`` is missing on
+    the row (a row that predates the identity migration; the next reconcile
+    pass will assign it a real key).
+    """
+    from carrel.pipeline.wiki._scholars_agg import NAME_KEY_PREFIX as _NP
     aid = _aid_for_key(key)
     if aid:
-        page = session.exec(
-            select(WikiPage).where(
-                WikiPage.kind == WikiKind.scholar.value,
-                WikiPage.scholar_aid == aid,
-            )
-        ).first()
-        if page:
-            return page
+        entity_key = f"scholar:{aid}"
+    else:
+        entity_key = f"scholar:name:{key[len(_NP):]}"
+    page = session.exec(
+        select(WikiPage).where(
+            WikiPage.entity_key == entity_key,
+            WikiPage.redirects_to.is_(None),
+        )
+    ).first()
+    if page is not None:
+        return page
+    # Fallback for legacy rows without entity_key: match by slug.
     slug = _slug.scholar_slug(aid, name)
     return session.exec(
         select(WikiPage).where(
-            WikiPage.kind == WikiKind.scholar.value, WikiPage.slug == slug
+            WikiPage.kind == WikiKind.scholar.value,
+            WikiPage.slug == slug,
+            WikiPage.redirects_to.is_(None),
         )
     ).first()
 
@@ -402,6 +420,22 @@ def compile_scholar(
     rel_path = _slug.page_path(WikiKind.scholar.value, slug)
     full_path = Path(cfg.storage.root) / rel_path
 
+    # Defensive: if the target slug is currently a redirect shell (the
+    # reconcile pass has not yet caught up), bail rather than clobber the
+    # shell's frontmatter.  The next reconcile + compile will re-evaluate.
+    from sqlmodel import select as _sel
+    existing_at_slug = session.exec(
+        _sel(WikiPage).where(
+            WikiPage.kind == WikiKind.scholar.value,
+            WikiPage.slug == slug,
+            WikiPage.redirects_to.is_not(None),
+        )
+    ).first()
+    if existing_at_slug is not None and not force:
+        raise ScholarError(
+            f"scholar slug {slug!r} is a redirect shell — reconcile first"
+        )
+
     papers = papers_for_key(session, scholar_key)[:_MAX_PAPERS]
     if not papers:
         raise ScholarError(f"no in-library papers for {scholar_key}")
@@ -417,6 +451,41 @@ def compile_scholar(
 
     latest_update = max((p.updated_at for p in papers if p.updated_at), default=None)
     existing = _existing_page(session, scholar_key, name)
+    # If the existing canonical page sits at a *different* slug than the one
+    # the current author key would synthesize (e.g. the author acquired an
+    # A-ID after being compiled as a name-only page), retire the old file
+    # to a redirect shell before we write the new one.  Without this, a
+    # reader who hits the old URL would see a 404, and the new page would
+    # be written at the new slug with no forward link from the old one.
+    if existing is not None and existing.slug != slug:
+        try:
+            from carrel.pipeline.wiki._frontmatter import dump
+            old_path = Path(cfg.storage.root) / existing.path
+            if old_path.exists():
+                meta = {"redirects_to": f"scholar:{aid}" if aid else f"scholar:name:{scholar_key[len(NAME_KEY_PREFIX):]}"}
+                body = (
+                    f"# Redirected\n\n"
+                    f"This page moved to "
+                    f"[[{name}]](../scholars/{slug}.md).\n"
+                )
+                text = dump(meta, body)
+                tmp = old_path.with_suffix(old_path.suffix + ".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(old_path)
+            # Convert the old DB row to a redirect shell so it stops
+            # showing up in API lists / select_stale_scholars.
+            existing.entity_key = None
+            existing.redirects_to = f"scholar:{aid}" if aid else f"scholar:name:{scholar_key[len(NAME_KEY_PREFIX):]}"
+            existing.title = name
+            existing.summary = None
+            existing.confidence = 0.0
+            existing.evidence_count = 0
+            existing.compiled_at = datetime.now(UTC)
+            session.add(existing)
+            session.commit()
+        except OSError:
+            logger.warning("scholar compile: could not retire old slug %s", existing.slug)
+        existing = None  # treat as fresh compile
     if (
         not force
         and existing is not None
@@ -576,26 +645,54 @@ def select_stale_scholars(session: Session, *, limit: int = 20) -> list[str]:
     Stale when there is no page, or ``max(Paper.updated_at)`` across the
     scholar's papers exceeds ``WikiPage.compiled_at``. Sorted by the number of
     *new/updated* papers (descending) so backfills prioritize active scholars.
+
+    Pages are looked up by ``entity_key`` (unique per scholar) so a stale
+    check never returns a redirect shell — the shell is bookkeeping, not
+    a page that needs recompiling.
+
+    Also skipped: aggregator keys whose slug is occupied by a redirect
+    shell (the canonical for that person lives at a different slug). The
+    reconcile pass handles those.
     """
+    from carrel.pipeline.wiki._scholars_agg import NAME_KEY_PREFIX as _NP
     scholars = aggregate(session)
-    page_by_aid: dict[str, WikiPage] = {}
-    page_by_slug: dict[str, WikiPage] = {}
+    page_by_entity: dict[str, WikiPage] = {}
+    # Slugs that point at redirect shells — a key whose canonical slug is
+    # one of these must be ignored (the canonical is at a different slug,
+    # already known to page_by_entity).
+    shell_slugs: set[str] = set()
     for page in session.exec(
-        select(WikiPage).where(WikiPage.kind == WikiKind.scholar.value)
+        select(WikiPage).where(
+            WikiPage.kind == WikiKind.scholar.value,
+            WikiPage.redirects_to.is_(None),
+        )
     ).all():
-        if page.scholar_aid:
-            page_by_aid[page.scholar_aid] = page
-        page_by_slug[page.slug] = page
+        if page.entity_key:
+            page_by_entity[page.entity_key] = page
+    for shell in session.exec(
+        select(WikiPage).where(
+            WikiPage.kind == WikiKind.scholar.value,
+            WikiPage.redirects_to.is_not(None),
+        )
+    ).all():
+        if shell.slug:
+            shell_slugs.add(shell.slug)
 
     stale: list[tuple[int, str]] = []
     for s in scholars:
         aid = _aid_for_key(s.key)
-        page = page_by_aid.get(aid) if aid else None
-        if page is None:
-            slug = _slug.scholar_slug(aid, s.name)
-            page = page_by_slug.get(slug)
+        entity_key = f"scholar:{aid}" if aid else f"scholar:name:{s.key[len(_NP):]}"
+        page = page_by_entity.get(entity_key)
         papers = papers_for_key(session, s.key)
         if not papers:
+            continue
+        # If the canonical slug for this key happens to be a redirect
+        # shell (the rare case where the file already exists from a
+        # previous compile but the row was just retired), skip —
+        # rewriting it would erase the shell's frontmatter.
+        from carrel.pipeline.wiki import _slug as _ws
+        canonical_slug = _ws.scholar_slug(s.key if not aid else aid, s.name)
+        if canonical_slug in shell_slugs:
             continue
         latest = max((p.updated_at for p in papers if p.updated_at), default=None)
         if page is None or page.compiled_at is None:
@@ -619,6 +716,21 @@ def compile_scholars_pending(
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, int]:
     """Compile stale scholar pages; returns counts."""
+    # Reconcile the scholar catalog against the live aggregation.  This
+    # retires any page whose entity_key no longer corresponds to a live
+    # author (e.g. a name-only author who later acquired an A-ID, or two
+    # A-IDs that were merged via scholar_aliases).  Without this, stale
+    # lookups by entity_key would silently skip the orphan and the next
+    # compile would resurrect the duplicate.
+    #
+    # Failure is non-fatal: a reconcile error must not block compiles.
+    # The next pass will retry.
+    try:
+        from carrel.pipeline.wiki._entities import reconcile_scholars
+        reconcile_scholars(session)
+    except Exception:
+        logger.exception("scholar compile: reconcile failed (continuing)")
+
     keys = select_stale_scholars(session, limit=limit)
     counts = {"candidates": len(keys), "compiled": 0, "failed": 0}
     total = len(keys)

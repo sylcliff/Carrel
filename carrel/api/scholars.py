@@ -87,22 +87,35 @@ def _get_scholars(session: Session) -> list[ScholarSummary]:
 
 
 def _scholar_wiki_page(session: Session, key: str, name: str) -> WikiPage | None:
-    """The compiled scholar WikiPage for an aggregation key, if any."""
-    if not key.startswith(NAME_KEY_PREFIX):
-        page = session.exec(
-            select(WikiPage).where(
-                WikiPage.kind == WikiKind.scholar.value,
-                WikiPage.scholar_aid == key,
-            )
-        ).first()
-        if page:
-            return page
+    """The compiled scholar WikiPage for an aggregation key, if any.
+
+    Looked up by ``entity_key`` (unique per scholar) so a name-only author
+    who later acquired an A-ID lands on the canonical page.  Redirect
+    shells are excluded — we want the live page or nothing.
+
+    A slug fallback exists for legacy rows whose ``entity_key`` was never
+    populated; those get cleaned up by the next reconcile pass.
+    """
+    if key.startswith(NAME_KEY_PREFIX):
+        entity_key = f"scholar:name:{key[len(NAME_KEY_PREFIX):]}"
+    else:
+        entity_key = f"scholar:{key}"
+    page = session.exec(
+        select(WikiPage).where(
+            WikiPage.entity_key == entity_key,
+            WikiPage.redirects_to.is_(None),
+        )
+    ).first()
+    if page is not None:
+        return page
     slug = _slug.scholar_slug(
         None if key.startswith(NAME_KEY_PREFIX) else key, name
     )
     return session.exec(
         select(WikiPage).where(
-            WikiPage.kind == WikiKind.scholar.value, WikiPage.slug == slug
+            WikiPage.kind == WikiKind.scholar.value,
+            WikiPage.slug == slug,
+            WikiPage.redirects_to.is_(None),
         )
     ).first()
 
