@@ -259,6 +259,10 @@ class WikiPageSummary(BaseModel):
     evidence_count: int = 0
     scholar_aid: str | None = None
     question_status: str | None = None
+    # True when the page is an evidence-threshold stub (concept/question with
+    # < 3 backing papers).  False for live pages and for redirect shells.
+    # D.7 lets the UI show a "待补证据" pill without re-parsing the file.
+    stub: bool = False
     # ``entity_key`` is the stable, kind-qualified identity the catalog
     # reconciles against (see carrel/pipeline/wiki/_entities.py).  ``None``
     # for rows that pre-date the identity migration.
@@ -286,11 +290,31 @@ class WikiPageDetail(WikiPageSummary):
 
 
 class WikiCompileRequest(BaseModel):
-    """POST /wiki/compile — batch-compile stale scholar pages."""
+    """POST /wiki/compile — batch-compile wiki pages across all kinds.
+
+    The driver runs up to four stages, each isolated by try/except so a
+    failure in one doesn't roll back the others:
+
+      1. ``paper_extract`` — per-paper LLM extraction of concepts/questions.
+      2. ``scholar_compile`` — synthesize scholar pages.
+      3. ``concept_compile`` — synthesize concept pages (≥ 3 papers each).
+      4. ``question_compile`` — synthesize open-question pages (≥ 3 papers).
+
+    ``stages`` lets an advanced caller run a single stage (e.g. a backfill
+    of paper extractions).  ``None`` (the default) runs all four in order.
+    """
 
     limit: int = Field(default=20, ge=1, le=200)
     background: bool = True
     force: bool = False
+    stages: list[str] | None = Field(
+        default=None,
+        description=(
+            "Subset of stages to run. Any of "
+            "'paper_extract' | 'scholar_compile' | 'concept_compile' | "
+            "'question_compile'. Default: all four in order."
+        ),
+    )
 
 
 # -------- Citations (Semantic Scholar) --------
@@ -550,6 +574,21 @@ class AuthorsBackfillRequest(BaseModel):
     paper_id: str | None = None
     limit: int = 100
     background: bool = False
+
+
+class PaperExtractRequest(BaseModel):
+    """Trigger LLM concept/question extraction for one paper or a batch.
+
+    Each call returns a Job per paper so the frontend can poll for progress.
+    ``deep=True`` widens the section pick (5 head + 5 tail) at the cost of
+    a larger LLM input; it is exposed for ops backfills, not the UI.
+    """
+
+    paper_id: str | None = None
+    limit: int = 20
+    background: bool = False
+    force: bool = False
+    deep: bool = False
 
 
 # -------- Search (M5) full-text --------

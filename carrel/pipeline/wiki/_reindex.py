@@ -230,3 +230,46 @@ def recompute_backlinks(session: Session) -> int:
             touched += 1
     session.commit()
     return touched
+
+
+# Source-page kinds whose ``links_out`` we prune.  Scholar pages are left
+# alone: their outbound links may include user-authored references to
+# concepts / questions that have not (yet) compiled, and dropping those
+# would silently break hand-curated notes.  Concept / question pages, by
+# contrast, are auto-generated; stale links there are noise.
+_PRUNE_KINDS = {WikiKind.concept.value, WikiKind.question.value}
+
+
+def prune_dead_links(session: Session) -> int:
+    """Drop ``links_out`` entries that no longer resolve to a live page.
+
+    Only concept/question source pages are touched (see :data:`_PRUNE_KINDS`).
+    For each remaining link, we ask :func:`_links.resolve_target`; a result
+    of ``None`` (file gone, row missing, or broken redirect chain) means the
+    link is dead.  Returns the number of pages that had at least one link
+    pruned.
+    """
+    _links.clear_resolve_cache()
+    pages = session.exec(
+        select(WikiPage).where(WikiPage.kind.in_(list(_PRUNE_KINDS)))
+    ).all()
+    touched = 0
+    for p in pages:
+        if p.redirects_to is not None or not p.links_out:
+            continue
+        kept: list[str] = []
+        for href in p.links_out:
+            tpage = _links.resolve_target(session, p.path, href)
+            if tpage is None:
+                # Dead link: file gone, row missing, or broken redirect
+                # chain.  Drop it from the page's outbound set so the
+                # rendered Markdown does not contain a broken wikilink.
+                continue
+            kept.append(href)
+        if len(kept) != len(p.links_out):
+            p.links_out = kept
+            session.add(p)
+            touched += 1
+    if touched:
+        session.commit()
+    return touched

@@ -84,6 +84,15 @@ def init_db(engine: Engine) -> None:
         # Wiki identity decoupling (M-reconcile): see carrel/pipeline/wiki/_entities.py
         "entity_key": "VARCHAR(200)",
         "redirects_to": "VARCHAR(200)",
+        # Stub pages: below-threshold concepts/questions written without an
+        # LLM call. The wiki list view filters stubs out by default.
+        "stub": "BOOLEAN DEFAULT FALSE NOT NULL",
+    })
+    _ensure_columns(engine, "paper_concepts", {
+        # Concept category from the extraction LLM (METHOD/THEORY/DATASET/
+        # DOMAIN/PHENOMENON).  Nullable: NULL means "uncategorized" (e.g.
+        # rows extracted before this column existed).
+        "category": "VARCHAR(32)",
     })
 
     # Backfill: papers created before the inbox feature existed are already in

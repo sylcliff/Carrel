@@ -22,7 +22,21 @@ from sqlmodel import Session, select
 from carrel.config import CarrelYAML
 from carrel.db import get_session_dep
 from carrel.models import Job, JobKind, JobStatus, Paper, WikiKind, WikiPage, WikiSource
-from carrel.pipeline.wiki import _frontmatter, _links, _scholars_agg
+from carrel.pipeline.paper_extract import (
+    PaperExtractError,
+    extract_papers_pending,
+)
+from carrel.pipeline.wiki import _frontmatter, _links, _reindex, _scholars_agg
+from carrel.pipeline.wiki.concept_compile import (
+    ConceptError,
+    compile_concept,
+    compile_concepts_pending,
+)
+from carrel.pipeline.wiki.question_compile import (
+    QuestionError,
+    compile_question,
+    compile_questions_pending,
+)
 from carrel.pipeline.wiki.scholar_compile import (
     ScholarError,
     compile_scholar,
@@ -60,6 +74,7 @@ def _to_summary(row: WikiPage) -> WikiPageSummary:
         evidence_count=row.evidence_count,
         scholar_aid=row.scholar_aid,
         question_status=row.question_status,
+        stub=row.stub,
         entity_key=row.entity_key,
         redirects_to=row.redirects_to,
         compiled_at=row.compiled_at,
@@ -253,6 +268,37 @@ def _page_detail_with_redirected_from(
 # Compilation (one Job per batch)
 # ---------------------------------------------------------------------------
 
+# Stage identifiers for the multi-phase driver.  Each maps to a batch
+# function below; the order here is the default execution order.
+_STAGE_PAPER_EXTRACT = "paper_extract"
+_STAGE_SCHOLAR = "scholar_compile"
+_STAGE_CONCEPT = "concept_compile"
+_STAGE_QUESTION = "question_compile"
+_ALL_STAGES = (
+    _STAGE_PAPER_EXTRACT,
+    _STAGE_SCHOLAR,
+    _STAGE_CONCEPT,
+    _STAGE_QUESTION,
+)
+_VALID_STAGES = frozenset(_ALL_STAGES)
+
+
+def _stage_did_work(stage: str, counts: dict) -> bool:
+    """True if a stage produced changes worth cascading into the next stage.
+
+    A stage is "no-op" when no live compile happened AND no failures
+    occurred — i.e. there is nothing to follow up on.  Stubbed pages count
+    as no-op (they did work but no LLM call, so they don't change the
+    staleness of downstream stages).
+    """
+    if not counts:
+        return False
+    if counts.get("failed", 0):
+        return True
+    if stage == _STAGE_PAPER_EXTRACT:
+        return counts.get("extracted", 0) > 0
+    return counts.get("compiled", 0) > 0
+
 
 def _make_progress_cb(session: Session, job_id: int):
     def _cb(progress: dict) -> None:
@@ -260,8 +306,17 @@ def _make_progress_cb(session: Session, job_id: int):
         if job is None:
             return
         stats = {**(job.stats or {})}
-        stats.update({k: v for k, v in progress.items() if k != "stage"})
-        stats["stage"] = progress.get("stage", "wiki_compile")
+        # Stage-specific sub-counters live under a per-stage key; preserve
+        # any prior stage results so a later stage's events don't clobber
+        # the earlier ones.
+        stage = progress.get("stage", "wiki_compile")
+        if stage and stage != "wiki_compile":
+            sub = {**(stats.get(stage) or {})}
+            sub.update({k: v for k, v in progress.items()
+                        if k not in {"stage", "index", "total", "name", "detail"}})
+            stats[stage] = sub
+        # Top-level "stage" reports the most-recent phase for the UI badge.
+        stats["stage"] = stage
         detail = progress.get("detail", "")
         idx = progress.get("index")
         total = progress.get("total")
@@ -280,41 +335,112 @@ def _make_progress_cb(session: Session, job_id: int):
 
 
 def _run_batch(
-    session: Session, job_id: int, limit: int, force: bool
+    session: Session,
+    job_id: int,
+    limit: int,
+    force: bool,
+    stages: list[str] | None = None,
 ) -> None:
+    """Run the multi-phase compile job.
+
+    Stages run in the order: paper_extract → scholar_compile →
+    concept_compile → question_compile.  Each stage is wrapped in its own
+    try/except so a concept-stage crash does not roll back scholar work.
+    Per-stage counts land under ``Job.stats[<stage>]``; the top-level
+    ``stage`` field reports the most-recent phase for the UI.
+
+    When a stage is a no-op (no LLM work done and no failures), the next
+    stage is skipped under the assumption that the input didn't change
+    and downstream staleness is unchanged.  The skip is reflected in the
+    job message so an operator can see why a stage did not run.
+    """
     from carrel.main import app_config  # noqa: PLC0415
 
     job = session.get(Job, job_id)
     progress = _make_progress_cb(session, job_id)
+    selected = list(stages) if stages else list(_ALL_STAGES)
+    unknown = [s for s in selected if s not in _VALID_STAGES]
+    if unknown:
+        if job is not None:
+            job.status = JobStatus.failed.value
+            job.finished_at = datetime.now(UTC)
+            job.message = f"unknown stages: {unknown!r}"
+            session.add(job)
+            session.commit()
+        return
+
     try:
         if job is not None:
             job.status = JobStatus.running.value
             job.started_at = datetime.now(UTC)
             session.add(job)
             session.commit()
-        counts = compile_scholars_pending(
-            session, app_config, limit=limit, force=force, on_progress=progress
-        )
+
+        prev_noop = False
+        per_stage: dict[str, dict] = {}
+
+        for stage in selected:
+            if prev_noop:
+                progress({"stage": stage, "detail": f"Skipping {stage} (previous stage no-op)"})
+                per_stage[stage] = {"skipped": True, "reason": "prev_noop"}
+                continue
+            try:
+                if stage == _STAGE_PAPER_EXTRACT:
+                    counts = extract_papers_pending(
+                        session, app_config, limit=limit, force=force,
+                        on_progress=progress,
+                    )
+                elif stage == _STAGE_SCHOLAR:
+                    counts = compile_scholars_pending(
+                        session, app_config, limit=limit, force=force,
+                        on_progress=progress,
+                    )
+                elif stage == _STAGE_CONCEPT:
+                    counts = compile_concepts_pending(
+                        session, app_config, limit=limit, force=force,
+                        on_progress=progress,
+                    )
+                else:  # _STAGE_QUESTION
+                    counts = compile_questions_pending(
+                        session, app_config, limit=limit, force=force,
+                        on_progress=progress,
+                    )
+            except Exception as e:  # noqa: BLE001
+                # Failure isolation: log + record, do not abort the job.
+                logger.exception("wiki compile stage %s crashed", stage)
+                per_stage[stage] = {"error": f"{type(e).__name__}: {e}"[:200]}
+                # A crashed stage is not a "no-op" — keep going so the
+                # user gets diagnostic data for every stage.
+                prev_noop = False
+                continue
+
+            per_stage[stage] = counts
+            prev_noop = not _stage_did_work(stage, counts)
+
+        # Final pass: prune dead links on auto-generated concept/question
+        # pages, then recompute backlinks so the UI shows fresh counts.
+        try:
+            pruned = _reindex.prune_dead_links(session)
+            recomputed = _reindex.recompute_backlinks(session)
+        except Exception:
+            logger.exception("wiki compile: final reindex pass failed")
+            pruned = None
+            recomputed = None
+
         if job is not None:
             job.status = JobStatus.done.value
             job.finished_at = datetime.now(UTC)
-            job.stats = {
-                **(job.stats or {}),
-                **counts,
-                "stage": "done",
-                "detail": "Done.",
-            }
-            job.message = (
-                f"compiled={counts.get('compiled', 0)} failed={counts.get('failed', 0)}"
-            )
-            session.add(job)
-            session.commit()
-    except ScholarError as e:
-        logger.info("wiki compile job %d failed: %s", job_id, e)
-        if job is not None:
-            job.status = JobStatus.failed.value
-            job.finished_at = datetime.now(UTC)
-            job.message = str(e)[:200]
+            final_stats = {**(job.stats or {})}
+            for stage, counts in per_stage.items():
+                final_stats[stage] = counts
+            final_stats["stage"] = "done"
+            final_stats["detail"] = "Done."
+            if pruned is not None:
+                final_stats["pruned_pages"] = pruned
+            if recomputed is not None:
+                final_stats["recomputed_backlinks"] = recomputed
+            job.stats = final_stats
+            job.message = "Done."
             session.add(job)
             session.commit()
     except Exception as e:  # noqa: BLE001
@@ -327,13 +453,15 @@ def _run_batch(
             session.commit()
 
 
-def _run_batch_background(job_id: int, limit: int, force: bool) -> None:
+def _run_batch_background(
+    job_id: int, limit: int, force: bool, stages: list[str] | None
+) -> None:
     from sqlmodel import Session as SqlSession  # noqa: PLC0415
 
     from carrel.db import get_app_engine  # noqa: PLC0415
 
     with SqlSession(get_app_engine()) as session:
-        _run_batch(session, job_id, limit, force)
+        _run_batch(session, job_id, limit, force, stages=stages)
 
 
 @router.post("/compile", response_model=JobOut)
@@ -342,7 +470,10 @@ def compile_wiki(
     background: BackgroundTasks,
     session: Session = Depends(get_session_dep),
 ) -> JobOut:
-    """Compile stale scholar pages as a single batch Job."""
+    """Compile the wiki as a single multi-stage batch Job.
+
+    See :class:`carrel.schemas.WikiCompileRequest` for the stage list.
+    """
     now = datetime.now(UTC)
     job = Job(
         kind=JobKind.wiki_compile.value,
@@ -353,6 +484,7 @@ def compile_wiki(
             "detail": "Queued…",
             "limit": body.limit,
             "force": body.force,
+            "stages": list(body.stages) if body.stages else list(_ALL_STAGES),
         },
         created_at=now,
     )
@@ -363,9 +495,9 @@ def compile_wiki(
     assert job_id is not None
 
     if body.background:
-        background.add_task(_run_batch_background, job_id, body.limit, body.force)
+        background.add_task(_run_batch_background, job_id, body.limit, body.force, body.stages)
     else:
-        _run_batch(session, job_id, body.limit, body.force)
+        _run_batch(session, job_id, body.limit, body.force, stages=body.stages)
         session.refresh(job)
     return JobOut(
         id=job.id or 0,
@@ -386,19 +518,48 @@ def recompile_page(
     background: bool = True,
     session: Session = Depends(get_session_dep),
 ) -> JobOut:
-    """Force-recompile one scholar page (M8a: scholar pages only).
+    """Force-recompile one wiki page of any kind (scholar, concept, question).
 
     By default runs in a background task (the frontend polls the Job); pass
     ``background=false`` to run inline within the request.
     """
     row = _get_page_row(session, page_id)
-    if row.kind != WikiKind.scholar.value:
+    # Resolve the per-kind compile key from the page row.  Concept and
+    # question compilers need the *normalized* term / question string, not
+    # the slug (the slug is a presentation form and may have been
+    # truncated relative to what the aggregation stored).  We look the
+    # candidate up by slug so the recompile hits the same candidate the
+    # forward compile would.
+    if row.kind == WikiKind.scholar.value:
+        key = row.scholar_aid or f"{_scholars_agg.NAME_KEY_PREFIX}{row.title}"
+        compile_fn = _recompile_scholar
+    elif row.kind == WikiKind.concept.value:
+        key = _resolve_concept_key(session, row)
+        if key is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"concept '{row.slug}' has no in-library papers; "
+                    "cannot recompile"
+                ),
+            )
+        compile_fn = _recompile_concept
+    elif row.kind == WikiKind.question.value:
+        key = _resolve_question_key(session, row)
+        if key is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"question '{row.slug}' has no in-library papers; "
+                    "cannot recompile"
+                ),
+            )
+        compile_fn = _recompile_question
+    else:
         raise HTTPException(
-            status_code=422,
-            detail="only scholar pages can be recompiled in M8a",
+            status_code=422, detail=f"unknown wiki kind: {row.kind!r}"
         )
-    # Resolve the scholar aggregation key from the page.
-    key = row.scholar_aid or f"{_scholars_agg.NAME_KEY_PREFIX}{row.title}"
+
     now = datetime.now(UTC)
     job = Job(
         kind=JobKind.wiki_recompile.value,
@@ -408,7 +569,8 @@ def recompile_page(
             "stage": "queued",
             "detail": "Queued…",
             "wiki_page_id": page_id,
-            "scholar_key": key,
+            "wiki_kind": row.kind,
+            "compile_key": key,
         },
         created_at=now,
     )
@@ -428,7 +590,7 @@ def recompile_page(
                 j.started_at = datetime.now(UTC)
                 sess.add(j)
                 sess.commit()
-            compile_scholar(sess, app_config, key, force=True)
+            compile_fn(sess, app_config, key)
             if j is not None:
                 j.status = JobStatus.done.value
                 j.finished_at = datetime.now(UTC)
@@ -436,7 +598,9 @@ def recompile_page(
                 j.stats = {**(j.stats or {}), "stage": "done"}
                 sess.add(j)
                 sess.commit()
-        except ScholarError as e:
+        except (
+            ScholarError, ConceptError, QuestionError, PaperExtractError
+        ) as e:
             if j is not None:
                 j.status = JobStatus.failed.value
                 j.finished_at = datetime.now(UTC)
@@ -476,3 +640,39 @@ def recompile_page(
         finished_at=job.finished_at,
         created_at=job.created_at,
     )
+
+
+# Per-kind recompile shims.  Each takes (session, cfg, key, force=True) so
+# the dispatcher above can wire them through the same background-task path.
+def _recompile_scholar(session, cfg, key):
+    return compile_scholar(session, cfg, key, force=True)
+
+
+def _recompile_concept(session, cfg, key):
+    return compile_concept(session, cfg, key, force=True)
+
+
+def _recompile_question(session, cfg, key):
+    return compile_question(session, cfg, key, force=True)
+
+
+def _resolve_concept_key(session: Session, row: WikiPage) -> str | None:
+    """Find the term_normalized for ``row.slug`` (concept page)."""
+    from carrel.pipeline.wiki._concepts_agg import aggregate
+    from carrel.pipeline.wiki._slug import slugify
+
+    for cand in aggregate(session):
+        if slugify(cand.term_display) == row.slug:
+            return cand.term_normalized
+    return None
+
+
+def _resolve_question_key(session: Session, row: WikiPage) -> str | None:
+    """Find the question_normalized for ``row.slug`` (question page)."""
+    from carrel.pipeline.wiki._questions_agg import aggregate
+    from carrel.pipeline.wiki._slug import slugify
+
+    for cand in aggregate(session):
+        if slugify(cand.question_display) == row.slug:
+            return cand.question_normalized
+    return None

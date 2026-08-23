@@ -78,19 +78,16 @@ _SYSTEM_PROMPT = (
     "- For collaborators you can identify by name from the co-author lists, "
     'give key_collaborators as [{name, aid (OpenAlex A-ID if shown, else ""), '
     "reason}].\n"
-    "- For recurring technical concepts, give concept_links as [{term, why}], "
-    "where term is a short canonical concept name (e.g. \"Retrieval-Augmented "
-    'Generation\") and why is one clause. Do not invent links beyond the papers.\n'
-    "- For open problems the abstracts explicitly state, give question_links "
-    'as [{question, why}]. ONLY include problems the papers themselves raise; '
-    "never propose new research ideas.\n"
+    "- Do NOT propose concept links or open questions — those are derived "
+    "deterministically from the per-paper extraction tables, not from your "
+    "JSON response.\n"
     "- tags: 3-8 short lowercase topic tags.\n"
     "- confidence: your estimate 0..1, but it is only a starting point and is "
     "capped by evidence quantity later.\n"
     "- Respond with ONLY a JSON object, no prose or markdown fences, of the "
     'form: {"summary": "...", "research_lines": ["...", "..."], '
     '"trajectory": "...markdown...", "evolving_views": "...markdown or empty...", '
-    '"key_collaborators": [...], "concept_links": [...], "question_links": [...], '
+    '"key_collaborators": [...], '
     '"tags": [...], "confidence": 0.0}'
 )
 
@@ -169,12 +166,88 @@ def _concept_link(term: str) -> str:
     return f"[[{term}]](../concepts/{_slug.slugify(term)}.md)"
 
 
+def _question_link(question: str) -> str:
+    return f"[[{question}]](../questions/{_slug.slugify(question)}.md)"
+
+
+# Cap on the deterministic link sections so a prolific scholar does not bloat
+# the page. 10 each is plenty for a navigation footer; the long tail is on
+# the concept/question pages themselves.
+_MAX_DETERMINISTIC_LINKS = 10
+
+
+def _concepts_for_papers(
+    session: Session, paper_ids: list[str]
+) -> list[tuple[str, int]]:
+    """Return ``[(term_display, paper_count)]`` for concepts mentioned by these papers.
+
+    Walks :class:`carrel.models.PaperConcept` joined to the given paper set,
+    groups by ``term_normalized``, picks the most-common ``term_display`` per
+    group, and returns the top entries by paper count desc then term. The
+    result is the deterministic "Related concepts" footer of a scholar page.
+    """
+    from collections import Counter
+    from carrel.models import PaperConcept
+    if not paper_ids:
+        return []
+    rows = session.exec(
+        select(PaperConcept).where(PaperConcept.paper_id.in_(paper_ids))
+    ).all()
+    displays: dict[str, Counter] = {}
+    counts: dict[str, set[str]] = {}
+    for pc in rows:
+        tn = pc.term_normalized
+        if not tn:
+            continue
+        displays.setdefault(tn, Counter())[pc.term_display or tn] += 1
+        counts.setdefault(tn, set()).add(pc.paper_id)
+    out: list[tuple[str, int]] = []
+    for tn, paper_set in counts.items():
+        display = displays[tn].most_common(1)[0][0]
+        out.append((display, len(paper_set)))
+    out.sort(key=lambda t: (-t[1], t[0]))
+    return out[:_MAX_DETERMINISTIC_LINKS]
+
+
+def _questions_for_papers(
+    session: Session, paper_ids: list[str]
+) -> list[tuple[str, int]]:
+    """Return ``[(question_display, paper_count)]`` for questions raised by these papers.
+
+    Mirror of :func:`_concepts_for_papers` for :class:`carrel.models.PaperQuestion`.
+    The result is the deterministic "Open questions" footer of a scholar page.
+    """
+    from collections import Counter
+    from carrel.models import PaperQuestion
+    if not paper_ids:
+        return []
+    rows = session.exec(
+        select(PaperQuestion).where(PaperQuestion.paper_id.in_(paper_ids))
+    ).all()
+    displays: dict[str, Counter] = {}
+    counts: dict[str, set[str]] = {}
+    for pq in rows:
+        qn = pq.question_normalized
+        if not qn:
+            continue
+        displays.setdefault(qn, Counter())[pq.question_display or qn] += 1
+        counts.setdefault(qn, set()).add(pq.paper_id)
+    out: list[tuple[str, int]] = []
+    for qn, paper_set in counts.items():
+        display = displays[qn].most_common(1)[0][0]
+        out.append((display, len(paper_set)))
+    out.sort(key=lambda t: (-t[1], t[0]))
+    return out[:_MAX_DETERMINISTIC_LINKS]
+
+
 def _render_body(
     *,
     name: str,
     data: dict[str, Any],
     papers: list[Any],
     profile: Any,
+    related_concepts: list[tuple[str, int]] | None = None,
+    open_questions: list[tuple[str, int]] | None = None,
 ) -> str:
     """Assemble the compiled Markdown body (title + sections + sources)."""
     summary = str(data.get("summary") or "").strip()
@@ -212,35 +285,21 @@ def _render_body(
         if rendered:
             lines += ["## Key collaborations", "\n".join(rendered), ""]
 
-    concepts = data.get("concept_links") or []
-    if isinstance(concepts, list) and concepts:
-        rendered = []
-        for c in concepts:
-            if not isinstance(c, dict):
-                continue
-            term = str(c.get("term") or "").strip()
-            if not term:
-                continue
-            why = str(c.get("why") or "").strip()
-            rendered.append(f"- {_concept_link(term)}" + (f" — {why}" if why else ""))
-        if rendered:
-            lines += ["## Related concepts", "\n".join(rendered), ""]
+    concepts = related_concepts or []
+    if concepts:
+        rendered = [
+            f"- {_concept_link(term)} — {n} paper{'s' if n != 1 else ''}"
+            for term, n in concepts
+        ]
+        lines += ["## Related concepts", "\n".join(rendered), ""]
 
-    questions = data.get("question_links") or []
-    if isinstance(questions, list) and questions:
-        rendered = []
-        for q in questions:
-            if not isinstance(q, dict):
-                continue
-            qtext = str(q.get("question") or "").strip()
-            if not qtext:
-                continue
-            why = str(q.get("why") or "").strip()
-            slug = _slug.slugify(qtext)
-            link = f"[[{qtext}]](../questions/{slug}.md)"
-            rendered.append(f"- {link}" + (f" — {why}" if why else ""))
-        if rendered:
-            lines += ["## Open questions", "\n".join(rendered), ""]
+    questions = open_questions or []
+    if questions:
+        rendered = [
+            f"- {_question_link(qtext)} — {n} paper{'s' if n != 1 else ''}"
+            for qtext, n in questions
+        ]
+        lines += ["## Open questions", "\n".join(rendered), ""]
 
     # Sources: footnote definitions linking back to each paper.
     if papers:
@@ -541,7 +600,14 @@ def compile_scholar(
     if not isinstance(data, dict) or not data.get("summary"):
         raise ScholarError("LLM returned no usable scholar summary")
 
-    body = _render_body(name=name, data=data, papers=papers, profile=profile)
+    body = _render_body(
+        name=name,
+        data=data,
+        papers=papers,
+        profile=profile,
+        related_concepts=_concepts_for_papers(session, [p.id for p in papers]),
+        open_questions=_questions_for_papers(session, [p.id for p in papers]),
+    )
 
     # Preserve any prior user-authored section.
     old_text = full_path.read_text(encoding="utf-8") if full_path.exists() else None

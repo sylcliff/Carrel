@@ -88,7 +88,17 @@ export default function WikiIndex() {
                 {rows.length ? rows.map((page) => (
                   <Link key={page.id} to={`/wiki/${page.kind}/${page.slug}`} className="block">
                     <Card className="transition-colors hover:bg-muted/30"><CardContent className="p-4">
-                      <div className="font-medium">{page.title}</div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="font-medium">{page.title}</div>
+                        {page.stub && (
+                          <span
+                            className="shrink-0 rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700"
+                            title="Need ≥ 3 backing papers to LLM-compile"
+                          >
+                            stub
+                          </span>
+                        )}
+                      </div>
                       {page.summary && <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">{page.summary}</p>}
                     </CardContent></Card>
                   </Link>

@@ -135,6 +135,9 @@ export interface WikiPageSummary {
   evidence_count: number;
   scholar_aid: string | null;
   question_status: string | null;
+  // True when the page is an evidence-threshold stub (concept/question with
+  // < 3 backing papers). D.7: the wiki list shows a "待补证据" pill for these.
+  stub: boolean;
   // Stable, kind-qualified identity the catalog reconciles against
   // (e.g. "scholar:A5013214678" or "scholar:name:he-li"). Redirect shells
   // have entity_key=null and redirects_to set to the canonical key.

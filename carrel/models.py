@@ -79,6 +79,9 @@ class JobKind(str, Enum):
     # bridge / LLM judge) and apply high-confidence paper merges into
     # paper_aliases. UI surface is the Library page "Duplicates" panel.
     paper_dedup = "paper_dedup"
+    # Per-paper LLM extraction of concepts + open questions from the parsed
+    # markdown. Feeds the concept/question wiki compilations.
+    paper_extract = "paper_extract"
 
 
 class WikiKind(str, Enum):
@@ -273,6 +276,57 @@ class PaperTopic(SQLModel, table=True):
     __table_args__ = (Index("ix_paper_topics_topic_id", "topic_id"),)
 
 
+class PaperConcept(SQLModel, table=True):
+    """One concept the LLM extracted from a single paper's body.
+
+    Compound by ``(paper_id, term_normalized)`` so a paper's "Retrieval-Augmented
+    Generation" mention is stored once even if the LLM surfaced it from
+    multiple sections.  The display form is preserved verbatim
+    (``term_display``) so the wiki page can use the most common surface form.
+    """
+
+    __tablename__ = "paper_concepts"
+
+    paper_id: str = Field(foreign_key="papers.id", primary_key=True, max_length=64)
+    term_normalized: str = Field(primary_key=True, max_length=200)
+    term_display: str = Field(max_length=300)
+    # Verbatim span from the paper's body that grounds the extraction. We
+    # verify it before write so a hallucinated mention never lands in the DB.
+    evidence_quote: str | None = Field(default=None, sa_column=Column(Text))
+    # One of METHOD / THEORY / DATASET / DOMAIN / PHENOMENON, set by the
+    # extraction LLM.  Nullable: rows from before this column existed have
+    # ``category=None``; downstream consumers must treat None as "unknown".
+    category: str | None = Field(default=None, max_length=32)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (Index("ix_paper_concepts_term", "term_normalized"),)
+
+
+class PaperQuestion(SQLModel, table=True):
+    """One open question the LLM extracted from a single paper's body.
+
+    Shape mirrors :class:`PaperConcept` (compound by
+    ``(paper_id, question_normalized)``). Field-level questions are
+    deferred — this is per-paper only in v1.
+    """
+
+    __tablename__ = "paper_questions"
+
+    paper_id: str = Field(foreign_key="papers.id", primary_key=True, max_length=64)
+    question_normalized: str = Field(primary_key=True, max_length=400)
+    question_display: str = Field(max_length=600)
+    evidence_quote: str | None = Field(default=None, sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (Index("ix_paper_questions_question", "question_normalized"),)
+
+
 class ChatMessage(SQLModel, table=True):
     """One turn in a paper's persisted RAG-chat transcript.
 
@@ -347,6 +401,10 @@ class WikiPage(SQLModel, table=True):
     # 0..1 corroboration score and count of distinct backing papers.
     confidence: float = Field(default=0.0, index=True)
     evidence_count: int = Field(default=0)
+    # Stub pages have < evidence threshold (e.g. < 3 papers for concepts);
+    # the LLM is skipped and a placeholder body is written instead. The
+    # partial index makes "find stubs needing a promotion check" cheap.
+    stub: bool = Field(default=False, index=True)
     embedding: list[float] | None = Field(default=None, sa_column=Column(HalfvecType))
 
     compiled_at: datetime | None = Field(

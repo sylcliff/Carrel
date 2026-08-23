@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 from carrel.config import CarrelYAML
-from carrel.models import Paper, WikiKind, WikiPage, WikiSource
+from carrel.models import Paper, PaperConcept, PaperQuestion, WikiKind, WikiPage, WikiSource
 from carrel.pipeline.wiki import _frontmatter
 from carrel.pipeline.wiki import scholar_compile as sc
 from sqlmodel import select
@@ -29,13 +29,27 @@ def _paper(session, *, pid="W1", aid="A5013214678", name="Jane Doe"):
     session.add(p); session.commit(); return p
 
 
+def _add_concept(session, paper_id, term, *, display=None):
+    session.add(PaperConcept(
+        paper_id=paper_id, term_normalized=term,
+        term_display=display or term, evidence_quote="seed",
+    ))
+    session.commit()
+
+
+def _add_question(session, paper_id, question, *, display=None):
+    session.add(PaperQuestion(
+        paper_id=paper_id, question_normalized=question,
+        question_display=display or question, evidence_quote="seed",
+    ))
+    session.commit()
+
+
 def _answer(summary="Jane studies grounded generation."):
     return {
         "summary": summary + " [^1]", "research_lines": ["Retrieval methods [^1]"],
         "trajectory": "Her work develops grounded systems [^1].", "evolving_views": "",
         "key_collaborators": [{"name": "John Smith", "aid": "A2", "reason": "coauthor"}],
-        "concept_links": [{"term": "Retrieval-Augmented Generation", "why": "central method"}],
-        "question_links": [{"question": "How can retrieval stay current?", "why": "raised in evidence"}],
         "tags": ["RAG", "Grounding"], "confidence": 0.95,
     }
 
@@ -47,8 +61,22 @@ def _fakes(monkeypatch, answer=None):
     monkeypatch.setattr(sc, "get_profile", lambda key: None)
 
 
+def _section_body(body: str, header: str) -> str:
+    """Return the body of a ``## header`` section up to the next ``## ``."""
+    idx = body.find(header)
+    assert idx >= 0, f"section not found: {header}"
+    rest = body[idx + len(header):]
+    nxt = rest.find("\n## ")
+    return rest if nxt < 0 else rest[:nxt]
+
+
 def test_compile_scholar_writes_indexes_sources_and_is_idempotent(session, tmp_path, monkeypatch):
-    cfg = _cfg(tmp_path); _paper(session); _fakes(monkeypatch)
+    cfg = _cfg(tmp_path); _paper(session)
+    _add_concept(session, "W1", "retrieval-augmented generation",
+                 display="Retrieval-Augmented Generation")
+    _add_question(session, "W1", "how can retrieval stay current",
+                 display="How can retrieval stay current?")
+    _fakes(monkeypatch)
     assert sc.select_stale_scholars(session) == ["A5013214678"]
     page = sc.compile_scholar(session, cfg, "A5013214678")
     full = tmp_path / "wiki/scholars/A5013214678.md"
@@ -58,7 +86,15 @@ def test_compile_scholar_writes_indexes_sources_and_is_idempotent(session, tmp_p
     assert meta["openalex_id"] == "A5013214678"
     assert meta["compiler_version"] == sc.COMPILER_VERSION
     assert meta["source_paper_ids"] == ["W1"]
-    assert "[[Retrieval-Augmented Generation]](../concepts/retrieval-augmented-generation.md)" in body
+    # Deterministic "Related concepts" from PaperConcept rows.
+    rel = _section_body(body, "## Related concepts")
+    assert "Retrieval-Augmented" in rel
+    assert "retrieval-augmented-generation" in rel  # the slug in the link
+    assert "1 paper" in rel
+    # Deterministic "Open questions" from PaperQuestion rows.
+    qs = _section_body(body, "## Open questions")
+    assert "how-can-retrieval-stay-current" in qs
+    assert "1 paper" in qs
     assert "## Sources" in body and "[^1]: [RAG Study W1](/papers/W1) (2024)" in body
     assert page.kind == WikiKind.scholar.value and page.scholar_aid == "A5013214678"
     assert page.title == "Jane Doe" and page.confidence <= 0.45 and page.evidence_count == 1
@@ -70,6 +106,27 @@ def test_compile_scholar_writes_indexes_sources_and_is_idempotent(session, tmp_p
     same = sc.compile_scholar(session, cfg, "A5013214678")
     assert same.checksum == checksum
     assert sc.select_stale_scholars(session) == []
+
+
+def test_related_links_count_distinct_papers(session, tmp_path, monkeypatch):
+    """A concept mentioned across two of the scholar's papers shows '2 papers'."""
+    cfg = _cfg(tmp_path)
+    _paper(session, pid="W1", aid="A5013214678", name="Jane Doe")
+    _paper(session, pid="W2", aid="A5013214678", name="Jane Doe")
+    _add_concept(session, "W1", "retrieval-augmented generation",
+                 display="Retrieval-Augmented Generation")
+    _add_concept(session, "W2", "retrieval-augmented generation",
+                 display="Retrieval-Augmented Generation")
+    _add_concept(session, "W1", "grounded generation", display="Grounded Generation")
+    _fakes(monkeypatch)
+    sc.compile_scholar(session, cfg, "A5013214678")
+    full = tmp_path / "wiki/scholars/A5013214678.md"
+    body = _frontmatter.parse(full.read_text())[1]
+    rel = _section_body(body, "## Related concepts")
+    # The RAG concept is in 2 distinct papers.
+    assert "2 papers" in rel
+    # The grounded-generation concept is in only 1 — "1 paper" (singular).
+    assert "1 paper" in rel
 
 
 def test_name_only_confidence_is_lower(session, tmp_path, monkeypatch):

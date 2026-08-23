@@ -45,14 +45,26 @@ export default function WikiPageList() {
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
               {pages.map((page) => {
                 const isRedirect = page.redirects_to !== null;
+                // D.7 stub pill: concept/question pages with < 3 backing papers.
+                // Surfaces "what to backfill next" without re-parsing the file.
+                const isStub = !isRedirect && page.stub;
                 return <Link key={page.id} to={`/wiki/${kind}/${page.slug}`}>
                   <Card className={"h-full transition-colors hover:bg-muted/30" + (isRedirect ? " opacity-60" : "")}>
                     <CardContent className="space-y-3 p-5">
                       <div className="flex items-start justify-between gap-3">
                         <h2 className="font-semibold">{page.title}</h2>
-                        {isRedirect
-                          ? <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800">redirect</span>
-                          : <span className="rounded-full bg-muted px-2 py-0.5 text-xs tabular-nums">{Math.round(page.confidence * 100)}%</span>}
+                        {isRedirect ? (
+                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800">redirect</span>
+                        ) : isStub ? (
+                          <span
+                            className="rounded-full bg-slate-200 px-2 py-0.5 text-xs text-slate-700"
+                            title="Need ≥ 3 backing papers to LLM-compile"
+                          >
+                            stub · {page.evidence_count} evidence
+                          </span>
+                        ) : (
+                          <span className="rounded-full bg-muted px-2 py-0.5 text-xs tabular-nums">{Math.round(page.confidence * 100)}%</span>
+                        )}
                       </div>
                       {page.summary && <p className="line-clamp-3 text-sm text-muted-foreground">{page.summary}</p>}
                       {isRedirect && page.redirects_to && <p className="text-xs text-amber-700">→ {page.redirects_to}</p>}
