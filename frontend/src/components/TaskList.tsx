@@ -61,7 +61,8 @@ export function TaskList({ onProcessed, refreshNonce = 0 }: Props) {
               j.kind !== "parse" &&
               j.kind !== "summarize" &&
               j.kind !== "embed" &&
-              j.kind !== "citations"
+              j.kind !== "citations" &&
+              j.kind !== "wiki_compile"
             )
               continue;
             const prev = prevStatus.current.get(j.id);
@@ -222,6 +223,10 @@ function stageLabelFor(stage: string): string {
   if (stage === "summarize") return "summarize";
   if (stage === "embed") return "embed";
   if (stage === "citations") return "citations";
+  if (stage === "paper_extract") return "extract";
+  if (stage === "scholar_compile") return "scholars";
+  if (stage === "concept_compile") return "concepts";
+  if (stage === "question_compile") return "questions";
   if (stage === "done") return "done";
   return stage;
 }

@@ -136,6 +136,25 @@ class ChatMessagesOut(BaseModel):
     updated_at: datetime | None = None
 
 
+# -------- Wiki-wide chat transcript (M12) --------
+
+
+class WikiChatTurnIn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class WikiChatMessagesIn(BaseModel):
+    messages: list[WikiChatTurnIn]
+
+
+class WikiChatMessagesOut(BaseModel):
+    """Global wiki-chat transcript envelope (no per-page scope)."""
+
+    messages: list[ChatMessageOut]
+    updated_at: datetime | None = None
+
+
 # -------- Topics (LLM classification) --------
 
 
@@ -623,6 +642,72 @@ class SemanticSearchResponse(BaseModel):
     query: str  # post-correction query we embedded and searched with
     corrected_from: str | None = None  # original if spelling was fixed
     results: list[SemanticSearchResult] = []
+
+
+# -------- Settings (M12) --------
+
+
+class EnvOverride(BaseModel):
+    """One field on a SerialisedSection that .env is currently overriding.
+
+    ``env_var`` is the environment variable name (always surfaced). ``env_value``
+    is the live value the process is using from that env var, but only when it
+    is safe to expose (i.e. the field isn't flagged as a secret). Secret overrides
+    (``OPENALEX_API_KEY``, ``S2_API_KEY``) carry ``env_value=None`` and the UI
+    falls back to a generic "set in .env" badge.
+    """
+
+    env_var: str
+    env_value: str | None = None
+
+
+class SerialisedSection(BaseModel):
+    """One YAML section as returned by GET /settings and re-emitted by PATCH.
+
+    ``values`` carries the effective configuration with secrets masked. For
+    fields that ``.env`` overrides at startup, the env-var name and (where
+    non-secret) the live value are recorded in ``env_overrides`` so the UI
+    can show both the source and the effective value. ``requires_restart``
+    flags sections whose change only takes effect after a process restart
+    (storage paths, HTTP bind, CORS origins).
+    """
+
+    values: dict[str, Any] = Field(default_factory=dict)
+    env_overrides: dict[str, EnvOverride] = Field(default_factory=dict)
+    requires_restart: bool = False
+
+
+class EnvEntry(BaseModel):
+    """One row in the .env read-only summary card."""
+
+    name: str           # Python attribute name on EnvSettings
+    label: str          # human-friendly name
+    is_secret: bool
+    is_set: bool
+    # Only populated for non-secret entries (e.g. database_url,
+    # mineru_base_url, host/port, cors origins). Always None for secrets.
+    value: str | None = None
+
+
+class SettingsOut(BaseModel):
+    yaml_path: str
+    sections: dict[str, SerialisedSection] = Field(default_factory=dict)
+    env: list[EnvEntry] = Field(default_factory=list)
+    # Convenience list of section names whose PATCH writes to disk but does
+    # not mutate the in-memory app_config. Drives the "Restart required"
+    # banner on the frontend.
+    restart_required_sections: list[str] = Field(default_factory=list)
+
+
+class SettingsUpdate(BaseModel):
+    """PATCH /settings body. Each top-level key is a YAML section name.
+
+    Section bodies for ``SECTION_MODELS`` sections are partial dicts (any
+    subset of that section's fields). ``"subscriptions"`` is a full list
+    replacement. Absent sections are left untouched.
+    """
+
+    sections: dict[str, dict[str, Any] | list[Any]] = Field(default_factory=dict)
 
 # Resolve the forward reference from ScholarDetail.wiki_page to WikiPageDetail,
 # which is defined later in this module.

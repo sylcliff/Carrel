@@ -30,6 +30,19 @@ class LLMError(RuntimeError):
     """A chat completion could not be produced or parsed."""
 
 
+def _configure_litellm() -> None:
+    """Drop provider-unsupported params instead of raising (e.g. volcengine
+    Doubao rejects ``response_format=json_object``).  Idempotent."""
+    try:
+        import litellm
+    except ImportError:  # pragma: no cover - litellm is a hard dep
+        return
+    litellm.drop_params = True
+
+
+_configure_litellm()
+
+
 def has_key_for(model: str) -> bool:
     """True if an API key is configured (in env) for ``model``'s provider."""
     return embeddings._key_for(model) is not None
@@ -43,12 +56,17 @@ def chat_json(
     temperature: float = 0.2,
     timeout: int = 60,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    feature: str = "other",
+    on_usage: "Any | None" = None,
 ) -> dict[str, Any]:
     """Call the chat model and return its content parsed as JSON.
 
     Tries ``model`` first; if that model has no configured key or the call
     fails after retries and a ``fallback_model`` is given, the fallback is
     tried once. Raises :class:`LLMError` if no model produces valid JSON.
+
+    If ``on_usage`` is given it is called with the raw litellm response so
+    the caller can persist the ``usage`` block (see :mod:`carrel.usage`).
     """
     attempts: list[tuple[str, str | None]] = []
     key = embeddings._key_for(model)
@@ -76,7 +94,7 @@ def chat_json(
     last_err: Exception | None = None
     for idx, (mdl, api_key) in enumerate(attempts):
         try:
-            return _chat_with_retry(
+            data, resp = _chat_with_retry(
                 messages,
                 model=mdl,
                 api_key=api_key or "",
@@ -95,6 +113,14 @@ def chat_json(
                 # Last attempt: normalize so callers only need to catch LLMError.
                 raise LLMError(f"chat failed with {mdl}: {e}") from e
             continue
+        # Notify the caller about the successful response so they can record
+        # usage. Failures here must not break the result.
+        if on_usage is not None:
+            try:
+                on_usage(mdl, feature, resp)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("on_usage callback failed: %s", e)
+        return data
 
     raise LLMError(f"all chat models failed; last error: {last_err}") from last_err
 
@@ -128,12 +154,20 @@ def chat_stream(
     fallback_model: str | None = None,
     temperature: float = 0.3,
     timeout: int = 60,
+    feature: str = "other",
+    on_usage: Any | None = None,
 ) -> Iterator[str]:
     """Yield free-text completion deltas token-by-token (streaming, no JSON).
 
     The model/api key is selected before streaming begins. No retry is
     attempted once tokens are flowing — an error is raised so the caller can
     emit it on the stream.
+
+    With ``stream_options={"include_usage": True}`` the final chunk carries
+    a ``usage`` block; ``on_usage`` is invoked with that chunk so callers
+    can record tokens (see :mod:`carrel.usage`). Fired eagerly on the
+    first chunk that has a usage block so the record is not lost if the
+    consumer breaks early.
     """
     mdl, api_key = _select_model(model, fallback_model)
 
@@ -147,8 +181,17 @@ def chat_stream(
             timeout=timeout,
             api_key=api_key,
             stream=True,
+            stream_options={"include_usage": True},
         )
         for chunk in resp:
+            # Some providers (e.g. DeepSeek) put the usage block on the
+            # very last chunk; record it eagerly in case the consumer
+            # breaks the loop before the generator finishes.
+            if on_usage is not None and getattr(chunk, "usage", None) is not None:
+                try:
+                    on_usage(mdl, feature, chunk)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("on_usage callback failed: %s", e)
             try:
                 delta = chunk.choices[0].delta.content
             except (AttributeError, IndexError, KeyError):
@@ -167,8 +210,12 @@ def _chat_with_retry(
     temperature: float,
     timeout: int,
     max_retries: int,
-) -> dict[str, Any]:
-    """One model's completion call with retry on transient errors."""
+) -> tuple[dict[str, Any], Any]:
+    """One model's completion call with retry on transient errors.
+
+    Returns ``(parsed_dict, raw_response)`` so callers can inspect
+    ``raw_response.usage`` for token accounting.
+    """
     from litellm import completion  # imported lazily so tests without keys work
 
     last_err: Exception | None = None
@@ -183,7 +230,7 @@ def _chat_with_retry(
                 response_format={"type": "json_object"},
             )
             content = resp.choices[0].message.content
-            return _parse_json(content)
+            return _parse_json(content), resp
         except Exception as e:  # noqa: BLE001
             last_err = e
             transient = embeddings._is_transient(e)

@@ -28,7 +28,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import embeddings, llm
+from carrel import embeddings, llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import WikiKind, WikiPage, WikiSource
 from carrel.pipeline.summarize import _prepare_body
@@ -77,6 +77,25 @@ _SYSTEM_PROMPT = (
     "- Respond with ONLY a JSON object of the form: "
     '{"summary": "...", "why_it_matters": "...", "confidence": 0.0}'
 )
+
+
+def _summarize_compile_io(data: dict, body: str) -> str:
+    """Compact summary for the stepper IO panel."""
+    summary = (data.get("summary") or "").strip()
+    if summary:
+        lines = [f"summary: {summary}"]
+        for key in ("stance", "evidence", "key_papers"):
+            v = data.get(key)
+            if isinstance(v, list):
+                for item in v[:3]:
+                    if isinstance(item, str) and item.strip():
+                        lines.append(f"{key}: {item.strip()}")
+        return "\n".join(lines)
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("---"):
+            return s
+    return "(empty)"
 
 
 def _paper_snippet(idx: int, paper: Any) -> str:
@@ -385,6 +404,8 @@ def compile_question(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="wiki_question",
+            on_usage=usage.make_usage_callback(session, feature="wiki_question"),
         )
     except llm.LLMError as e:
         raise QuestionError(str(e)) from e
@@ -461,7 +482,13 @@ def compile_question(
         session.commit()
 
     _reindex.recompute_backlinks(session)
-    _emit(detail=f"Compiled {candidate.question_display}")
+    _emit(
+        detail=f"Compiled {candidate.question_display}",
+        io={
+            "input": prompt,
+            "output": _summarize_compile_io(data, body),
+        },
+    )
     logger.info("compiled question page %s (%s)", slug, candidate.question_display)
     return page
 

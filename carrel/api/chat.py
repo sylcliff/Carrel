@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from carrel import embeddings as emb
-from carrel import llm
+from carrel import llm, usage
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
 from carrel.models import ChatMessage, Chunk, Paper
@@ -258,6 +258,10 @@ def paper_chat(
                 fallback_model=fallback,
                 temperature=temperature,
                 timeout=timeout,
+                feature="paper_chat",
+                on_usage=usage.make_usage_callback(
+                    session, feature="paper_chat", paper_id=paper_id,
+                ),
             ):
                 yield _event({"t": delta})
         except Exception as e:  # noqa: BLE001 - surface any LLM error on the stream

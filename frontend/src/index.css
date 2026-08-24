@@ -73,7 +73,8 @@
   }
   /* Intra-document references: less visually loud than external links. */
   .md-body a.cite,
-  .md-body a.xref {
+  .md-body a.xref,
+  .md-body a.wikilink {
     @apply no-underline;
     color: hsl(var(--primary));
     background-color: hsl(var(--primary) / 0.08);
@@ -81,7 +82,8 @@
     padding: 0 3px;
   }
   .md-body a.cite:hover,
-  .md-body a.xref:hover {
+  .md-body a.xref:hover,
+  .md-body a.wikilink:hover {
     @apply underline;
     background-color: hsl(var(--primary) / 0.16);
   }

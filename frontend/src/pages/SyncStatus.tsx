@@ -21,6 +21,8 @@ const KIND_LABEL: Record<string, string> = {
   scholar_dedup: "Scholar dedup",
   remote_fill: "Remote fill",
   publication_check: "Publication check",
+  wiki_compile: "Wiki compile",
+  wiki_recompile: "Wiki recompile",
 };
 const KIND_KEYS = Object.keys(KIND_LABEL) as Array<keyof typeof KIND_LABEL>;
 type KindFilter = "all" | (typeof KIND_KEYS)[number];

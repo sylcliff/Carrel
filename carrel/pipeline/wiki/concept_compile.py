@@ -19,7 +19,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import embeddings, llm
+from carrel import embeddings, llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import WikiKind, WikiPage, WikiSource
 from carrel.pipeline.summarize import _prepare_body
@@ -61,6 +61,26 @@ _SYSTEM_PROMPT = (
     "- Respond with ONLY a JSON object of the form: "
     '{"summary": "...", "tags": [...], "confidence": 0.0}'
 )
+
+
+def _summarize_compile_io(data: dict, body: str) -> str:
+    """Compact summary for the stepper IO panel."""
+    summary = (data.get("summary") or "").strip()
+    if summary:
+        lines = [f"summary: {summary}"]
+        for key in ("definition", "mechanism", "evidence", "open_questions"):
+            v = data.get(key)
+            if isinstance(v, list):
+                for item in v[:3]:
+                    if isinstance(item, str) and item.strip():
+                        lines.append(f"{key}: {item.strip()}")
+        return "\n".join(lines)
+    # Fallback: first non-heading line of the body.
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and not s.startswith("---"):
+            return s
+    return "(empty)"
 
 
 def _paper_snippet(idx: int, paper: Any) -> str:
@@ -363,6 +383,8 @@ def compile_concept(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="wiki_concept",
+            on_usage=usage.make_usage_callback(session, feature="wiki_concept"),
         )
     except llm.LLMError as e:
         raise ConceptError(str(e)) from e
@@ -436,7 +458,13 @@ def compile_concept(
         session.commit()
 
     _reindex.recompute_backlinks(session)
-    _emit(detail=f"Compiled {candidate.term_display}")
+    _emit(
+        detail=f"Compiled {candidate.term_display}",
+        io={
+            "input": prompt,
+            "output": _summarize_compile_io(data, body),
+        },
+    )
     logger.info("compiled concept page %s (%s)", slug, candidate.term_display)
     return page
 

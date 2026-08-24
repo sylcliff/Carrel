@@ -123,6 +123,12 @@ export interface WikiBacklink {
   title: string;
 }
 
+export interface WikiSource {
+  kind: string;
+  slug: string;
+  title: string;
+}
+
 export interface WikiPageSummary {
   id: number;
   kind: string;
@@ -348,6 +354,19 @@ export const saveChatMessages = (id: string, messages: ChatTurn[]) =>
     { method: "PUT", body: JSON.stringify({ messages }) },
   );
 
+// ---- Wiki-wide chat transcript (server-persisted) ----
+
+export const getWikiChatMessages = () =>
+  request<{ messages: ChatMessage[]; updated_at: string | null }>(
+    `/wiki/chat/messages`,
+  );
+
+export const saveWikiChatMessages = (messages: ChatTurn[]) =>
+  request<{ messages: ChatMessage[]; updated_at: string | null }>(
+    `/wiki/chat/messages`,
+    { method: "PUT", body: JSON.stringify({ messages }) },
+  );
+
 // ---- Annotations: favorites, notes, tags ----
 
 export interface Tag {
@@ -558,6 +577,48 @@ export const runScheduledJob = (jobId: string) =>
     `/schedule/${encodeURIComponent(jobId)}/run`,
     { method: "POST" },
   );
+
+// -------- Settings (M12) --------
+
+// One field on a SerialisedSection that .env is overriding. env_value is
+// only populated for non-secret env vars; for secret overrides
+// (OPENALEX_API_KEY, S2_API_KEY) it's null and the UI shows a generic
+// "set in .env" badge.
+export interface EnvOverride {
+  env_var: string;
+  env_value?: string | null;
+}
+
+export interface SerialisedSection {
+  values: Record<string, unknown>;
+  env_overrides: Record<string, EnvOverride>;
+  requires_restart: boolean;
+}
+
+export interface EnvEntry {
+  name: string;
+  label: string;
+  is_secret: boolean;
+  is_set: boolean;
+  value?: string | null;
+}
+
+export interface Settings {
+  yaml_path: string;
+  sections: Record<string, SerialisedSection>;
+  env: EnvEntry[];
+  restart_required_sections: string[];
+}
+
+export const getSettings = () => request<Settings>("/settings");
+
+export const updateSettings = (
+  sections: Record<string, Record<string, unknown>>,
+) =>
+  request<Settings>("/settings", {
+    method: "PATCH",
+    body: JSON.stringify({ sections }),
+  });
 
 // -------- Search (M5) --------
 
@@ -894,3 +955,61 @@ export const importPaper = (body: {
     method: "POST",
     body: JSON.stringify(body),
   });
+
+// ---- Token usage (M13) ----
+
+export interface UsageSummary {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  calls: number;
+}
+
+export interface UsageBucket {
+  key: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  calls: number;
+}
+
+export interface UsageDay {
+  day: string; // YYYY-MM-DD, oldest first
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  calls: number;
+}
+
+export interface UsageRecent {
+  id: number;
+  created_at: string | null;
+  model: string;
+  feature: string;
+  job_id: number | null;
+  paper_id: string | null;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export const getUsageSummary = (sinceDays?: number) => {
+  const q = sinceDays ? `?since_days=${sinceDays}` : "";
+  return request<UsageSummary>(`/usage/summary${q}`);
+};
+
+export const getUsageByModel = (sinceDays?: number) => {
+  const q = sinceDays ? `?since_days=${sinceDays}` : "";
+  return request<UsageBucket[]>(`/usage/by-model${q}`);
+};
+
+export const getUsageByFeature = (sinceDays?: number) => {
+  const q = sinceDays ? `?since_days=${sinceDays}` : "";
+  return request<UsageBucket[]>(`/usage/by-feature${q}`);
+};
+
+export const getUsageByDay = (days = 30) =>
+  request<UsageDay[]>(`/usage/by-day?days=${days}`);
+
+export const getUsageRecent = (limit = 20) =>
+  request<UsageRecent[]>(`/usage/recent?limit=${limit}`);

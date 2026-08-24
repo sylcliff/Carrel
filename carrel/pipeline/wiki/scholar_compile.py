@@ -33,7 +33,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import embeddings, llm
+from carrel import embeddings, llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import WikiKind, WikiPage, WikiSource
 from carrel.pipeline.summarize import _prepare_body
@@ -90,6 +90,27 @@ _SYSTEM_PROMPT = (
     '"key_collaborators": [...], '
     '"tags": [...], "confidence": 0.0}'
 )
+
+
+def _summarize_scholar_io(data: dict, body: str) -> str:
+    """Compact summary of the LLM result + first lines of the rendered body."""
+    bits: list[str] = []
+    summary = (data.get("summary") or "").strip()
+    if summary:
+        bits.append(f"summary: {summary}")
+    lines = (data.get("research_lines") or [])[:3]
+    for line in lines:
+        if line:
+            bits.append(f"line: {line}")
+    if not bits:
+        # Fall back to the first 3 non-empty lines of the rendered markdown.
+        for line in body.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("---"):
+                bits.append(s)
+                if len(bits) >= 3:
+                    break
+    return "\n".join(bits) if bits else "(empty)"
 
 
 def _paper_snippet(idx: int, paper: Any) -> str:
@@ -594,6 +615,8 @@ def compile_scholar(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="wiki_scholar",
+            on_usage=usage.make_usage_callback(session, feature="wiki_scholar"),
         )
     except llm.LLMError as e:
         raise ScholarError(str(e)) from e
@@ -695,7 +718,13 @@ def compile_scholar(
         session.commit()
 
     _reindex.recompute_backlinks(session)
-    _emit(detail=f"Compiled {name}")
+    _emit(
+        detail=f"Compiled {name}",
+        io={
+            "input": prompt,
+            "output": _summarize_scholar_io(data, body),
+        },
+    )
     logger.info("compiled scholar page %s (%s)", slug, name)
     return page
 

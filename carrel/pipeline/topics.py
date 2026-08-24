@@ -31,7 +31,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, func, select
 
-from carrel import llm
+from carrel import llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperTopic, Topic
 
@@ -327,6 +327,10 @@ def topics_paper(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="topics",
+            on_usage=usage.make_usage_callback(
+                session, feature="topics", paper_id=paper.id,
+            ),
         )
     except llm.LLMError as e:
         raise TopicsError(str(e)) from e

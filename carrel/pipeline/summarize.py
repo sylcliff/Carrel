@@ -33,7 +33,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import llm
+from carrel import llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
 
@@ -215,6 +215,10 @@ def summarize_paper(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="summarize",
+            on_usage=usage.make_usage_callback(
+                session, feature="summarize", paper_id=paper.id,
+            ),
         )
     except llm.LLMError as e:
         raise SummarizeError(str(e)) from e

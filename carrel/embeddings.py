@@ -27,6 +27,8 @@ _KEY_ENV = {
     "volcengine": "VOLCANO_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_AUTH_TOKEN",  # Anthropic SDK convention; falls back
+                                           # to ANTHROPIC_API_KEY at litellm level
 }
 
 

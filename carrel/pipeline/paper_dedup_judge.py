@@ -290,6 +290,7 @@ class LLMJudge:
         return verdict
 
     def _call_llm(self, a: Paper, b: Paper) -> PaperPairVerdict:
+        from carrel import usage as _usage
         try:
             raw = chat_json(
                 [
@@ -299,6 +300,10 @@ class LLMJudge:
                 model=self.model,
                 fallback_model=self.fallback,
                 temperature=0.0,
+                feature="dedup_judge",
+                on_usage=_usage.make_usage_callback(
+                    self.session, feature="dedup_judge",
+                ),
             )
         except LLMError as e:
             logger.warning("LLM judge call failed: %s", e)

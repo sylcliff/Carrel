@@ -116,6 +116,15 @@ class LLMConfig(BaseModel):
     # markdown fed as context, after stripping image markup.
     chat_fulltext_chars: int = 24000
 
+    # ---- Wiki-wide RAG chat (M12) ----
+    # Same model family as the per-paper chat; the context is the union of the
+    # top-k wiki pages by embedding similarity (full bodies read from disk).
+    # chat_model/chat_fallback default to the per-paper chat chain when None.
+    wiki_chat_top_k: int = 6
+    # Per-page cap when assembling the <wiki-context> block (after stripping
+    # frontmatter). Keeps the total prompt bounded even on long scholar pages.
+    wiki_chat_fulltext_chars: int = 4000
+
     # ---- Paper dedup LLM judge (M10.6) ----
     # paper_dedup_judge_model defaults to the summarizer so the LLM judge uses
     # whatever model is already authenticated. paper_dedup_judge_fallback

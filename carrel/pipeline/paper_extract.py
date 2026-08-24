@@ -34,7 +34,7 @@ from typing import Any
 
 from sqlmodel import Session, func, select
 
-from carrel import chunking, llm
+from carrel import chunking, llm, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperConcept, PaperQuestion, PaperStatus
 
@@ -262,6 +262,24 @@ def _coerce_items(raw: Any, kind: str) -> list[dict[str, str]]:
     return out
 
 
+def _summarize_extract(
+    concepts: list[dict[str, str]], questions: list[dict[str, str]]
+) -> str:
+    """Compact, human-readable digest of an extraction result for the stepper."""
+    lines: list[str] = []
+    for c in concepts[:8]:
+        term = (c.get("term") or c.get("display") or "").strip()
+        if term:
+            lines.append(f"concept: {term}")
+    for q in questions[:8]:
+        text = (q.get("question") or q.get("display") or "").strip()
+        if text:
+            lines.append(f"question: {text}")
+    if not lines:
+        return "(no items extracted)"
+    return "\n".join(lines)
+
+
 def _verify_quotes(items: list[dict[str, str]], body: str) -> list[dict[str, str]]:
     """Keep only items whose ``quote`` is a substring of ``body``.
 
@@ -439,6 +457,10 @@ def extract_paper(
             fallback_model=cfg.llm.fallback_model,
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
+            feature="extract",
+            on_usage=usage.make_usage_callback(
+                session, feature="extract", paper_id=paper.id,
+            ),
         )
     except llm.LLMError as e:
         raise PaperExtractError(str(e)) from e
@@ -458,7 +480,15 @@ def extract_paper(
     c_written, q_written = _write_rows(
         session, paper_id=paper.id, concepts=concepts, questions=questions
     )
-    _emit(detail=f"Extracted {c_written} concepts, {q_written} questions")
+    # Surface a short input/output snippet pair so the wiki stepper can show
+    # *what* the model saw and produced for this paper — not just counts.
+    _emit(
+        detail=f"Extracted {c_written} concepts, {q_written} questions",
+        io={
+            "input": body,
+            "output": _summarize_extract(concepts, questions),
+        },
+    )
     logger.info("paper extract %s: %d concepts, %d questions", paper.id, c_written, q_written)
     return paper
 

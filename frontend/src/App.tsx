@@ -10,7 +10,9 @@ import Scholars from "@/pages/Scholars";
 import ScholarDetail from "@/pages/ScholarDetail";
 import Subscriptions from "@/pages/Subscriptions";
 import SyncStatus from "@/pages/SyncStatus";
+import Settings from "@/pages/Settings";
 import Topics from "@/pages/Topics";
+import Usage from "@/pages/Usage";
 import WikiIndex from "@/pages/WikiIndex";
 import WikiPageList from "@/pages/WikiPageList";
 import WikiPageDetail from "@/pages/WikiPageDetail";
@@ -31,6 +33,8 @@ function Header() {
           <Link to="/wiki" className="hover:text-foreground">Wiki</Link>
           <Link to="/subscriptions" className="hover:text-foreground">Subscriptions</Link>
           <Link to="/sync" className="hover:text-foreground">Sync</Link>
+          <Link to="/usage" className="hover:text-foreground">Usage</Link>
+          <Link to="/settings" className="hover:text-foreground">Settings</Link>
         </nav>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -69,6 +73,8 @@ export default function App() {
           <Route path="/docs" element={<Docs />} />
           <Route path="/subscriptions" element={<Subscriptions />} />
           <Route path="/sync" element={<SyncStatus />} />
+          <Route path="/usage" element={<Usage />} />
+          <Route path="/settings" element={<Settings />} />
           <Route path="/papers/:id" element={<PaperDetail />} />
         </Routes>
       </div>

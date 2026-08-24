@@ -33,11 +33,14 @@ from carrel.api import (
     scholar_dedup,
     scholars,
     search,
+    settings,
     subscriptions,
     summarize,
     sync,
     topics,
+    usage,
     wiki,
+    wiki_chat,
 )
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
@@ -162,6 +165,7 @@ def create_app() -> FastAPI:
     app.include_router(topics.router)
     app.include_router(scholars.router)
     app.include_router(wiki.router)
+    app.include_router(wiki_chat.router)
     app.include_router(paper_extract.router)
     app.include_router(authors_backfill.router)
     app.include_router(scholar_dedup.router)
@@ -169,6 +173,8 @@ def create_app() -> FastAPI:
     app.include_router(embed.router)
     app.include_router(search.router)
     app.include_router(chat.router)
+    app.include_router(settings.router)
+    app.include_router(usage.router)
 
     # Serve parsed markdown images (and PDFs) straight from storage. The
     # bootstrap step above created the directory, so StaticFiles can mount it.

@@ -301,6 +301,12 @@ def _stage_did_work(stage: str, counts: dict) -> bool:
 
 
 def _make_progress_cb(session: Session, job_id: int):
+    # How many recent input/output snippets to keep per stage. Snippets are
+    # truncated to ``_IO_SNIPPET_CHARS`` so a long compile does not bloat
+    # ``Job.stats`` (which is a JSON column on the same row).
+    _IO_RECENT_KEEP = 3
+    _IO_SNIPPET_CHARS = 500
+
     def _cb(progress: dict) -> None:
         job = session.get(Job, job_id)
         if job is None:
@@ -310,16 +316,47 @@ def _make_progress_cb(session: Session, job_id: int):
         # any prior stage results so a later stage's events don't clobber
         # the earlier ones.
         stage = progress.get("stage", "wiki_compile")
+        idx = progress.get("index")
+        total = progress.get("total")
         if stage and stage != "wiki_compile":
             sub = {**(stats.get(stage) or {})}
             sub.update({k: v for k, v in progress.items()
-                        if k not in {"stage", "index", "total", "name", "detail"}})
+                        if k not in {"stage", "index", "total", "name",
+                                     "detail", "io", "paper_title",
+                                     "term", "title", "key"}})
+            # Mirror live progress so the frontend stepper can render a bar
+            # without re-parsing ``job.message``. Additive: missing on old
+            # events, treated as 0 by the UI.
+            if idx is not None:
+                sub["current_index"] = idx
+            if total is not None:
+                sub["current_total"] = total
+            # Optional input/output snippet pair. The pipeline emits this on
+            # the final event of each item (after the LLM call) so the UI
+            # can show *what* the model saw and produced, not just counts.
+            io = progress.get("io")
+            if isinstance(io, dict):
+                item_name = (
+                    progress.get("name")
+                    or progress.get("paper_title")
+                    or progress.get("title")
+                    or progress.get("key")
+                    or progress.get("term")
+                    or ""
+                )
+                snippet_in = str(io.get("input", ""))[:_IO_SNIPPET_CHARS]
+                snippet_out = str(io.get("output", ""))[:_IO_SNIPPET_CHARS]
+                recent = list(sub.get("recent") or [])
+                recent.append({
+                    "name": str(item_name)[:200],
+                    "input": snippet_in,
+                    "output": snippet_out,
+                })
+                sub["recent"] = recent[-_IO_RECENT_KEEP:]
             stats[stage] = sub
         # Top-level "stage" reports the most-recent phase for the UI badge.
         stats["stage"] = stage
         detail = progress.get("detail", "")
-        idx = progress.get("index")
-        total = progress.get("total")
         name = progress.get("name", "")
         if detail:
             stats["detail"] = detail

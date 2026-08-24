@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { getJob, getWikiPageBySlug, recompileWikiPage, type Job, type WikiPageDetail as WikiDetail } from "@/api/client";
 import MarkdownReader from "@/components/MarkdownReader";
+import { WikiCompileStepper } from "@/components/WikiCompileStepper";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 
@@ -62,7 +63,7 @@ export default function WikiPageDetail() {
         <Button variant="outline" onClick={recompile} disabled={!!job && !TERMINAL.has(job.status)}><RefreshCw className={`mr-2 h-4 w-4 ${job && !TERMINAL.has(job.status) ? "animate-spin" : ""}`} /> Recompile</Button>
       </div>
       <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground"><span>{Math.round(page.confidence * 100)}% confidence</span><span>{page.evidence_count} evidence</span>{page.compiled_at && <span>Compiled {new Date(page.compiled_at).toLocaleDateString()}</span>}<span className="break-all">{page.path}</span></div>
-      {job && <p className="text-sm text-muted-foreground">{job.status}{job.message ? ` · ${job.message}` : ""}</p>}
+      {job && <WikiCompileStepper job={job} />}
       {error && <p className="text-sm text-red-600">{error}</p>}
       <Card><CardContent className="p-5"><MarkdownReader body={page.body} mdPath={page.path} internal /></CardContent></Card>
       <div className="grid gap-5 lg:grid-cols-2">

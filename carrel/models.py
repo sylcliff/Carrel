@@ -97,6 +97,36 @@ class JobStatus(str, Enum):
     failed = "failed"
 
 
+# ------------------ Token usage ------------------
+
+
+class TokenUsage(SQLModel, table=True):
+    """One LLM call's token usage.
+
+    Populated from the ``usage`` block of litellm completions. ``feature``
+    is a free-form string naming the calling subsystem (e.g. "summarize",
+    "chat", "wiki_compile", "concept_compile"); it powers the by-feature
+    breakdown on the Usage page.
+    """
+
+    __tablename__ = "token_usage"
+
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False, index=True),
+    )
+    model: str = Field(max_length=120, index=True)
+    feature: str = Field(max_length=64, index=True)
+    # Optional context: which job / paper the call belonged to.  Both are
+    # nullable so chat calls (no job) and ad-hoc calls can still record.
+    job_id: int | None = Field(default=None, index=True)
+    paper_id: str | None = Field(default=None, index=True, max_length=64)
+    prompt_tokens: int = Field(default=0)
+    completion_tokens: int = Field(default=0)
+    total_tokens: int = Field(default=0)
+
+
 # ------------------ Tables ------------------
 
 
@@ -340,6 +370,30 @@ class ChatMessage(SQLModel, table=True):
 
     id: int | None = Field(default=None, primary_key=True)
     paper_id: str = Field(foreign_key="papers.id", index=True, max_length=64)
+    role: str = Field(max_length=16)  # "user" | "assistant"
+    content: str = Field(sa_column=Column(Text))
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class WikiChatMessage(SQLModel, table=True):
+    """One turn in the global wiki chat transcript (server-persisted).
+
+    There is exactly one conversation about the whole wiki (no per-page
+    transcript), so the table has no foreign key to a specific page. The
+    whole transcript is replaced on each save (whole-document PUT, like
+    :class:`ChatMessage`).
+    """
+
+    __tablename__ = "wiki_chat_messages"
+
+    id: int | None = Field(default=None, primary_key=True)
     role: str = Field(max_length=16)  # "user" | "assistant"
     content: str = Field(sa_column=Column(Text))
     created_at: datetime = Field(
