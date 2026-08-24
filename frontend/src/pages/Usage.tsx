@@ -20,7 +20,7 @@ type WindowKey = "7" | "30" | "all";
 const WINDOW_OPTIONS: { key: WindowKey; label: string; sinceDays?: number; days: number }[] = [
   { key: "7", label: "Last 7 days", sinceDays: 7, days: 7 },
   { key: "30", label: "Last 30 days", sinceDays: 30, days: 30 },
-  { key: "all", label: "All time", days: 90 },
+  { key: "all", label: "All time · 90d chart", days: 90 },
 ];
 
 function fmt(n: number): string {

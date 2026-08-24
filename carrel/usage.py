@@ -103,25 +103,38 @@ def make_usage_callback(
 ) -> Callable[[str, str, Any], None]:
     """Return a closure suitable for ``llm.chat_json(..., on_usage=...)``.
 
-    The closure records a :class:`TokenUsage` row using :func:`record_usage`.
-    DB failures are logged and swallowed so the LLM call's return value is
-    never blocked by accounting.
+    The closure records a :class:`TokenUsage` row using :func:`record_usage`
+    AND commits the row in its own transaction, so accounting survives even
+    if the LLM caller's outer transaction later rolls back. DB failures are
+    logged and swallowed so the LLM call's return value is never blocked
+    by accounting.
+
+    The commit happens on the caller's session, so any work the caller had
+    pending at the time of the LLM call is also flushed. This is acceptable
+    for our single-user app — accounting persistence outweighs outer-tx
+    atomicity — and avoids the deadlock risk of opening a second connection
+    to the same in-memory SQLite used in tests.
     """
 
     def _cb(model: str, _feature: str, resp: Any) -> None:
-        usage = extract_usage(resp)
-        if not usage:
+        u = extract_usage(resp)
+        if not u:
             return
         try:
             record_usage(
                 session,
                 model=model,
                 feature=feature,
-                usage=usage,
+                usage=u,
                 job_id=job_id,
                 paper_id=paper_id,
             )
+            session.commit()
         except Exception as e:  # noqa: BLE001 - accounting must not break the LLM
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001 - rollback failure is non-fatal
+                pass
             logger.warning("record_usage failed: %s", e)
 
     return _cb
@@ -136,19 +149,28 @@ def _since(days: int) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
 
 
+def _day_key(v: Any) -> str:
+    """Normalize a day-bucket value to an ISO date string.
+
+    SQLite returns the cast as a string (``'2024-01-15'``); PostgreSQL returns
+    a ``datetime.date``. Both render to the same key via ``isoformat()``.
+    """
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
 def summary(session: Session, *, since_days: int | None = None) -> dict[str, Any]:
     """Totals + per-bucket breakdown. ``since_days=None`` returns all-time."""
-    base = select(TokenUsage)
+    stmt = select(
+        func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
+        func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
+        func.coalesce(func.sum(TokenUsage.total_tokens), 0),
+        func.count(TokenUsage.id),
+    )
     if since_days is not None:
-        base = base.where(TokenUsage.created_at >= _since(since_days))
-    total = session.exec(
-        select(
-            func.coalesce(func.sum(TokenUsage.prompt_tokens), 0),
-            func.coalesce(func.sum(TokenUsage.completion_tokens), 0),
-            func.coalesce(func.sum(TokenUsage.total_tokens), 0),
-            func.count(TokenUsage.id),
-        ).where(*[c for c in base._where_criteria])  # type: ignore[attr-defined]
-    ).one()
+        stmt = stmt.where(TokenUsage.created_at >= _since(since_days))
+    total = session.exec(stmt).one()
     return {
         "prompt_tokens": int(total[0] or 0),
         "completion_tokens": int(total[1] or 0),
@@ -206,8 +228,15 @@ def by_day(session: Session, *, days: int = 30) -> list[dict[str, Any]]:
     today = datetime.now(UTC).date()
     series = [today - timedelta(days=days - 1 - i) for i in range(days)]
     start = datetime.combine(series[0], datetime.min.time()).replace(tzinfo=UTC)
-    # Pull a coarse per-day aggregation in UTC and merge.
-    day_expr = func.strftime("%Y-%m-%d", TokenUsage.created_at)
+    # Use ``func.date(...)`` for cross-dialect bucketing.
+    # - SQLite: ``date('2026-08-23 12:34:56')`` returns the text ``'2026-08-23'``
+    # - PostgreSQL: ``date(timestamp)`` returns a ``date`` value
+    # Both render to the same key via :func:`_day_key`. We deliberately do
+    # NOT use ``cast(... AS DATE)`` here: SQLite's CAST is a no-op for the
+    # date part of a timestamp string, which then trips SQLAlchemy's Date
+    # result processor (it tries ``date.fromisoformat`` on a non-ISO value).
+    # We also don't use ``func.strftime`` since it doesn't exist on Postgres.
+    day_expr = func.date(TokenUsage.created_at)
     rows = session.exec(
         select(
             day_expr.label("day"),
@@ -221,7 +250,7 @@ def by_day(session: Session, *, days: int = 30) -> list[dict[str, Any]]:
         .order_by(day_expr)
     ).all()
     by_day_map: dict[str, tuple[int, int, int, int]] = {
-        str(r[0]): (int(r[1] or 0), int(r[2] or 0), int(r[3] or 0), int(r[4] or 0))
+        _day_key(r[0]): (int(r[1] or 0), int(r[2] or 0), int(r[3] or 0), int(r[4] or 0))
         for r in rows
     }
     out: list[dict[str, Any]] = []
