@@ -213,3 +213,69 @@ def test_batch_returns_all_compiled_at_threshold_one(session, tmp_path, monkeypa
     by_slug = {r.slug: r for r in rows}
     assert by_slug["concept-a"].stub is False
     assert by_slug["concept-b"].stub is False
+
+
+def test_related_scholars_section_renders(session, tmp_path, monkeypatch):
+    """A concept page must surface the contributing scholars as a deterministic
+    '## Related scholars' footer with links into the scholar wiki."""
+    cfg = _cfg(tmp_path)
+    # Three papers from two distinct authors — the section should list both.
+    for i, authors in enumerate([
+        [{"name": "Alice Wu", "openalex_author_id": "A100", "affiliation": "X"}],
+        [{"name": "Alice Wu", "openalex_author_id": "A100"}],
+        [{"name": "Bob Tang", "openalex_author_id": "A200", "affiliation": "Y"}],
+    ]):
+        pid = f"W{i+1}"
+        p = Paper(
+            id=pid, id_kind="openalex", title=f"RAG study {i+1}",
+            abstract="Retrieval improves answers.",
+            tldr_en="Grounded generation helps factuality.",
+            publication_date=date(2024, 1, 1),
+            authors=authors,
+            status="summarized", oa_status="oa", source="openalex", in_library=True,
+            created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+        )
+        session.add(p)
+        session.commit()
+        _add_concept(
+            session, pid, "retrieval-augmented generation",
+            display="Retrieval-Augmented Generation",
+        )
+    _fakes(monkeypatch)
+    page = cc.compile_concept(
+        session, cfg, "retrieval-augmented generation"
+    )
+    full = tmp_path / page.path
+    body = _frontmatter.parse(full.read_text())[1]
+    assert "## Related scholars" in body
+    # Alice Wu is on two papers → must sort first; Bob Tang second.
+    alice_idx = body.find("[[Alice Wu]]")
+    bob_idx = body.find("[[Bob Tang]]")
+    assert alice_idx != -1 and bob_idx != -1
+    assert alice_idx < bob_idx
+    # Link target uses the scholar slug for the A-ID.
+    assert "../scholars/A100.md" in body
+    assert "../scholars/A200.md" in body
+
+
+def test_related_scholars_omitted_when_no_authors(session, tmp_path, monkeypatch):
+    """No authors on the contributing papers → no 'Related scholars' footer
+    (the page is fine without it; the /scholars browse still surfaces the
+    scholar rows)."""
+    cfg = _cfg(tmp_path)
+    p = Paper(
+        id="W1", id_kind="openalex", title="Anon study",
+        abstract="Anonymous.", tldr_en="Anonymized.",
+        publication_date=date(2024, 1, 1),
+        authors=[],
+        status="summarized", oa_status="oa", source="openalex", in_library=True,
+        created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+    )
+    session.add(p)
+    session.commit()
+    _add_concept(session, "W1", "retrieval-augmented generation",
+                display="Retrieval-Augmented Generation")
+    _fakes(monkeypatch)
+    page = cc.compile_concept(session, cfg, "retrieval-augmented generation")
+    body = _frontmatter.parse((tmp_path / page.path).read_text())[1]
+    assert "## Related scholars" not in body

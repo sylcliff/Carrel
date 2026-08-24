@@ -262,3 +262,70 @@ def test_batch_returns_all_compiled_at_threshold_one(session, tmp_path, monkeypa
     assert by_slug["what-is-question-a"].question_status == "open"
     assert by_slug["what-is-question-b"].stub is False
     assert by_slug["what-is-question-b"].question_status == "open"
+
+
+def test_related_scholars_section_renders(session, tmp_path, monkeypatch):
+    """A question page must surface the contributing scholars as a
+    '## Related scholars' footer that links into the scholar wiki."""
+    cfg = _cfg(tmp_path)
+    for i, authors in enumerate([
+        [{"name": "Alice Wu", "openalex_author_id": "A100", "affiliation": "X"}],
+        [{"name": "Alice Wu", "openalex_author_id": "A100"}],
+        [{"name": "Bob Tang", "openalex_author_id": "A200", "affiliation": "Y"}],
+    ]):
+        pid = f"W{i+1}"
+        p = Paper(
+            id=pid, id_kind="openalex", title=f"RAG study {i+1}",
+            abstract="Retrieval improves answers.",
+            tldr_en="Grounded generation helps factuality.",
+            publication_date=date(2024, 1, 1),
+            authors=authors,
+            status="summarized", oa_status="oa", source="openalex", in_library=True,
+            created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+        )
+        session.add(p)
+        session.commit()
+        _add_question(
+            session, pid,
+            "how can retrieval stay current with fast-moving knowledge bases",
+            display="How can retrieval stay current with fast-moving knowledge bases?",
+        )
+    _fakes(monkeypatch)
+    page = qc.compile_question(
+        session, cfg,
+        "how can retrieval stay current with fast-moving knowledge bases",
+    )
+    body = _frontmatter.parse((tmp_path / page.path).read_text())[1]
+    assert "## Related scholars" in body
+    alice_idx = body.find("[[Alice Wu]]")
+    bob_idx = body.find("[[Bob Tang]]")
+    assert alice_idx != -1 and bob_idx != -1
+    assert alice_idx < bob_idx
+    assert "../scholars/A100.md" in body
+    assert "../scholars/A200.md" in body
+
+
+def test_related_scholars_omitted_when_no_authors(session, tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    p = Paper(
+        id="W1", id_kind="openalex", title="Anon study",
+        abstract="Anonymous.", tldr_en="Anonymized.",
+        publication_date=date(2024, 1, 1),
+        authors=[],
+        status="summarized", oa_status="oa", source="openalex", in_library=True,
+        created_at=datetime.now(UTC), updated_at=datetime.now(UTC),
+    )
+    session.add(p)
+    session.commit()
+    _add_question(
+        session, "W1",
+        "how can retrieval stay current with fast-moving knowledge bases",
+        display="How can retrieval stay current with fast-moving knowledge bases?",
+    )
+    _fakes(monkeypatch)
+    page = qc.compile_question(
+        session, cfg,
+        "how can retrieval stay current with fast-moving knowledge bases",
+    )
+    body = _frontmatter.parse((tmp_path / page.path).read_text())[1]
+    assert "## Related scholars" not in body

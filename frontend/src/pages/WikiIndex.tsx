@@ -6,7 +6,6 @@ import { Card, CardContent } from "@/components/ui/card";
 import { compileWiki, getJob, listWikiPages, type Job, type WikiPageSummary } from "@/api/client";
 
 const SECTIONS = [
-  { kind: "scholar", title: "Scholars", empty: "No scholar pages yet." },
   { kind: "concept", title: "Concepts", empty: "No concept pages yet." },
   { kind: "question", title: "Questions", empty: "No question pages yet." },
 ] as const;
@@ -76,7 +75,7 @@ export default function WikiIndex() {
       {job && <p className="text-sm text-muted-foreground">{job.status}{progressText(job) ? ` · ${progressText(job)}` : ""}</p>}
       {error && <p className="text-sm text-red-600">{error}</p>}
       {loading ? <p className="text-sm text-muted-foreground">Loading…</p> : (
-        <div className="grid gap-5 lg:grid-cols-3">
+        <div className="grid gap-5 lg:grid-cols-2">
           {SECTIONS.map((section) => {
             const rows = pages.filter((page) => page.kind === section.kind);
             return (

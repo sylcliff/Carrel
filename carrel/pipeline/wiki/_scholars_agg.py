@@ -126,6 +126,21 @@ def aggregate(session: Session) -> list[ScholarSummary]:
                 if key not in aff or (year is not None and year >= aff[key][0]):
                     aff[key] = (year or 0, affiliation)
 
+    # Merge pass: name-only keys whose normalized display name matches a
+    # single A-ID key get folded into the A-ID key. This handles the
+    # common case where a person has an A-ID in some papers (e.g. those
+    # imported from OpenAlex) but not in others (e.g. those imported from
+    # Semantic Scholar before authors_backfill resolves the A-IDs). Without
+    # this the /scholars list shows two rows for the same person — one with
+    # an A-ID, one with the name-only key.
+    #
+    # Ambiguity guard: if multiple distinct A-ID keys share the same
+    # normalized display name, we can't tell which one the name-only row
+    # belongs to, so we leave the name-only key in place rather than guess.
+    _merge_name_only_into_aid(
+        names, paper_ids, citations, years, aff, has_oa
+    )
+
     out: list[ScholarSummary] = []
     for key, name_counts in names.items():
         display_name = name_counts.most_common(1)[0][0]
@@ -145,6 +160,73 @@ def aggregate(session: Session) -> list[ScholarSummary]:
 
     out.sort(key=lambda s: (-s.paper_count, -s.total_citations, s.name.lower()))
     return out
+
+
+def _merge_name_only_into_aid(
+    names: dict[str, Counter],
+    paper_ids: dict[str, set[str]],
+    citations: dict[str, int],
+    years: dict[str, list[int]],
+    aff: dict[str, tuple[int, str]],
+    has_oa: dict[str, bool],
+) -> None:
+    """Fold ``name:<x>`` keys into the matching A-ID key in-place.
+
+    See :func:`aggregate` for context. A name-only key is merged into an
+    A-ID key when the A-ID key's most-common display name normalizes to
+    the same string as the name-only key's display name, and exactly one
+    A-ID key matches (so the merge can't accidentally conflate two
+    different scholars who happen to share a name).
+    """
+    # Build normalized display name -> A-ID key, only when unambiguous.
+    name_to_aid: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for key, counts in names.items():
+        if key.startswith(NAME_KEY_PREFIX):
+            continue
+        if not counts:
+            continue
+        display = counts.most_common(1)[0][0]
+        nname = normalize_name(display)
+        if not nname:
+            continue
+        if nname in name_to_aid:
+            # Two distinct A-ID keys share the same display name — mark
+            # the name as ambiguous so we don't try to merge into either.
+            ambiguous.add(nname)
+        else:
+            name_to_aid[nname] = key
+    # Drop ambiguous matches.
+    for nname in ambiguous:
+        name_to_aid.pop(nname, None)
+
+    # Walk name-only keys once; mutate the underlying dicts so subsequent
+    # iterations in the caller see the merged view.
+    name_only_keys = [k for k in list(names) if k.startswith(NAME_KEY_PREFIX)]
+    for nk in name_only_keys:
+        nname = normalize_name(names[nk].most_common(1)[0][0]) if names[nk] else ""
+        target = name_to_aid.get(nname) if nname else None
+        if not target or target == nk:
+            continue
+        names[target].update(names[nk])
+        paper_ids[target] |= paper_ids[nk]
+        citations[target] += citations.get(nk, 0)
+        years[target].extend(years.get(nk, []))
+        if has_oa.get(nk):
+            has_oa[target] = True
+        # Keep the most recent affiliation between the two rows.
+        if nk in aff:
+            old_year, old_aff = aff[nk]
+            cur = aff.get(target)
+            if not cur or (old_year or 0) >= cur[0]:
+                aff[target] = (old_year or 0, old_aff)
+        # Drop the name-only key from every accumulator.
+        names.pop(nk, None)
+        paper_ids.pop(nk, None)
+        citations.pop(nk, None)
+        years.pop(nk, None)
+        aff.pop(nk, None)
+        has_oa.pop(nk, None)
 
 
 _aggregate = aggregate

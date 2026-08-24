@@ -30,6 +30,10 @@ from carrel.pipeline.wiki._concepts_agg import (
     aggregate,
     papers_for_term,
 )
+from carrel.pipeline.wiki._scholars_agg import (
+    NAME_KEY_PREFIX,
+    author_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,11 +94,74 @@ def _build_user_prompt(*, term_display, papers, old_body):
 # ---------------------------------------------------------------------------
 
 
-def _render_live_body(*, term_display, data, papers):
+def _related_scholars(
+    session: Session, papers: list[Any]
+) -> list[tuple[str, str]]:
+    """Return ``[(name, slug), ...]`` for scholars who authored these papers.
+
+    Walks the author lists of the given papers, groups by aggregation key
+    (A-ID when present, else name), and returns the most-frequent
+    display name per key, sorted by paper-count desc then name.  ``slug``
+    is what :func:`_slug.scholar_slug` produces so it matches the
+    on-disk page address.  The same merge semantics as
+    :func:`_scholars_agg.aggregate` apply, so an author with an A-ID in
+    some papers and without in others collapses to a single entry.
+    """
+    from collections import Counter
+    if not papers:
+        return []
+    name_counts: dict[str, Counter] = {}
+    paper_counts: dict[str, set[str]] = {}
+    for p in papers:
+        for a in p.authors or []:
+            if not isinstance(a, dict):
+                continue
+            key = author_key(a, session)
+            if not key:
+                continue
+            name = (a.get("name") or "").strip()
+            if not name:
+                continue
+            name_counts.setdefault(key, Counter())[name] += 1
+            paper_counts.setdefault(key, set()).add(p.id)
+    rows: list[tuple[int, str, str, str]] = []
+    for key, counts in name_counts.items():
+        aid = None if key.startswith(NAME_KEY_PREFIX) else key
+        display = counts.most_common(1)[0][0]
+        rows.append((
+            -len(paper_counts.get(key, set())),
+            display.lower(),
+            display,
+            _slug.scholar_slug(aid, display),
+        ))
+    rows.sort()
+    return [(name, slug) for _neg, _lname, name, slug in rows[:_MAX_RELATED_SCHOLARS]]
+
+
+# Cap on the deterministic "Related scholars" footer so a broad concept
+# (e.g. "machine learning") does not bloat the page. 10 is enough to
+# surface the principal contributors; the long tail is searchable
+# via the /scholars browse.
+_MAX_RELATED_SCHOLARS = 10
+
+
+def _render_live_body(
+    *,
+    term_display,
+    data,
+    papers,
+    related_scholars=None,
+):
     summary = str(data.get("summary") or "").strip()
     lines = [f"# {term_display}", ""]
     if summary:
         lines += ["## Summary", summary, ""]
+    if related_scholars:
+        rendered = [
+            f"- [[{name}]](../scholars/{slug}.md)"
+            for name, slug in related_scholars
+        ]
+        lines += ["## Related scholars", "\n".join(rendered), ""]
     if papers:
         lines += ["## Sources", ""]
         for i, p in enumerate(papers, start=1):
@@ -306,6 +373,7 @@ def compile_concept(
         term_display=candidate.term_display,
         data=data,
         papers=papers,
+        related_scholars=_related_scholars(session, papers),
     )
 
     # Preserve any prior user-authored section.

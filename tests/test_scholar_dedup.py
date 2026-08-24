@@ -174,6 +174,56 @@ def test_papers_for_key_includes_alias_papers(session: Session):
     assert {p.id for p in papers} == {"W1", "W2"}
 
 
+def test_aggregation_merges_name_only_into_aid(session: Session):
+    """A name-only author row for someone who appears with an A-ID in other
+    papers must collapse into the A-ID entry, not show up as a duplicate row
+    in the /scholars list.
+    """
+    session.add(_paper("W1", [{"name": "He Li", "openalex_author_id": "A1", "affiliation": "Tsinghua"}]))
+    # Same person, this time imported without an A-ID (e.g. from S2 before
+    # authors_backfill resolved it).
+    session.add(_paper("W2", [{"name": "He Li"}]))
+    session.commit()
+    _scholars_agg.invalidate_alias_cache()
+    scholars = _scholars_agg.aggregate(session)
+    he_li = [s for s in scholars if s.name == "He Li"]
+    assert len(he_li) == 1
+    assert he_li[0].key == "A1"
+    assert he_li[0].paper_count == 2
+    # has_openalex should be True because the A-ID row promoted it.
+    assert he_li[0].has_openalex is True
+
+
+def test_aggregation_keeps_name_only_when_no_aid_match(session: Session):
+    """A pure name-only author (no paper has an A-ID for that person) must
+    not be merged away — they still deserve a row on /scholars.
+    """
+    session.add(_paper("W1", [{"name": "Lone Ranger"}]))
+    session.commit()
+    _scholars_agg.invalidate_alias_cache()
+    scholars = _scholars_agg.aggregate(session)
+    lone = [s for s in scholars if s.name == "Lone Ranger"]
+    assert len(lone) == 1
+    assert lone[0].key.startswith("name:")
+    assert lone[0].has_openalex is False
+
+
+def test_aggregation_skips_merge_on_ambiguous_name(session: Session):
+    """Two different A-ID scholars who happen to share a display name: the
+    name-only row can't be safely merged into either, so it stays put.
+    """
+    session.add(_paper("W1", [{"name": "Wei Li", "openalex_author_id": "A1"}]))
+    session.add(_paper("W2", [{"name": "Wei Li", "openalex_author_id": "A2"}]))
+    # Lone name-only paper — could be either of the two Wei Lis.
+    session.add(_paper("W3", [{"name": "Wei Li"}]))
+    session.commit()
+    _scholars_agg.invalidate_alias_cache()
+    scholars = _scholars_agg.aggregate(session)
+    # Two A-ID rows + one name-only row, all three still present.
+    assert sum(1 for s in scholars if s.name == "Wei Li") == 3
+    assert sum(1 for s in scholars if s.key.startswith("name:")) == 1
+
+
 # ---------------------------------------------------------------------------
 # API tests
 # ---------------------------------------------------------------------------
