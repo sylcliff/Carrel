@@ -32,6 +32,7 @@ from carrel.api import (
     publication,
     schedule,
     scholar_dedup,
+    scholar_works_sync,
     scholars,
     search,
     search_brave,
@@ -182,6 +183,7 @@ def create_app() -> FastAPI:
     app.include_router(wiki_chat.router)
     app.include_router(paper_extract.router)
     app.include_router(authors_backfill.router)
+    app.include_router(scholar_works_sync.router)
     app.include_router(scholar_dedup.router)
     app.include_router(paper_dedup.router)
     app.include_router(embed.router)

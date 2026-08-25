@@ -230,11 +230,33 @@ export interface ScholarWork {
 export interface ScholarWorksResponse {
   items: ScholarWork[];
   next_cursor: string | null;
-  // OpenAlex's reported total work count for this author — same on every
-  // page. ``null`` when the count couldn't be read; the UI shows just
-  // "Showing N" without "of M" in that case.
+  // Cache state. ``ready`` / ``stale`` = serve from cache; ``loading``
+  // = a sync is in flight (the page should poll /sync_status until
+  // ready/failed); ``missing`` / ``failed`` = no cached rows yet
+  // (lazy-kickoff happens server-side; the frontend should also poll).
+  status: "missing" | "loading" | "ready" | "stale" | "failed";
+  // Total works the cache has for this author. ``null`` when the
+  // count couldn't be read or the sync is still in flight; the UI
+  // shows just "Showing N" without "of M" in that case.
   total: number | null;
 }
+
+export interface ScholarSyncStatus {
+  author_id: string;
+  status: "missing" | "loading" | "ready" | "stale" | "failed";
+  total_count: number | null;
+  last_full_sync_at: string | null;
+  last_error: string | null;
+}
+
+export const getScholarSyncStatus = (key: string) =>
+  request<ScholarSyncStatus>(`/scholars/${encodeURIComponent(key)}/sync_status`);
+
+export const refreshScholarWorks = (key: string, background = true) =>
+  request<Job>(
+    `/scholars/${encodeURIComponent(key)}/sync/refresh?background=${background ? "true" : "false"}`,
+    { method: "POST" },
+  );
 
 export const getScholarWorks = (
   key: string,

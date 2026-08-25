@@ -233,12 +233,29 @@ class ScholarWorkOut(BaseModel):
 
 class ScholarWorksResponse(BaseModel):
     items: list[ScholarWorkOut] = []
-    # OpenAlex's opaque next-cursor string. ``None`` when no more pages.
+    # Opaque pagination token. The cached path emits ``"offset:<n>"`` and
+    # the legacy path emitted OpenAlex's cursor; the frontend treats both
+    # opaquely and just feeds the next request's ``cursor`` query.
     next_cursor: str | None = None
-    # Total works OpenAlex has for this author (from response meta.count).
-    # ``None`` when the count couldn't be read; the UI should fall back to
-    # "Showing N" without "of M" in that case.
+    # Total works the cache has for this author. ``None`` when the
+    # count couldn't be read; the UI should fall back to "Showing N"
+    # without "of M" in that case.
     total: int | None = None
+    # Cache state. ``ready`` / ``stale`` = serve from cache; ``loading``
+    # = a sync is in flight (the page should poll /sync_status until
+    # ready/failed); ``missing`` / ``failed`` = no cached rows yet
+    # (lazy-kickoff happens server-side; the frontend should also poll).
+    status: str = "ready"
+
+
+class ScholarSyncStatusOut(BaseModel):
+    """Compact read for the scholar page's polling loop."""
+
+    author_id: str
+    status: str  # missing | loading | ready | stale | failed
+    total_count: int | None = None
+    last_full_sync_at: datetime | None = None
+    last_error: str | None = None
 
 
 # -------- LLM-compiled wiki (M8) --------

@@ -75,6 +75,7 @@ def fetch_candidates(
     subs: list[Subscription],
     *,
     lookback_hours: int = 24,
+    session: Session | None = None,
 ) -> tuple[list[PaperRecord], dict[str, str]]:
     """Run all enabled subscriptions and return (records, per_source_errors).
 
@@ -112,7 +113,7 @@ def fetch_candidates(
             errors["arxiv_categories"] = f"{type(e).__name__}: {e}"
             entries = []
         for e in entries:
-            rec = enrich_with_openalex(from_arxiv(e))
+            rec = enrich_with_openalex(from_arxiv(e), session=session)
             _merge_record(records, rec)
     if arxiv_queries:
         try:
@@ -128,7 +129,7 @@ def fetch_candidates(
             errors["arxiv_keywords"] = f"{type(e).__name__}: {e}"
             entries = []
         for e in entries:
-            rec = enrich_with_openalex(from_arxiv(e))
+            rec = enrich_with_openalex(from_arxiv(e), session=session)
             _merge_record(records, rec)
 
     # --- OpenAlex: author subscriptions -----------------------------------------
@@ -457,7 +458,9 @@ def run_sync(
     logger.info("sync start: subs=%d lookback_h=%d", len(subs), lookback_hours)
 
     try:
-        records, fetch_errors = fetch_candidates(cfg, subs, lookback_hours=lookback_hours)
+        records, fetch_errors = fetch_candidates(
+            cfg, subs, lookback_hours=lookback_hours, session=session
+        )
         logger.info("fetched %d candidate records", len(records))
         counts = upsert_records(session, records)
         counts["fetched"] = len(records)

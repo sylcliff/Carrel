@@ -82,6 +82,11 @@ class JobKind(str, Enum):
     # Per-paper LLM extraction of concepts + open questions from the parsed
     # markdown. Feeds the concept/question wiki compilations.
     paper_extract = "paper_extract"
+    # Bulk fetch + cache an OpenAlex author's full works list. Triggered when a
+    # scholar page is first visited (lazy load) or via manual "Refresh from
+    # OpenAlex". Reuses the Job / BackgroundTasks / JobOut shape that
+    # authors_backfill and citations refresh use.
+    scholar_works_sync = "scholar_works_sync"
 
 
 class WikiKind(str, Enum):
@@ -667,6 +672,109 @@ class Job(SQLModel, table=True):
         default=None, sa_column=Column(DateTime(timezone=True))
     )
     created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+# ------------------ OpenAlex persistent cache (A+B) ------------------
+
+
+class AuthorWorksSync(SQLModel, table=True):
+    """Per-author sync state for :class:`AuthorWorksCache`.
+
+    A row exists (or is inserted) for every A-ID whose works the user has
+    visited. ``status`` drives the scholar page's behaviour:
+
+      * ``missing`` — never fetched; the page should lazy-kick off a sync.
+      * ``loading`` — a sync is in flight; the page should render an empty
+        "Loading…" state and let the frontend poll until ``ready``.
+      * ``ready`` — serve from :class:`AuthorWorksCache` with zero OA calls.
+      * ``stale`` — same as ``ready`` for read purposes; set on a manual
+        "Refresh" so we can show "Re-fetching…" before the next page load.
+      * ``failed`` — last sync raised; show the empty state and let the
+        next visit retry.
+
+    A server restart must reset any ``loading`` rows to ``failed`` (see
+    :func:`carrel.db._reset_orphaned_openalex_sync`); the in-process worker
+    that owned them is gone.
+    """
+
+    __tablename__ = "author_works_sync"
+
+    author_id: str = Field(primary_key=True, max_length=32)  # "A12345"
+    total_count: int | None = None
+    last_full_sync_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+    last_incremental_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+    status: str = Field(default="missing", max_length=16)
+    last_error: str | None = Field(default=None, sa_column=Column(Text))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class AuthorWorksCache(SQLModel, table=True):
+    """One row per OpenAlex Work, scoped by author.
+
+    Populated by :mod:`carrel.pipeline.scholar_works_sync` (page-by-page
+    cursor walk) and read by ``api/scholars.py:list_scholar_works`` instead
+    of hitting OpenAlex live. The same row is reused across A-IDs that
+    share a work — the PK is the W-id, ``author_id`` is the author that
+    most-recently refreshed it. ``raw_json`` keeps the original pyalex
+    dict so future field additions don't require re-fetching.
+
+    ``schema_version`` is a cache-bust key (mirrors
+    :attr:`PaperDedupVerdict.prompt_hash`): increment if ``raw_json``'s
+    expected shape changes so old rows are detected and re-fetched.
+    """
+
+    __tablename__ = "author_works_cache"
+
+    openalex_id: str = Field(primary_key=True, max_length=32)  # "W12345"
+    author_id: str = Field(..., max_length=32, index=True)
+    title: str = Field(..., sa_column=Column(Text))
+    publication_date: date | None = Field(default=None, sa_column=Column(Date))
+    publication_year: int | None = None
+    venue: str | None = Field(default=None, sa_column=Column(Text))
+    doi: str | None = Field(default=None, max_length=255)
+    arxiv_id: str | None = Field(default=None, max_length=32)
+    cited_by_count: int | None = None
+    is_oa: bool = False
+    pdf_url: str | None = Field(default=None, sa_column=Column(Text))
+    oa_status: str = Field(default="none", max_length=16)
+    raw_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    schema_version: int = Field(default=1)
+    fetched_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+class WorkByArxivId(SQLModel, table=True):
+    """Map a bare arXiv id (no version suffix) to the OpenAlex Work dict.
+
+    Populated by :func:`carrel.cache.openalex_works.lookup_work_by_arxiv_id`
+    on first miss. The same arXiv id is queried by sync (B), the import
+    path (D), and ``publication_check``; one row per id covers all three
+    callers and is reused across authors.
+
+    PK is the bare arXiv id (``stripped of any trailing vN``) so the same
+    paper resolved once serves every caller regardless of which form they
+    typed.
+    """
+
+    __tablename__ = "work_by_arxiv_id"
+
+    arxiv_id: str = Field(primary_key=True, max_length=32)
+    openalex_id: str = Field(..., max_length=32)
+    raw_json: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    schema_version: int = Field(default=1)
+    fetched_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
     )

@@ -129,6 +129,16 @@ def init_db(engine: Engine) -> None:
     retire_duplicate_wiki_pages(engine)
     _ensure_wiki_identity_index(engine)
 
+    # OpenAlex persistent cache (A+B). Indexes use raw DDL because
+    # SQLAlchemy's `Index(..., postgresql_where=...)` silently drops the
+    # WHERE clause on SQLite, which would turn the partial indexes into
+    # full ones. ``DESC`` is honored on both PG and SQLite ≥ 3.3.
+    _ensure_openalex_cache_indexes(engine)
+    # Crash recovery: any author_works_sync row left in `loading` by a
+    # killed server would otherwise pin the scholar page forever; mirror
+    # the orphan-Job cleanup that main.lifespan runs for the jobs table.
+    _reset_orphaned_openalex_sync(engine)
+
     # HNSW index for cosine similarity over chunk embeddings. Built once at
     # startup (IF NOT EXISTS makes it idempotent). HNSW defaults (m=16,
     # ef_construction=64) are fine for <100k chunks; revisit if recall drops
@@ -228,6 +238,66 @@ def _ensure_wiki_identity_index(engine: Engine) -> None:
     """
     with engine.begin() as conn:
         conn.exec_driver_sql(_WIKI_ENTITY_KEY_INDEX_DDL)
+
+
+# ---------------------------------------------------------------------------
+# OpenAlex persistent cache (A+B) — see carrel/models.py for the tables.
+# ---------------------------------------------------------------------------
+
+# Composite (author_id, publication_date DESC, cited_by_count DESC) drives
+# the scholar page's "newest first" sort without a filesort, and the two
+# partial indexes keep DOI/arXiv lookups O(log n) even as the cache grows.
+_OPENALEX_CACHE_INDEXES: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS ix_awc_author_date "
+    "ON author_works_cache (author_id, publication_date DESC, cited_by_count DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_awc_doi "
+    "ON author_works_cache (doi) WHERE doi IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_awc_arxiv "
+    "ON author_works_cache (arxiv_id) WHERE arxiv_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS ix_wbaid_openalex "
+    "ON work_by_arxiv_id (openalex_id)",
+)
+
+
+def _ensure_openalex_cache_indexes(engine: Engine) -> None:
+    """Create the indexes backing :class:`AuthorWorksCache` /
+    :class:`WorkByArxivId`. Idempotent via ``IF NOT EXISTS``.
+
+    Mirrors the partial-index pattern used for wiki identity — `Index(...,
+    postgresql_where=...)` is silently dropped on SQLite, so raw DDL is
+    the only way to keep partial WHERE clauses portable.
+    """
+    with engine.begin() as conn:
+        for ddl in _OPENALEX_CACHE_INDEXES:
+            conn.exec_driver_sql(ddl)
+
+
+def _reset_orphaned_openalex_sync(engine: Engine) -> None:
+    """Mark every ``author_works_sync.status='loading'`` row as failed.
+
+    Runs at startup so a crashed/killed server doesn't pin its in-flight
+    scholars in a forever-loading state (the in-process worker that owned
+    them is gone, and there's no other actor that would re-mark them).
+    Mirrors the orphan-Job cleanup at :mod:`carrel.main` (lifespan).
+    """
+    from datetime import UTC, datetime
+
+    from sqlmodel import Session as SqlSession
+    from sqlalchemy import update
+
+    from carrel.models import AuthorWorksSync
+
+    with SqlSession(engine) as session:
+        session.exec(
+            update(AuthorWorksSync)
+            .where(AuthorWorksSync.status == "loading")
+            .values(
+                status="failed",
+                last_error="Interrupted by server restart",
+                updated_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
 
 
 def backfill_wiki_identity(engine: Engine) -> dict[str, int]:

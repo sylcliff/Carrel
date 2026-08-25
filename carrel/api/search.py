@@ -794,6 +794,7 @@ def _resolve_work_for_import(
     arxiv_id: str | None,
     s2_id: str | None,
     title: str | None = None,
+    session: Session | None = None,
 ) -> tuple[dict, str] | None:
     """Resolve whichever identifier the client gave us to importable metadata.
 
@@ -806,20 +807,40 @@ def _resolve_work_for_import(
     → S2 id (mapped to DOI/arXiv, then OpenAlex title search). If every
     OpenAlex path fails but S2 has the paper, fall back to the S2 record so the
     paper can still be imported (id_kind=semanticscholar).
+
+    When ``session`` is supplied, the OpenAlex lookups go through the
+    persistent cache (see
+    :mod:`carrel.cache.openalex_works`): re-importing the same paper is
+    free and a DOI that came from a previous import serves the same
+    Work dict without a fresh live call. The DOI path stays direct
+    (``lookup_by_doi``) because the cache currently keys on arXiv id and
+    W-id only — adding a DOI table is a future PR.
     """
     work: dict | None = None
     if oa_id:
-        oa_id = oa_id.rsplit("/", 1)[-1]
-        try:
-            w = oa.Works()[oa_id]
-            work = dict(w) if w else None
-        except Exception as e:  # noqa: BLE001
-            logger.warning("openalex lookup W=%s failed: %s", oa_id, e)
-            work = None
+        if session is not None:
+            from carrel.cache import openalex_works as cache
+
+            work = cache.lookup_work_by_oa_id(session, oa_id)
+        else:
+            oa_id = oa_id.rsplit("/", 1)[-1]
+            try:
+                w = oa.Works()[oa_id]
+                work = dict(w) if w else None
+            except Exception as e:  # noqa: BLE001
+                logger.warning("openalex lookup W=%s failed: %s", oa_id, e)
+                work = None
     if work is None and doi:
         work = oa.lookup_by_doi(doi)
     if work is None and arxiv_id:
-        work = oa.lookup_by_arxiv_id(arxiv_id, title_hint=title)
+        if session is not None:
+            from carrel.cache import openalex_works as cache
+
+            work = cache.lookup_work_by_arxiv_id(
+                session, arxiv_id, title_hint=title
+            )
+        else:
+            work = oa.lookup_by_arxiv_id(arxiv_id, title_hint=title)
 
     # We need an S2 lookup only if OpenAlex hasn't resolved the work: either
     # the client gave an s2 id directly, or all OA paths (W/DOI/arXiv) missed.
@@ -951,6 +972,7 @@ def import_external_paper(
         arxiv_id=body.arxiv_id,
         s2_id=body.s2,
         title=body.title,
+        session=session,
     )
     if not resolved:
         from fastapi import HTTPException

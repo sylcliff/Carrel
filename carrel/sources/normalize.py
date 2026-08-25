@@ -20,6 +20,7 @@ from typing import Any
 
 from carrel.sources import openalex_client as oa
 from carrel.sources.arxiv import ArxivEntry
+from sqlmodel import Session
 
 logger = logging.getLogger(__name__)
 
@@ -153,15 +154,32 @@ def is_zenodo(doi: str | None, venue: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def enrich_with_openalex(rec: PaperRecord) -> PaperRecord:
+def enrich_with_openalex(rec: PaperRecord, session: Session | None = None) -> PaperRecord:
     """If the record came from arXiv, try to attach an OpenAlex Work so the
     rest of the system has a canonical ID, authors with OA IDs, and a
     canonical PDF. ``work_pdf_url`` prefers repository/arXiv copies, since
-    publisher ``pdf_url`` values sometimes serve HTML landing pages."""
+    publisher ``pdf_url`` values sometimes serve HTML landing pages.
+
+    When a SQLAlchemy ``session`` is provided the OpenAlex lookup goes
+    through the persistent cache (see
+    :func:`carrel.cache.openalex_works.lookup_work_by_arxiv_id`): the
+    first miss hits OpenAlex and writes the result back to the
+    ``work_by_arxiv_id`` table so the next caller — sync, the import
+    path, or the publication check — short-circuits. Without a session
+    the legacy direct call is used (kept for unit tests and any caller
+    that hasn't been threaded through a session yet).
+    """
     if rec.id_kind != "arxiv" or not rec.arxiv_id:
         return rec
 
-    work = oa.lookup_by_arxiv_id(rec.arxiv_id)
+    if session is not None:
+        from carrel.cache import openalex_works as cache
+
+        work = cache.lookup_work_by_arxiv_id(
+            session, rec.arxiv_id, title_hint=rec.title
+        )
+    else:
+        work = oa.lookup_by_arxiv_id(rec.arxiv_id)
     if not work:
         return rec
 

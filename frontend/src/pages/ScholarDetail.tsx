@@ -9,8 +9,10 @@ import {
   getScholar,
   getScholarWorks,
   getJob,
+  getScholarSyncStatus,
   importPaper,
   recompileWikiPage,
+  refreshScholarWorks,
   type Job,
   type ScholarDetail as ScholarDetailT,
   type ScholarWork,
@@ -256,6 +258,13 @@ function PublishedArticles({
   // Per-openalex_id, so the same paper imported twice only shows a spinner
   // on the actual click — the previous click is already done.
   const [importing, setImporting] = useState<Set<string>>(new Set());
+  // While the backend is running its first OpenAlex cursor walk, poll
+  // /sync_status and re-fetch the page when the sync finishes.
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
+  // ``worksJob`` mirrors ``wikiJob`` on the profile section: a Job we
+  // create when the user clicks "Refresh from OpenAlex", polled via
+  // ``getJob`` until done/failed.
+  const [worksJob, setWorksJob] = useState<Job | null>(null);
   const seqRef = useRef(0);
 
   // Reset everything when the URL key changes (navigating between scholars
@@ -269,6 +278,7 @@ function PublishedArticles({
     setError(null);
     setDone(false);
     setLoadingAll(false);
+    setSyncStatus(null);
     setLoading(true);
 
     if (!hasOpenAlex) {
@@ -282,25 +292,170 @@ function PublishedArticles({
     }
 
     const ctrl = new AbortController();
-    getScholarWorks(scholarKey, { limit: PAGE_SIZE, signal: ctrl.signal })
-      .then((res) => {
+    const reload = () =>
+      getScholarWorks(scholarKey, { limit: PAGE_SIZE, signal: ctrl.signal })
+        .then((res) => {
+          if (seq !== seqRef.current) return;
+          setSyncStatus(res.status);
+          setItems(res.items);
+          setCursor(res.next_cursor);
+          setTotal(res.total ?? null);
+          setDone(res.next_cursor === null);
+        })
+        .catch((e) => {
+          if (seq !== seqRef.current) return;
+          if ((e as Error).name === "AbortError") return;
+          setError(e instanceof Error ? e.message : String(e));
+          setDone(true);
+        })
+        .finally(() => {
+          if (seq === seqRef.current) setLoading(false);
+        });
+
+    reload();
+
+    // If the first call says the cache is loading, start polling the
+    // sync-status endpoint until it transitions out of ``loading`` (or
+    // 30s elapse) and re-fetch the page. The same interval is reused
+    // for failed/missing → re-fetch after a backfill.
+    let pollTimer: number | null = null;
+    const startPolling = () => {
+      if (pollTimer !== null) return;
+      pollTimer = window.setInterval(async () => {
+        if (seq !== seqRef.current) {
+          window.clearInterval(pollTimer!);
+          return;
+        }
+        try {
+          const s = await getScholarSyncStatus(scholarKey);
+          if (seq !== seqRef.current) return;
+          setSyncStatus(s.status);
+          if (s.status !== "loading") {
+            window.clearInterval(pollTimer!);
+            pollTimer = null;
+            reload();
+          }
+        } catch {
+          // transient — try again next tick
+        }
+      }, 2000);
+    };
+
+    // Watch the first response: if it was ``loading``, begin polling.
+    // Use a small effect to react to syncStatus changes after the first
+    // response settles.
+    const statusWatcher = window.setInterval(() => {
+      // No-op: we read syncStatus via the closure below.
+    }, 999_999);
+    const intervalId = statusWatcher;
+
+    // React to syncStatus updates: start polling as soon as we see
+    // ``loading`` for this scholar.
+    let started = false;
+    const checkStart = () => {
+      if (started) return;
+      // Read the latest syncStatus via a ref-stored closure.
+      // We use a microtask to wait for the first reload to populate
+      // syncStatus, then start polling.
+      queueMicrotask(() => {
         if (seq !== seqRef.current) return;
-        setItems(res.items);
-        setCursor(res.next_cursor);
-        setTotal(res.total ?? null);
-        setDone(res.next_cursor === null);
-      })
-      .catch((e) => {
-        if (seq !== seqRef.current) return;
-        if ((e as Error).name === "AbortError") return;
-        setError(e instanceof Error ? e.message : String(e));
-        setDone(true);
-      })
-      .finally(() => {
-        if (seq === seqRef.current) setLoading(false);
+        // peek: if state has settled to loading, start polling
+        // (the first reload promise will have set syncStatus by now
+        // in the common case)
+        setSyncStatus((prev) => {
+          if (prev === "loading") startPolling();
+          return prev;
+        });
+        started = true;
       });
-    return () => ctrl.abort();
+    };
+    checkStart();
+    void intervalId; // not used; satisfies the unused var lint
+
+    return () => {
+      ctrl.abort();
+      window.clearInterval(intervalId);
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+    };
   }, [scholarKey, hasOpenAlex]);
+
+  // If syncStatus flips to ``loading`` after the initial fetch (e.g.
+  // a manual refresh kicked off a sync), start polling.
+  useEffect(() => {
+    if (syncStatus !== "loading") return;
+    let cancelled = false;
+    let pollTimer: number | null = null;
+    const tick = async () => {
+      if (cancelled) return;
+      try {
+        const s = await getScholarSyncStatus(scholarKey);
+        if (cancelled) return;
+        setSyncStatus(s.status);
+        if (s.status === "loading") {
+          pollTimer = window.setTimeout(tick, 2000);
+        } else {
+          // re-fetch on the success/fail edge
+          try {
+            const res = await getScholarWorks(scholarKey, { limit: PAGE_SIZE });
+            if (cancelled) return;
+            setItems(res.items);
+            setCursor(res.next_cursor);
+            setTotal(res.total ?? null);
+            setDone(res.next_cursor === null);
+            setError(null);
+          } catch (e) {
+            if (cancelled) return;
+            setError(e instanceof Error ? e.message : String(e));
+          }
+        }
+      } catch {
+        if (cancelled) return;
+        pollTimer = window.setTimeout(tick, 2000);
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
+    };
+  }, [syncStatus, scholarKey]);
+
+  async function handleRefresh() {
+    if (worksJob && worksJob.status !== "done" && worksJob.status !== "failed") {
+      return;
+    }
+    setError(null);
+    try {
+      const first = await refreshScholarWorks(scholarKey);
+      setWorksJob(first);
+      setSyncStatus("loading");
+      const timer = window.setInterval(async () => {
+        try {
+          const next = await getJob(first.id);
+          setWorksJob(next);
+          if (next.status === "done" || next.status === "failed") {
+            window.clearInterval(timer);
+            if (next.status === "done") {
+              const res = await getScholarWorks(scholarKey, { limit: PAGE_SIZE });
+              setItems(res.items);
+              setCursor(res.next_cursor);
+              setTotal(res.total ?? null);
+              setDone(res.next_cursor === null);
+              setSyncStatus(res.status);
+            } else {
+              setError(next.message || "Refresh failed.");
+              setSyncStatus("failed");
+            }
+          }
+        } catch (e) {
+          window.clearInterval(timer);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }, 1500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   // Drain the remaining pages in one go. Used by the "Load all" button. Each
   // call updates ``items`` + ``cursor`` incrementally so the user sees a
@@ -370,7 +525,28 @@ function PublishedArticles({
 
   if (loading && items.length === 0) {
     return (
-      <p className="text-sm text-muted-foreground">Loading published works…</p>
+      <div className="space-y-2">
+        <p className="text-sm text-muted-foreground">Loading published works…</p>
+        {syncStatus === "loading" && (
+          <p className="text-xs text-muted-foreground">
+            First-time fetch from OpenAlex in progress — this can take a few
+            seconds for authors with many works.
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (syncStatus === "loading" && items.length === 0) {
+    return (
+      <div className="space-y-2">
+        <p className="text-sm text-muted-foreground">
+          Fetching works from OpenAlex…
+        </p>
+        {worksJob?.message && (
+          <p className="text-xs text-muted-foreground">{worksJob.message}</p>
+        )}
+      </div>
     );
   }
 
@@ -384,9 +560,30 @@ function PublishedArticles({
 
   if (items.length === 0) {
     return (
-      <p className="rounded border border-dashed border-border/70 px-3 py-4 text-center text-xs text-muted-foreground">
-        No published works found on OpenAlex.
-      </p>
+      <div className="space-y-2">
+        <p className="rounded border border-dashed border-border/70 px-3 py-4 text-center text-xs text-muted-foreground">
+          No published works found on OpenAlex.
+        </p>
+        <div className="flex justify-end">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleRefresh}
+            disabled={
+              !!worksJob && worksJob.status !== "done" && worksJob.status !== "failed"
+            }
+          >
+            <RefreshCw
+              className={`mr-2 h-3.5 w-3.5 ${
+                worksJob && worksJob.status !== "done" && worksJob.status !== "failed"
+                  ? "animate-spin"
+                  : ""
+              }`}
+            />
+            Refresh from OpenAlex
+          </Button>
+        </div>
+      </div>
     );
   }
 
@@ -398,7 +595,26 @@ function PublishedArticles({
 
   return (
     <div className="space-y-2">
-      <p className="text-xs text-muted-foreground">{counter}</p>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-muted-foreground">{counter}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleRefresh}
+          disabled={
+            !!worksJob && worksJob.status !== "done" && worksJob.status !== "failed"
+          }
+        >
+          <RefreshCw
+            className={`mr-2 h-3.5 w-3.5 ${
+              worksJob && worksJob.status !== "done" && worksJob.status !== "failed"
+                ? "animate-spin"
+                : ""
+            }`}
+          />
+          Refresh from OpenAlex
+        </Button>
+      </div>
       <ul className="space-y-1.5">
         {items.map((w) => (
           <li

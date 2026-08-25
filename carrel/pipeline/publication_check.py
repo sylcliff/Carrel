@@ -138,12 +138,19 @@ def detect_publication(
     *,
     min_age_days: int = 180,
     now: date | None = None,
+    session: Session | None = None,
 ) -> PublicationInfo:
     """Check whether an arXiv paper has been published in a journal.
 
     Re-fetches the arXiv record to read the authoritative first-version
     ``<published>`` date; papers younger than ``min_age_days`` short-circuit
     without hitting S2/OA.
+
+    When a SQLAlchemy ``session`` is provided, the OpenAlex lookup is
+    routed through the persistent cache (see
+    :func:`carrel.cache.openalex_works.lookup_work_by_arxiv_id`) so the
+    second paper to be checked on the same arXiv id skips the live call.
+    Without a session the legacy direct call is used.
     """
     now = now or datetime.now(UTC).date()
     arxiv_id = paper.arxiv_id
@@ -173,7 +180,18 @@ def detect_publication(
 
     # OpenAlex fallback (primary_location.source.type is the journal signal).
     try:
-        work = oa.lookup_by_arxiv_id(arxiv_id.split("v", 1)[0], title_hint=paper.title)
+        if session is not None:
+            from carrel.cache import openalex_works as cache
+
+            work = cache.lookup_work_by_arxiv_id(
+                session,
+                arxiv_id.split("v", 1)[0],
+                title_hint=paper.title,
+            )
+        else:
+            work = oa.lookup_by_arxiv_id(
+                arxiv_id.split("v", 1)[0], title_hint=paper.title
+            )
     except Exception as e:  # noqa: BLE001
         logger.info("OpenAlex lookup failed for %s: %s", arxiv_id, e)
         work = None
@@ -273,6 +291,7 @@ def check_and_apply(
     info = detect_publication(
         paper,
         min_age_days=env.remote_journal_min_age_days,
+        session=session,
     )
     paper.published_checked_at = datetime.now(UTC)
     session.add(paper)

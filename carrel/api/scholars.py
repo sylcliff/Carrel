@@ -16,13 +16,19 @@ when an OpenAlex ID is available, a live OpenAlex profile (works_count,
 h_index, ...) fetched on demand and cached in-process, and any compiled wiki
 page (M8).
 
-``GET /scholars/{key}/works`` pages the OpenAlex works authored by this
-scholar (newest first), joined with the local library so the UI can show an
-"In library" badge or an "Import" button next to each work.
+``GET /scholars/{key}/works`` pages the **cached** OpenAlex works authored by
+this scholar (newest first), joined with the local library so the UI can show
+an "In library" badge or an "Import" button next to each work. The cache is
+populated lazily on first visit (a background thread kicks off the OpenAlex
+cursor walk) and refreshed on demand via
+:mod:`carrel.api.scholar_works_sync`. Pagination is offset-based
+(``"offset:<N>"`` cursor), not OpenAlex cursor, so repeated page loads after
+the first sync are pure local reads.
 """
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from typing import Any
@@ -32,8 +38,9 @@ from sqlalchemy import func, or_
 from sqlmodel import Session, col, select
 
 from carrel.api.papers import _to_summary
+from carrel.cache import openalex_works as cache
 from carrel.db import get_session_dep
-from carrel.models import Paper, WikiKind, WikiPage
+from carrel.models import AuthorWorksSync, Paper, WikiKind, WikiPage
 from carrel.pipeline.wiki import _slug
 from carrel.pipeline.wiki._scholars_agg import (
     NAME_KEY_PREFIX,
@@ -58,6 +65,16 @@ router = APIRouter(prefix="/scholars", tags=["scholars"])
 _LIST_TTL = 60.0
 _list_cache: dict[str, Any] = {"ts": 0.0, "sig": None, "items": []}
 _list_lock = threading.Lock()
+
+# A-ID → thread that lazy-kicked off the OpenAlex sync. We use this as
+# a coarse in-process mutex to avoid two concurrent first-visit
+# requests each spawning their own sync; the
+# :class:`AuthorWorksSync` table also enforces this server-side, but
+# starting only one thread keeps the log quiet.
+_lazy_kickoff_threads: dict[str, threading.Thread] = {}
+_lazy_kickoff_lock = threading.Lock()
+
+_OFFSET_CURSOR_RE = re.compile(r"^offset:(\d+)$")
 
 
 def _library_signature(session: Session) -> Any:
@@ -236,12 +253,134 @@ def _batch_library_match(
     return out
 
 
+def _cache_rows_to_works(
+    session: Session, rows: list[AuthorWorksCache]
+) -> list[ScholarWorkOut]:
+    """Convert cached :class:`AuthorWorksCache` rows to ``ScholarWorkOut``s.
+
+    The ``in_library`` / ``library_id`` join is the one query the cache
+    path still needs to issue — the local library state is not in
+    ``author_works_cache`` (and shouldn't be, since imports / discards
+    would otherwise have to back-write into the cache).
+    """
+    if not rows:
+        return []
+    # Build the same identifier set the live path collects, then reuse
+    # the existing matcher.
+    pseudo: list[dict[str, Any]] = []
+    for r in rows:
+        pseudo.append(
+            {
+                "id": r.openalex_id,
+                "doi": r.doi,
+                # OpenAlex's arXiv id is stored as a bare string (e.g.
+                # "2301.12345"); the live path passes the same form.
+            }
+        )
+    # We need arxiv_id too — look it up explicitly because the cached
+    # row carries it. Extend the matcher by passing the arxiv ids in.
+    oa_ids = {r.openalex_id for r in rows}
+    dois = {(r.doi or "").lower() for r in rows if r.doi}
+    arxiv_ids = {r.arxiv_id for r in rows if r.arxiv_id}
+    conditions = []
+    if oa_ids:
+        conditions.append(col(Paper.id).in_(oa_ids))
+    if dois:
+        conditions.append(func.lower(col(Paper.doi)).in_(dois))
+    if arxiv_ids:
+        conditions.append(col(Paper.arxiv_id).in_(arxiv_ids))
+    match_rows: dict[str, Paper] = {}
+    if conditions:
+        paper_rows = session.exec(
+            select(Paper).where(or_(*conditions))
+        ).all()
+        by_oa = {r.id: r for r in paper_rows if r.id_kind == "openalex"}
+        by_doi = {(r.doi or "").lower(): r for r in paper_rows if r.doi}
+        by_arxiv = {r.arxiv_id: r for r in paper_rows if r.arxiv_id}
+        for r in rows:
+            m = (
+                by_oa.get(r.openalex_id)
+                or by_doi.get((r.doi or "").lower())
+                or by_arxiv.get(r.arxiv_id or "")
+            )
+            if m is not None:
+                match_rows[r.openalex_id] = m
+
+    items: list[ScholarWorkOut] = []
+    for r in rows:
+        m = match_rows.get(r.openalex_id)
+        items.append(
+            ScholarWorkOut(
+                openalex_id=r.openalex_id,
+                title=r.title,
+                year=r.publication_year,
+                venue=r.venue,
+                doi=r.doi,
+                arxiv_id=r.arxiv_id,
+                cited_by_count=r.cited_by_count,
+                is_oa=r.is_oa,
+                pdf_url=r.pdf_url,
+                in_library=bool(m and m.in_library),
+                library_id=m.id if m else None,
+            )
+        )
+    return items
+
+
+def _kickoff_lazy_sync(aid: str) -> None:
+    """Spawn a daemon thread that runs the OA cursor walk for ``aid``.
+
+    The thread opens its own session (the request session is closing);
+    the in-process ``_lazy_kickoff_threads`` map keeps the GIL from
+    spawning duplicates if two requests race. The
+    :class:`AuthorWorksSync` table is the authoritative deduplication
+    primitive server-side, so the in-process map is just a nicety.
+    """
+    with _lazy_kickoff_lock:
+        existing = _lazy_kickoff_threads.get(aid)
+        if existing is not None and existing.is_alive():
+            return
+
+        def _runner() -> None:
+            from sqlmodel import Session as SqlSession
+            from carrel.db import get_app_engine
+            from carrel.pipeline.scholar_works_sync import sync_scholar_works
+
+            try:
+                engine = get_app_engine()
+                with SqlSession(engine) as sess:
+                    sync_scholar_works(sess, aid, on_progress=None)
+            except Exception:
+                logger.exception("lazy scholar_works_sync crashed for %s", aid)
+            finally:
+                with _lazy_kickoff_lock:
+                    _lazy_kickoff_threads.pop(aid, None)
+
+        t = threading.Thread(
+            target=_runner, name=f"scholar-sync-{aid}", daemon=True
+        )
+        _lazy_kickoff_threads[aid] = t
+        t.start()
+
+
+def _parse_offset_cursor(cursor: str | None) -> int:
+    """Parse ``"offset:N"`` to ``N``. Any other shape → 0.
+
+    Older sessions might still hold a raw OpenAlex cursor; treat it as
+    the start of the list rather than 500ing the page.
+    """
+    if not cursor:
+        return 0
+    m = _OFFSET_CURSOR_RE.match(cursor)
+    return int(m.group(1)) if m else 0
+
+
 @router.get("/{key}/works", response_model=ScholarWorksResponse)
 def list_scholar_works(
     key: str,
     cursor: str | None = Query(
         None,
-        description="Opaque OpenAlex next-cursor from the previous page",
+        description="Opaque pagination cursor (offset:N) from the previous page",
     ),
     limit: int = Query(50, ge=1, le=50),
     session: Session = Depends(get_session_dep),
@@ -252,9 +391,16 @@ def list_scholar_works(
     matching against the local Paper table. Only A-ID scholars can be
     resolved through OpenAlex — name-only authors (no A-ID) return 422.
 
-    ``total`` is OpenAlex's reported work count for this author and is the
-    same on every page; the UI uses it to render a "Showing X of Y" counter
-    on the section header.
+    The endpoint serves the cached :class:`AuthorWorksCache` rows when
+    present (``status='ready'`` / ``'stale'``). On first visit, when the
+    cache is ``missing`` / ``failed`` / ``loading``, a background thread
+    is kicked off to populate it and the response is empty with
+    ``status='loading'``; the frontend polls ``GET /scholars/{key}/sync_status``
+    until ``ready`` and re-issues this call.
+
+    ``total`` is the cached total for the author (or ``None`` while
+    loading) and is the same on every page; the UI uses it to render a
+    "Showing X of Y" counter on the section header.
     """
     # Mirror /scholars/{key}: only authors that exist in the local aggregation
     # are addressable here. This blocks casual enumeration of OpenAlex from
@@ -273,32 +419,57 @@ def list_scholar_works(
             ),
         )
 
-    works, next_cursor, total = oa.fetch_author_works(key, cursor=cursor, limit=limit)
-    if not works and not next_cursor:
-        return ScholarWorksResponse(items=[], next_cursor=None, total=total)
+    sync_state = session.get(AuthorWorksSync, key)
+    sync_status = sync_state.status if sync_state is not None else "missing"
 
-    matches = _batch_library_match(session, works)
-    items: list[ScholarWorkOut] = []
-    for w in works:
-        wid = oa.work_id(w)
-        if not wid:
-            continue
-        pdf_url, oa_status = oa.work_pdf_url(w)
-        is_oa = oa_status == "oa"
-        match = matches.get(wid)
-        items.append(
-            ScholarWorkOut(
-                openalex_id=wid,
-                title=oa.work_title(w),
-                year=_work_year(w),
-                venue=oa.work_venue(w),
-                doi=oa.work_doi(w),
-                arxiv_id=oa.work_arxiv_id(w),
-                cited_by_count=w.get("cited_by_count"),
-                is_oa=is_oa,
-                pdf_url=pdf_url,
-                in_library=bool(match and match.in_library),
-                library_id=match.id if match else None,
-            )
+    # First-visit / failure path: kick off a sync, return immediately
+    # with an empty page + status='loading'.
+    if sync_status in ("missing", "failed"):
+        _kickoff_lazy_sync(key)
+        return ScholarWorksResponse(
+            items=[],
+            next_cursor=None,
+            total=sync_state.total_count if sync_state else None,
+            status="loading",
         )
-    return ScholarWorksResponse(items=items, next_cursor=next_cursor, total=total)
+
+    if sync_status == "loading":
+        # Another worker is already on it — let it finish, return the
+        # current best-effort view.
+        rows, total = cache.get_cached_works(
+            session, key, limit=limit, offset=_parse_offset_cursor(cursor)
+        )
+        if not rows:
+            return ScholarWorksResponse(
+                items=[],
+                next_cursor=None,
+                total=sync_state.total_count,
+                status="loading",
+            )
+        items = _cache_rows_to_works(session, rows)
+        next_cursor = (
+            f"offset:{_parse_offset_cursor(cursor) + limit}"
+            if len(rows) == limit
+            else None
+        )
+        return ScholarWorksResponse(
+            items=items,
+            next_cursor=next_cursor,
+            # Prefer the sync state count (authoritative from OpenAlex) when
+            # present — the in-page row count is just "what we already have",
+            # which may be smaller mid-sync.
+            total=sync_state.total_count or total,
+            status="loading",
+        )
+
+    # ``ready`` / ``stale``: serve from cache. Zero OA calls.
+    offset = _parse_offset_cursor(cursor)
+    rows, total = cache.get_cached_works(session, key, limit=limit, offset=offset)
+    items = _cache_rows_to_works(session, rows)
+    next_cursor = f"offset:{offset + limit}" if len(rows) == limit else None
+    return ScholarWorksResponse(
+        items=items,
+        next_cursor=next_cursor,
+        total=sync_state.total_count or total,
+        status=sync_status,
+    )
