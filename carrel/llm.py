@@ -156,6 +156,8 @@ def chat_stream(
     timeout: int = 60,
     feature: str = "other",
     on_usage: Any | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    on_tool_calls: "Any | None" = None,
 ) -> Iterator[str]:
     """Yield free-text completion deltas token-by-token (streaming, no JSON).
 
@@ -168,13 +170,24 @@ def chat_stream(
     can record tokens (see :mod:`carrel.usage`). Fired eagerly on the
     first chunk that has a usage block so the record is not lost if the
     consumer breaks early.
+
+    With ``tools=`` the model is offered the function-calling surface;
+    tool-call deltas are accumulated by index and, after the stream ends,
+    handed off as a list of OpenAI-shaped call dicts to ``on_tool_calls``
+    (one invocation, after the last text delta is yielded). Callers
+    without ``on_tool_calls`` see tool calls silently dropped — same as
+    before this option existed, which keeps every existing call site
+    working unchanged.
     """
     mdl, api_key = _select_model(model, fallback_model)
 
     from litellm import completion  # imported lazily so tests without keys work
 
     try:
-        resp: Any = completion(
+        # Forward `tools` only when supplied; providers that don't support
+        # function calling will have the param dropped (litellm.drop_params
+        # is set globally at module load) so this is safe across providers.
+        completion_kwargs: dict[str, Any] = dict(
             model=mdl,
             messages=list(messages),
             temperature=temperature,
@@ -183,6 +196,15 @@ def chat_stream(
             stream=True,
             stream_options={"include_usage": True},
         )
+        if tools:
+            completion_kwargs["tools"] = tools
+        resp: Any = completion(**completion_kwargs)
+
+        # Accumulator for tool-call deltas, keyed by the tool-call index
+        # the provider assigns. Some providers emit only `id`, some only
+        # `function.name`/`function.arguments` fragments — we concatenate
+        # the string parts and remember whichever `id` shows up first.
+        tool_accum: dict[int, dict[str, Any]] = {}
         for chunk in resp:
             # Some providers (e.g. DeepSeek) put the usage block on the
             # very last chunk; record it eagerly in case the consumer
@@ -193,13 +215,49 @@ def chat_stream(
                 except Exception as e:  # noqa: BLE001
                     logger.warning("on_usage callback failed: %s", e)
             try:
-                delta = chunk.choices[0].delta.content
+                delta = chunk.choices[0].delta
             except (AttributeError, IndexError, KeyError):
                 delta = None
-            if delta:
-                yield delta
+            # Text delta: yield as before.
+            text = getattr(delta, "content", None) if delta is not None else None
+            if text:
+                yield text
+            # Tool-call deltas: accumulate by index, no yields.
+            tc_deltas = getattr(delta, "tool_calls", None) if delta is not None else None
+            if tc_deltas:
+                for tc in tc_deltas:
+                    idx = getattr(tc, "index", None)
+                    if idx is None:
+                        # Single-call responses sometimes omit index.
+                        idx = 0
+                    entry = tool_accum.setdefault(idx, {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if getattr(tc, "id", None):
+                        entry["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            entry["function"]["name"] += fn.name
+                        if getattr(fn, "arguments", None):
+                            entry["function"]["arguments"] += fn.arguments
     except Exception as e:  # noqa: BLE001 - normalized for the streaming caller
         raise LLMError(f"chat stream failed with {mdl}: {e}") from e
+
+    # Stream finished — if the model returned tool calls, hand the
+    # assembled list to the caller. Done after the loop so the caller
+    # can be sure every text delta has already been yielded.
+    if on_tool_calls is not None and tool_accum:
+        calls: list[dict[str, Any]] = []
+        for _idx in sorted(tool_accum):
+            calls.append(tool_accum[_idx])
+        try:
+            on_tool_calls(calls)
+        except Exception as e:  # noqa: BLE001
+            # A buggy caller shouldn't crash the request; log and move on.
+            logger.warning("on_tool_calls callback failed: %s", e)
 
 
 def _chat_with_retry(

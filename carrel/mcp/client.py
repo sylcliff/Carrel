@@ -21,6 +21,7 @@ from mcp.client.stdio import stdio_client
 
 from carrel.config import CarrelYAML, EnvSettings, MCPServerConfig
 from carrel.mcp.errors import MCPError, MCPUnavailable
+from carrel.mcp.socks_bridge import SocksHttpBridge
 from mcp import ClientSession, StdioServerParameters
 
 logger = logging.getLogger("carrel.mcp")
@@ -139,6 +140,7 @@ class MCPClientRegistry:
 
     def __init__(self) -> None:
         self._clients: dict[str, MCPClient] = {}
+        self._bridge: SocksHttpBridge | None = None
 
     async def start_all(
         self,
@@ -147,10 +149,27 @@ class MCPClientRegistry:
         default_startup_timeout: float = 15.0,
         default_tool_call_timeout: float = 30.0,
     ) -> None:
+        # Spin up a single SOCKS→HTTP bridge if any enabled server's
+        # env references the sentinel. Done once, shared, and torn down
+        # in :meth:`stop_all`.
+        bridge = SocksHttpBridge.maybe_start()
+        self._bridge = bridge
+
         for name, cfg, params in configs:
             if not cfg.enabled:
                 logger.info("MCP server %r disabled by config; skipping", name)
                 continue
+            if bridge is not None:
+                # Rewrite sentinel values in the subprocess env to point
+                # at the bridge's real URL. params.env is read-only inside
+                # StdioServerParameters, so build a fresh one.
+                rewritten = bridge.rewrite_env(params.env or {})
+                params = StdioServerParameters(
+                    command=params.command,
+                    args=params.args,
+                    env=rewritten,
+                    cwd=params.cwd,
+                )
             client = MCPClient(
                 name,
                 params,
@@ -180,6 +199,12 @@ class MCPClientRegistry:
             except Exception:  # pragma: no cover - shutdown best-effort
                 logger.exception("error stopping MCP server %r", name)
         self._clients.clear()
+        if self._bridge is not None:
+            try:
+                self._bridge.stop()
+            except Exception:  # pragma: no cover
+                logger.exception("error stopping SOCKS bridge")
+            self._bridge = None
 
     def get(self, name: str) -> MCPClient | None:
         return self._clients.get(name)

@@ -58,6 +58,18 @@ export interface ChatPanelConfig<TSource> {
   extraRehypePlugins?: Pluggable[];
   /** Render the per-answer source chips (e.g. a string chip or a Link). */
   renderSources: (sources: TSource[]) => ReactNode;
+  /**
+   * Called with the ordered list of tool events from the most recent
+   * server response, plus the final text answer. Fires once per run
+   * (when the SSE ``[DONE]`` sentinel arrives, or when the run errors
+   * out mid-stream). Defaults to a no-op so the paper-chat path stays
+   * untouched.
+   *
+   * Empty list means the model answered without calling any tools.
+   * Events are NOT part of the persisted transcript — they're just
+   * visual scaffolding the consumer can show next to the answer.
+   */
+  onToolEvents?: (events: ToolEvent[], answer: string) => void;
   /** Header title (e.g. "Chat with this paper" / "Chat with the wiki"). */
   title: string;
   /** Empty-thread hint when chat is enabled / disabled. */
@@ -74,6 +86,19 @@ export interface ChatPanelConfig<TSource> {
   cardClassName?: string;
 }
 
+/** One tool invocation surfaced by the wiki chat agent. */
+export interface ToolEvent {
+  /** Server-prefixed tool name (e.g. ``brave_search__brave_web_search``). */
+  name: string;
+  /** Parsed arguments the model passed. */
+  args: Record<string, unknown>;
+  /** Stringified tool result (the model saw the same string). */
+  content: string;
+  /** True when the dispatcher hit MCPUnavailable/MCPError or the
+   * upstream tool returned ``is_error: true``. */
+  isError: boolean;
+}
+
 // ReactMarkdown's rehypePlugins prop expects a PluggableList (the same array
 // shape used by unified). Pulled in here so the ChatPanelConfig can describe
 // the extra plugins consumers want to layer on.
@@ -87,7 +112,9 @@ interface ChatRequestMessage {
 type ServerEvent<TSource> =
   | { sources: TSource[] }
   | { t: string }
-  | { error: string };
+  | { error: string }
+  | { type: "tool_call"; name: string; args: Record<string, unknown> }
+  | { type: "tool_result"; name: string; content: string; is_error?: boolean };
 
 // ---------------------------------------------------------------------------
 // Persistence helpers — convert between our wire format and assistant-ui's
@@ -252,9 +279,26 @@ function ChatThread<TSource>({ config, sources, onSources, initialTurns }: ChatT
         }
 
         let answer = "";
+        // Pending tool events keyed by tool name. The server emits
+        // `tool_call` first then `tool_result`; we pair them so
+        // onToolEvents gets a single ordered list of complete invocations.
+        const pending = new Map<string, ToolEvent>();
+        const completed: ToolEvent[] = [];
+        const finishWithEvents = () => {
+          if (!config.onToolEvents) return;
+          const events = [...completed, ...pending.values()];
+          try {
+            config.onToolEvents(events, answer);
+          } catch (e) {
+            console.warn(`${config.logLabel}: onToolEvents threw`, e);
+          }
+        };
         const reader = res.body.getReader();
         for await (const evt of parseSSE<TSource>(reader)) {
-          if (evt === "done") break;
+          if (evt === "done") {
+            finishWithEvents();
+            break;
+          }
           if ("sources" in evt) {
             onSources(evt.sources);
           } else if ("t" in evt) {
@@ -264,7 +308,32 @@ function ChatThread<TSource>({ config, sources, onSources, initialTurns }: ChatT
             // whole accumulated answer rather than just the new delta.
             yield { content: [{ type: "text", text: answer }] };
           } else if ("error" in evt) {
+            finishWithEvents();
             throw new Error(evt.error);
+          } else if (evt.type === "tool_call") {
+            pending.set(evt.name, {
+              name: evt.name,
+              args: evt.args ?? {},
+              content: "",
+              isError: false,
+            });
+          } else if (evt.type === "tool_result") {
+            const call = pending.get(evt.name);
+            if (call) {
+              call.content = evt.content;
+              call.isError = Boolean(evt.is_error);
+              pending.delete(evt.name);
+              completed.push(call);
+            } else {
+              // Result without a preceding call — surface it anyway so
+              // the UI can see the server's view of what happened.
+              completed.push({
+                name: evt.name,
+                args: {},
+                content: evt.content,
+                isError: Boolean(evt.is_error),
+              });
+            }
           }
         }
         if (!answer) {
@@ -272,7 +341,7 @@ function ChatThread<TSource>({ config, sources, onSources, initialTurns }: ChatT
         }
       },
     }),
-    [config.chatEndpoint, onSources],
+    [config.chatEndpoint, config.onToolEvents, onSources],
   );
 
   const runtime = useLocalRuntime(adapter, { initialMessages });

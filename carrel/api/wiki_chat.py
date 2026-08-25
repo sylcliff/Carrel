@@ -11,6 +11,13 @@ Event shapes (all ``data: <json>\\n\\n``):
   * ``{"sources": [{"kind": "...", "slug": "...", "title": "..."}, ...]}`` —
     the wiki pages that informed the answer. The first frame.
   * ``{"t": "token"}`` — one or more text deltas.
+  * ``{"type": "tool_call", "name": "...", "args": {...}}`` — the model
+    decided to call an MCP tool. Issued only when MCP tools are configured
+    and running; the model is given the live tool list at every iteration.
+  * ``{"type": "tool_result", "name": "...", "content": "...", "is_error":
+    bool}`` — what the tool returned. ``is_error`` is true for transport
+    failures and upstream ``CallToolResult.is_error``; the model sees the
+    text content either way and decides how to answer.
   * ``{"error": "..."}`` — terminal error frame.
   * ``[DONE]`` — terminal success frame (literal, not JSON).
 
@@ -22,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -33,6 +41,16 @@ from carrel import embeddings as emb
 from carrel import llm, usage
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
+from carrel.mcp import (
+    MCPError,
+    MCPUnavailable,
+    builtin_dispatch_map,
+    collect_builtin_tools,
+    collect_tools,
+    dispatch_tool_call,
+    get_mcp,
+    litellm_arguments,
+)
 from carrel.models import WikiChatMessage, WikiPage
 from carrel.schemas import (
     ChatMessageOut,
@@ -260,12 +278,140 @@ def _event(obj: dict[str, Any]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Tool loop (MCP-backed function calling)
+# ---------------------------------------------------------------------------
+
+
+async def _run_tool_loop(
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    fallback: str | None,
+    temperature: float,
+    timeout: int,
+    on_usage: Any,
+    tools: list[dict[str, Any]],
+    registry: Any,
+    builtin_handlers: dict[str, Any] | None,
+    max_iters: int,
+) -> AsyncIterator[bytes]:
+    """Run the model + tool + model loop, yielding SSE-ready bytes.
+
+    When ``tools`` is empty this is just a single streaming call that
+    yields text deltas as they arrive. When ``tools`` is non-empty we
+    buffer the text per iteration: the user never sees "thinking"
+    preambles — they only see the final text answer. Tool calls and
+    their results are surfaced as ``tool_call`` / ``tool_result`` events
+    so the UI can show what the agent did.
+
+    The loop is bounded by ``max_iters``; on the cap we emit a single
+    error frame and stop (no [DONE], so the client sees a broken stream
+    — the same shape as any other LLM failure).
+    """
+    if not tools:
+        try:
+            for delta in llm.chat_stream(
+                messages,
+                model=model,
+                fallback_model=fallback,
+                temperature=temperature,
+                timeout=timeout,
+                feature="wiki_chat",
+                on_usage=on_usage,
+            ):
+                yield _event({"t": delta})
+        except Exception as e:  # noqa: BLE001
+            logger.warning("wiki chat stream failed: %s", e)
+            yield _event({"error": str(e)})
+            return
+        return
+
+    for _iteration in range(max_iters):
+        text_buf: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+
+        try:
+            for delta in llm.chat_stream(
+                messages,
+                model=model,
+                fallback_model=fallback,
+                temperature=temperature,
+                timeout=timeout,
+                feature="wiki_chat",
+                on_usage=on_usage,
+                tools=tools,
+                on_tool_calls=lambda calls: tool_calls.extend(calls),
+            ):
+                if delta:
+                    text_buf.append(delta)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("wiki chat stream failed: %s", e)
+            yield _event({"error": str(e)})
+            return
+
+        if not tool_calls:
+            # The model produced a final text answer — flush it.
+            for d in text_buf:
+                yield _event({"t": d})
+            return
+
+        # Persist the assistant turn (with the tool_calls array) into
+        # the message list so the next iteration has it as context.
+        assistant_content = "".join(text_buf) or None
+        messages.append({
+            "role": "assistant",
+            "content": assistant_content,
+            "tool_calls": tool_calls,
+        })
+
+        for call in tool_calls:
+            name = (call.get("function") or {}).get("name") or ""
+            args = litellm_arguments(call)
+            yield _event({"type": "tool_call", "name": name, "args": args})
+            try:
+                result_str = await dispatch_tool_call(
+                    registry, name, args, builtins=builtin_handlers,
+                )
+                # The dispatcher prefixes upstream ``isError: True`` results
+                # (and in-process builtin handler errors) with ``[tool error]``
+                # rather than raising — the model is expected to see the
+                # message and degrade gracefully. The wire-format ``is_error``
+                # flag is the UI's signal to render the bubble as an error,
+                # so it MUST agree with that prefix.
+                is_error = result_str.startswith("[tool error]")
+            except MCPUnavailable as e:
+                logger.warning("wiki chat: MCP unavailable for %s: %s", name, e)
+                result_str = f"[unavailable] {e}"
+                is_error = True
+            except MCPError as e:
+                logger.warning("wiki chat: MCP error for %s: %s", name, e)
+                result_str = f"[error] {e}"
+                is_error = True
+            yield _event({
+                "type": "tool_result",
+                "name": name,
+                "content": result_str,
+                "is_error": is_error,
+            })
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.get("id") or "",
+                "content": result_str,
+            })
+
+    # Cap hit without a final text answer.
+    yield _event({
+        "error": f"wiki chat tool loop exceeded max iterations ({max_iters})",
+    })
+
+
+# ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
 
 
 @router.post("/chat")
-def wiki_chat(
+async def wiki_chat(
     req: ChatRequest,
     session: Session = Depends(get_session_dep),
 ):
@@ -280,7 +426,7 @@ def wiki_chat(
         # Empty wiki — surface a friendly error on the stream and stop.
         from fastapi.responses import StreamingResponse
 
-        def _empty_gen():
+        async def _empty_gen():
             yield _event({"error": "wiki is empty — run Compile wiki first"})
             yield _sse(_DONE)
 
@@ -299,27 +445,35 @@ def wiki_chat(
     fallback = _chat_fallback()
     temperature = app_config.llm.chat_temperature
     timeout = app_config.llm.request_timeout_seconds
+    max_iters = app_config.llm.wiki_chat_max_tool_iterations
 
-    def generate():
+    # Live tool list from the MCP registry + in-process builtins. The
+    # builtins (e.g. ``builtin__save_scholar_note``) run inside the FastAPI
+    # process and let the agent write to the wiki, which MCP servers can't
+    # easily do. ``collect_tools`` returns [] (or just the builtins) when MCP
+    # is disabled / not started, which keeps today's behavior intact on
+    # installs that don't run any MCP servers.
+    registry = get_mcp()
+    builtin_handlers = builtin_dispatch_map()
+    tools = collect_tools(registry, builtins=collect_builtin_tools())
+    on_usage = usage.make_usage_callback(session, feature="wiki_chat")
+
+    async def generate():
         # Sources frame first so the UI can render provenance before tokens.
         yield _event({"sources": sources})
-        try:
-            for delta in llm.chat_stream(
-                messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=temperature,
-                timeout=timeout,
-                feature="wiki_chat",
-                on_usage=usage.make_usage_callback(
-                    session, feature="wiki_chat",
-                ),
-            ):
-                yield _event({"t": delta})
-        except Exception as e:  # noqa: BLE001 - surface any LLM error on the stream
-            logger.warning("wiki chat stream failed: %s", e)
-            yield _event({"error": str(e)})
-            return
+        async for frame in _run_tool_loop(
+            messages,
+            model=model,
+            fallback=fallback,
+            temperature=temperature,
+            timeout=timeout,
+            on_usage=on_usage,
+            tools=tools,
+            registry=registry,
+            builtin_handlers=builtin_handlers,
+            max_iters=max_iters,
+        ):
+            yield frame
         yield _sse(_DONE)
 
     from fastapi.responses import StreamingResponse

@@ -124,6 +124,12 @@ class LLMConfig(BaseModel):
     # Per-page cap when assembling the <wiki-context> block (after stripping
     # frontmatter). Keeps the total prompt bounded even on long scholar pages.
     wiki_chat_fulltext_chars: int = 4000
+    # ---- Wiki chat MCP tool loop (M14.x) ----
+    # How many round-trips through the model + tool + model the wiki-chat
+    # agent is allowed to take before bailing out with an error. Each
+    # iteration may yield zero or more text deltas plus any number of
+    # tool calls; one tool call counts as part of the same iteration.
+    wiki_chat_max_tool_iterations: int = 5
 
     # ---- Paper dedup LLM judge (M10.6) ----
     # paper_dedup_judge_model defaults to the summarizer so the LLM judge uses

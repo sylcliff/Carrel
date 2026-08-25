@@ -1,10 +1,12 @@
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
+import { Wrench } from "lucide-react";
 import rehypeWikiLinks from "./rehypeWikiLinks";
 
 import {
   ChatPanel,
   type ChatPanelConfig,
+  type ToolEvent,
 } from "./ChatPanel";
 import {
   getWikiChatMessages,
@@ -67,14 +69,90 @@ export interface WikiChatProps {
 }
 
 export function WikiChat({ pagesExist }: WikiChatProps) {
+  // Tool events from the most recent run. Reset to [] on each new
+  // run start (the chat panel always passes a fresh empty list before
+  // the first tool frame arrives, so we treat empty as "nothing to show").
+  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const handleToolEvents = useCallback((events: ToolEvent[]) => {
+    setToolEvents(events);
+  }, []);
   // Memoize so the history-load effect only re-runs when `pagesExist`
   // actually flips (e.g. the user compiles the wiki mid-session).
   const config = useMemo<ChatPanelConfig<WikiSource>>(
     () => ({
       ...WIKI_CHAT_CONFIG,
       enabled: pagesExist,
+      onToolEvents: handleToolEvents,
     }),
-    [pagesExist],
+    [pagesExist, handleToolEvents],
   );
-  return <ChatPanel config={config} />;
+  return (
+    <div className="flex h-full flex-col gap-2">
+      <ChatPanel config={config} />
+      <ToolEventsStrip events={toolEvents} />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ToolEventsStrip — collapsible strip below the chat card that surfaces
+// the most recent run's tool calls. Hidden when no tools were used so
+// the wiki-chat surface looks identical to before for the common case.
+// ---------------------------------------------------------------------------
+
+function shortToolName(name: string): string {
+  // The server prefixes ``<server>__`` to avoid name collisions across
+  // MCP servers; the human-facing label is just the tool portion.
+  const idx = name.indexOf("__");
+  return idx >= 0 ? name.slice(idx + 2) : name;
+}
+
+function formatArgs(args: Record<string, unknown>): string {
+  try {
+    const json = JSON.stringify(args);
+    return json.length > 80 ? json.slice(0, 77) + "…" : json;
+  } catch {
+    return "";
+  }
+}
+
+function ToolEventsStrip({ events }: { events: ToolEvent[] }) {
+  if (events.length === 0) return null;
+  return (
+    <details className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+      <summary className="flex cursor-pointer items-center gap-1.5 select-none">
+        <Wrench className="h-3.5 w-3.5" />
+        <span>
+          Used {events.length} tool{events.length === 1 ? "" : "s"} for this answer
+        </span>
+      </summary>
+      <ul className="mt-2 space-y-1.5">
+        {events.map((evt, i) => (
+          <li
+            key={`${evt.name}-${i}`}
+            className="rounded border border-border/60 bg-background/60 px-2 py-1.5"
+          >
+            <div className="flex items-center gap-1.5">
+              <code className="font-mono text-[11px] text-foreground">
+                {shortToolName(evt.name)}
+              </code>
+              <code className="truncate font-mono text-[11px] text-muted-foreground">
+                ({formatArgs(evt.args)})
+              </code>
+              {evt.isError && (
+                <span className="ml-auto rounded bg-destructive/15 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+                  error
+                </span>
+              )}
+            </div>
+            <pre className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted-foreground">
+              {evt.content.length > 600
+                ? evt.content.slice(0, 600) + "…"
+                : evt.content}
+            </pre>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
 }

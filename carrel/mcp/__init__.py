@@ -9,6 +9,12 @@ The module-level singleton (``_registry``) mirrors the shape used by
 """
 from __future__ import annotations
 
+from carrel.mcp.builtin_tools import (
+    BUILTIN_SERVER_NAME,
+    builtin_dispatch_map,
+    collect_builtin_tools,
+    dispatch_builtin,
+)
 from carrel.mcp.client import (
     MCPClient,
     MCPClientRegistry,
@@ -18,13 +24,29 @@ from carrel.mcp.client import (
     stop_mcp,
 )
 from carrel.mcp.errors import MCPError, MCPUnavailable
+from carrel.mcp.tools import (
+    collect_tools,
+    dispatch_tool_call,
+    litellm_arguments,
+    mcp_tool_to_litellm,
+    parse_litellm_name,
+)
 
 __all__ = [
+    "BUILTIN_SERVER_NAME",
     "MCPClient",
     "MCPClientRegistry",
     "MCPError",
     "MCPUnavailable",
+    "builtin_dispatch_map",
+    "collect_builtin_tools",
+    "collect_tools",
+    "dispatch_builtin",
+    "dispatch_tool_call",
     "get_mcp",
+    "litellm_arguments",
+    "mcp_tool_to_litellm",
+    "parse_litellm_name",
     "reset_mcp",
     "start_mcp",
     "stop_mcp",

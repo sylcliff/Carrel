@@ -73,3 +73,29 @@ def protect_user_section(old_text: str | None, new_text: str) -> str:
     if _USER_SECTION_RE.search(new_text):
         return _USER_SECTION_RE.sub(lambda _m: section, new_text, count=1)
     return _insert_section(new_text, section)
+
+
+def append_to_user_section(
+    text: str, *, section_title: str, content: str
+) -> str:
+    """Insert ``## <section_title>\\n<content>`` inside the user section.
+
+    The block is always *appended* after whatever is already inside the user
+    section, never replacing user edits — repeated calls accumulate so a
+    model, a manual edit, and a future compile can coexist. If the page has
+    no user section yet, the standard :data:`EMPTY_USER_SECTION` placeholder
+    is inserted first so the new content has a home. The returned text is
+    otherwise byte-identical to ``text`` (frontmatter, compiled prose, etc.
+    are untouched).
+    """
+    block = f"\n## {section_title}\n\n{content.strip()}\n"
+    existing = extract_user_section(text)
+    if existing is None:
+        text = ensure_user_section(text)
+        existing = extract_user_section(text)
+        assert existing is not None  # ensure_user_section guarantees it
+    # Splice the new block in just before </section>.
+    updated = existing.replace("</section>", block + "</section>", 1)
+    if updated == existing:
+        return text
+    return text.replace(existing, updated, 1)

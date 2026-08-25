@@ -64,6 +64,11 @@ llm:
   # Wiki-wide RAG chat (M12): context = top-k wiki pages by embedding similarity.
   wiki_chat_top_k: 6
   wiki_chat_fulltext_chars: 4000     # per-page cap when assembling the <wiki-context> block
+  # Wiki chat MCP tool loop (M14.x): how many model + tool + model
+  # round-trips the agent is allowed to take before bailing out with
+  # an error. Bump if you expect deeply-nested tool use; lower it to
+  # keep requests cheap. Has no effect when no MCP tools are exposed.
+  wiki_chat_max_tool_iterations: 5
 
 embeddings:
   provider: volcengine
