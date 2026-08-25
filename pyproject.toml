@@ -22,6 +22,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "symspellpy>=6.7",
     "paramiko>=3.4",  # institutional SSH download fallback (optional at runtime)
+    "mcp>=1.0,<2",
 ]
 
 [project.optional-dependencies]

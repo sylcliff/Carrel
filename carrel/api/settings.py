@@ -68,6 +68,8 @@ ENV_LABELS: list[tuple[str, str, bool]] = [
     ("remote_retries",             "Remote retries",          False),
     ("remote_journal_min_age_days","Journal detection min age (days)", False),
     ("remote_journal_check_throttle_days", "Journal detection throttle (days)", False),
+    ("brave_api_key",              "Brave Search API key (MCP)",   True),
+    ("mcp_enabled",                "MCP integration enabled",      False),
 ]
 
 # Env-var names that carry a secret. The override list (ENV_OVERRIDE_FIELDS)
@@ -83,6 +85,7 @@ ENV_SECRET_VARS: set[str] = {
     "DATABASE_URL",
     "REMOTE_SSH_KEY_PATH",
     "REMOTE_SSH_KNOWN_HOSTS_PATH",
+    "BRAVE_API_KEY",
 }
 
 

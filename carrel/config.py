@@ -187,6 +187,46 @@ class ScheduleConfig(BaseModel):
     wiki_compile_cron: str = "17 11 * * *"
 
 
+class MCPServerConfig(BaseModel):
+    """One MCP server to spawn at startup.
+
+    ``command`` + ``args`` defines the subprocess; the runtime env is
+    Carrel's ``os.environ`` overlaid with ``env`` from this section and any
+    server-specific secrets from :class:`EnvSettings` (currently only
+    ``BRAVE_API_KEY`` for the ``brave_search`` server).
+
+    Per-server timeouts default to the global ``MCPConfig`` values when
+    left as ``None``, so most servers just override ``enabled`` and the
+    command/args.
+    """
+
+    enabled: bool = True
+    command: str
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    startup_timeout_seconds: int | None = None
+    tool_call_timeout_seconds: int | None = None
+
+
+class MCPConfig(BaseModel):
+    """Top-level MCP integration settings.
+
+    ``enabled`` is the master kill switch; ``env.mcp_enabled`` in
+    :class:`EnvSettings` is the second one. The registry only starts
+    servers when both are true.
+    """
+
+    enabled: bool = True
+    # Subprocess launch + initialize() timeout, per server (override per server
+    # in MCPServerConfig). First-ever `npx -y` can take 5-10s to fetch the
+    # package, so this is sized to leave headroom.
+    startup_timeout_seconds: int = 15
+    # Per-call timeout for `call_tool`; brave_web_search typically returns
+    # in <2s, but network + summarizer calls can take longer.
+    tool_call_timeout_seconds: int = 30
+    servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+
 SubKind = Literal["keyword", "author", "venue", "arxiv_category"]
 
 
@@ -211,6 +251,7 @@ class CarrelYAML(BaseModel):
     mineru: MinerUConfig = Field(default_factory=MinerUConfig)
     chunking: ChunkingConfig = Field(default_factory=ChunkingConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
     subscriptions: list[Subscription] = Field(default_factory=list)
 
 
@@ -270,6 +311,16 @@ class EnvSettings(BaseSettings):
     # date is this old; throttle re-checks per paper.
     remote_journal_min_age_days: int = 180
     remote_journal_check_throttle_days: int = 30
+
+    # ---- MCP integration (M14) ----
+    # API key for the Brave Search MCP server
+    # (https://github.com/brave/brave-search-mcp-server). Required for the
+    # `brave_search` server; missing → /mcp/health reports it offline.
+    brave_api_key: str | None = None
+    # Master kill switch for the MCP layer (env-level override of the
+    # YAML `mcp.enabled` flag). Defaults to true so a fresh install gets
+    # the feature without YAML edits; set to false to fully disable.
+    mcp_enabled: bool = True
 
 
 # ----------------------------- Loader -----------------------------

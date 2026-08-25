@@ -24,6 +24,7 @@ from carrel.api import (
     citations,
     embed,
     health,
+    mcp,
     papers,
     paper_dedup,
     paper_extract,
@@ -33,6 +34,7 @@ from carrel.api import (
     scholar_dedup,
     scholars,
     search,
+    search_brave,
     settings,
     subscriptions,
     summarize,
@@ -44,6 +46,7 @@ from carrel.api import (
 )
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
+from carrel.mcp import start_mcp, stop_mcp
 from carrel.scheduler import start_scheduler, stop_scheduler
 from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
@@ -114,11 +117,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     app_config = cfg
     app_env = env
     start_scheduler(cfg)
+    # MCP integration is optional and best-effort: a missing dependency
+    # (no Node.js), a bad key, or a hung subprocess should never prevent
+    # Carrel from starting. The /mcp/health endpoint reports the state.
+    try:
+        await start_mcp(cfg, env)
+    except Exception:
+        logger.exception("MCP startup failed; continuing without MCP")
     logger.info(
         "Carrel %s started. db=%s mineru=%s",
         __version__, env.database_url, cfg.mineru.base_url,
     )
     yield
+    try:
+        await stop_mcp()
+    except Exception:
+        logger.exception("error stopping MCP registry")
     stop_scheduler()
 
 
@@ -172,6 +186,8 @@ def create_app() -> FastAPI:
     app.include_router(paper_dedup.router)
     app.include_router(embed.router)
     app.include_router(search.router)
+    app.include_router(search_brave.router)
+    app.include_router(mcp.router)
     app.include_router(chat.router)
     app.include_router(settings.router)
     app.include_router(usage.router)

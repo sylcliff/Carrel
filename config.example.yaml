@@ -97,6 +97,24 @@ schedule:
   publication_check_enabled: false
   publication_check_cron: "0 10 * * 1"
 
+# ----- MCP integration (M14) -----
+# Generic Model Context Protocol client. Each entry under `servers` is one
+# stdio subprocess spawned at app startup; Carrel talks JSON-RPC over its
+# stdin/stdout. Only `brave_search` is wired in by default; add more by
+# following the same shape (command + args, optional `env` for non-secret
+# flags). PATCH /settings writes here; restart Carrel to apply changes
+# (subprocesses aren't hot-reloaded).
+mcp:
+  enabled: true
+  startup_timeout_seconds: 15   # `npx -y` first run can take 5-10s to fetch
+  tool_call_timeout_seconds: 30
+  servers:
+    brave_search:
+      enabled: true
+      command: npx
+      args: ["-y", "@brave/brave-search-mcp-server", "--transport", "stdio"]
+      env: {}
+
 # ----- Subscriptions (M2) -----
 # Each entry is one of:
 #   - { kind: keyword, value: "retrieval augmented generation", label: "RAG" }

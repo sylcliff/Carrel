@@ -709,6 +709,82 @@ class SettingsUpdate(BaseModel):
 
     sections: dict[str, dict[str, Any] | list[Any]] = Field(default_factory=dict)
 
+
+# -------- MCP integration (M14) --------
+
+
+class BraveSearchItem(BaseModel):
+    """One result from the Brave web search MCP tool.
+
+    Carrel-internal schema, not a passthrough of the native Brave response —
+    only the fields we actually use are surfaced. Extra fields on the
+    upstream payload are dropped at the adapter level
+    (see :mod:`carrel.search.brave`).
+    """
+
+    title: str
+    url: str
+    description: str | None = None
+    # Brave's `age` field is a human-readable relative-time string
+    # ("2 hours ago"), not a date. Keep as str.
+    age: str | None = None
+    language: str | None = None
+    family_friendly: bool | None = None
+    extra_snippets: list[str] = Field(default_factory=list)
+
+
+class BraveSearchRequest(BaseModel):
+    """Body for ``POST /search/brave``.
+
+    Mirrors a subset of the ``brave_web_search`` tool's input schema (only
+    the fields most users want to tune). Brave-specific options like
+    ``goggles`` / ``result_filter`` are intentionally omitted — add a
+    follow-up endpoint if those become a need.
+    """
+
+    query: str = Field(..., min_length=1, max_length=400)
+    count: int = Field(10, ge=1, le=20)
+    country: str | None = Field(None, max_length=2, description="ISO 3166-1 alpha-2")
+    search_lang: str | None = Field(None, max_length=8, description="BCP-47")
+    # pd / pw / pm / py, or a YYYY-MM-DDtoYYYY-MM-DD range. Validated server-
+    # side by passing the value through to Brave — we don't re-parse it.
+    freshness: str | None = None
+    safesearch: str | None = Field(None, pattern="^(off|moderate|strict)$")
+
+
+class BraveSearchResponse(BaseModel):
+    query: str
+    results: list[BraveSearchItem] = Field(default_factory=list)
+    total: int = 0
+    took_ms: int = 0
+
+
+class MCPToolInfo(BaseModel):
+    """One tool exposed by one running MCP server (for ``GET /mcp/tools``)."""
+
+    server: str
+    name: str
+    description: str | None = None
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPServerHealth(BaseModel):
+    name: str
+    enabled: bool  # YAML-enabled; the server may still be offline (crash, missing dep)
+    running: bool
+    tool_count: int = 0
+    last_error: str | None = None
+
+
+class MCPHealthResponse(BaseModel):
+    """Response for ``GET /mcp/health``."""
+
+    enabled: bool  # master kill switch (cfg + env)
+    servers: list[MCPServerHealth] = Field(default_factory=list)
+    # Set when a server failed to start so the UI can surface the cause
+    # without having to scrape logs.
+    error: str | None = None
+
 # Resolve the forward reference from ScholarDetail.wiki_page to WikiPageDetail,
 # which is defined later in this module.
 ScholarDetail.model_rebuild()

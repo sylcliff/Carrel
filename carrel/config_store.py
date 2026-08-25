@@ -29,6 +29,7 @@ from carrel.config import (
     EmbeddingsConfig,
     HttpConfig,
     LLMConfig,
+    MCPConfig,
     MinerUConfig,
     OpenAlexConfig,
     ScheduleConfig,
@@ -55,13 +56,14 @@ SECTION_MODELS: dict[str, type[BaseModel]] = {
     "chunking":         ChunkingConfig,
     "download":         DownloadConfig,
     "schedule":         ScheduleConfig,
+    "mcp":              MCPConfig,
 }
 
 # Sections whose change in the running process requires a full restart
 # (baked into uvicorn / middleware / StaticFiles at startup). The settings
 # API persists these to disk but does NOT mutate ``app_config`` for them;
 # the user has to restart for the new value to take effect.
-RESTART_REQUIRED_SECTIONS: set[str] = {"storage", "http", "cors"}
+RESTART_REQUIRED_SECTIONS: set[str] = {"storage", "http", "cors", "mcp"}
 
 # Env-overrideable field names per section. The Settings UI shows these as
 # read-only with an "overridden by VAR" chip — env wins at startup time

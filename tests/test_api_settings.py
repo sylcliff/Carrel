@@ -54,6 +54,7 @@ def test_get_settings_returns_all_sections(client, tmp_config: Path):
     expected_sections = {
         "storage", "http", "cors", "openalex", "arxiv", "semantic_scholar",
         "llm", "embeddings", "mineru", "chunking", "download", "schedule",
+        "mcp",
     }
     assert set(data["sections"]) == expected_sections
     assert data["yaml_path"] == str(tmp_config)
@@ -68,7 +69,7 @@ def test_get_settings_returns_all_sections(client, tmp_config: Path):
         if entry["is_secret"]:
             assert entry["value"] is None, entry
     # Restart-required sections are reported
-    assert set(data["restart_required_sections"]) == {"storage", "http", "cors"}
+    assert set(data["restart_required_sections"]) == {"storage", "http", "cors", "mcp"}
 
 
 def test_get_settings_masks_yaml_secrets(client, tmp_config: Path):
