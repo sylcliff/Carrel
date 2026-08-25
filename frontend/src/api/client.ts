@@ -1013,3 +1013,14 @@ export const getUsageByDay = (days = 30) =>
 
 export const getUsageRecent = (limit = 20) =>
   request<UsageRecent[]>(`/usage/recent?limit=${limit}`);
+
+export interface UsagePrompt {
+  feature: string;
+  label: string;
+  source: string;
+  system: string;
+  user_template: string;
+  notes: string;
+}
+
+export const getUsagePrompts = () => request<UsagePrompt[]>("/usage/prompts");

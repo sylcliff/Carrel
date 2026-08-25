@@ -304,6 +304,49 @@ def test_api_usage_endpoints_shape(client, session):
     assert r[0]["paper_id"] == "abc"
 
 
+# ---------------------------------------------------------------------------
+# Prompt catalog
+# ---------------------------------------------------------------------------
+
+
+def test_api_usage_prompts_lists_every_feature(client):
+    """``/usage/prompts`` returns the full prompt catalog. The set of
+    feature names must cover every ``feature=`` value that
+    :func:`usage.make_usage_callback` has ever been called with, so a
+    typo in a call site surfaces as a missing row."""
+    rows = client.get("/usage/prompts").json()
+    assert isinstance(rows, list) and rows, "catalog must not be empty"
+    features = {r["feature"] for r in rows}
+    # Every feature visible in /usage/by-feature should also be catalogued.
+    expected = {
+        "summarize",
+        "extract",
+        "topics",
+        "dedup_judge",
+        "wiki_scholar",
+        "wiki_concept",
+        "wiki_question",
+        "paper_chat",
+        "wiki_chat",
+    }
+    assert features == expected, features ^ expected
+    # Each row has the contract shape the UI relies on.
+    for r in rows:
+        for key in ("feature", "label", "source", "system", "user_template", "notes"):
+            assert key in r, f"{r['feature']} missing {key}"
+        assert r["system"].strip(), f"{r['feature']} has empty system prompt"
+        assert r["user_template"].strip(), f"{r['feature']} has empty user template"
+        # `source` points at the module that owns the system prompt
+        # constant, so an editor can jump from the UI to the file.
+        assert "._SYSTEM_PROMPT" in r["source"] or r["source"].endswith(":_SYSTEM_PROMPT")
+
+
+def test_api_usage_prompts_is_readonly(client):
+    """The catalog endpoint is read-only — POST should be 405."""
+    r = client.post("/usage/prompts")
+    assert r.status_code == 405
+
+
 def test_api_usage_since_days_param(client, session):
     """since_days=1 should exclude rows older than 24h."""
     now = datetime.now(UTC)

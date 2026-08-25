@@ -13,6 +13,8 @@ import SyncStatus from "@/pages/SyncStatus";
 import Settings from "@/pages/Settings";
 import Topics from "@/pages/Topics";
 import Usage from "@/pages/Usage";
+import Agent from "@/pages/Agent";
+import AgentPipeline from "@/pages/AgentPipeline";
 import WikiIndex from "@/pages/WikiIndex";
 import WikiPageList from "@/pages/WikiPageList";
 import WikiPageDetail from "@/pages/WikiPageDetail";
@@ -34,6 +36,7 @@ function Header() {
           <Link to="/subscriptions" className="hover:text-foreground">Subscriptions</Link>
           <Link to="/sync" className="hover:text-foreground">Sync</Link>
           <Link to="/usage" className="hover:text-foreground">Usage</Link>
+          <Link to="/agent" className="hover:text-foreground">Agent</Link>
           <Link to="/settings" className="hover:text-foreground">Settings</Link>
         </nav>
         <Tooltip>
@@ -74,6 +77,8 @@ export default function App() {
           <Route path="/subscriptions" element={<Subscriptions />} />
           <Route path="/sync" element={<SyncStatus />} />
           <Route path="/usage" element={<Usage />} />
+          <Route path="/agent" element={<Agent />} />
+          <Route path="/agent/:pipelineId" element={<AgentPipeline />} />
           <Route path="/settings" element={<Settings />} />
           <Route path="/papers/:id" element={<PaperDetail />} />
         </Routes>

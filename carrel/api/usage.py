@@ -7,6 +7,11 @@ Five GETs:
   * ``/usage/by-day``      — per-day series for the last ``days`` (default 30)
   * ``/usage/recent``      — most recent N rows
 
+Plus a sixth:
+  * ``/usage/prompts``     — catalog of every LLM prompt the app issues
+    (system + user-template), so the Usage page can render an at-a-glance
+    view of "what does this app actually ask the LLM".
+
 All accept an optional ``since_days`` query param (``summary``, ``by_model``,
 ``by_feature``) so the UI can show 7d / 30d / all-time windows without
 hitting the DB twice.
@@ -16,7 +21,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
 
-from carrel import usage
+from carrel import prompts, usage
 from carrel.db import get_session_dep
 
 router = APIRouter(tags=["usage"])
@@ -60,3 +65,13 @@ def get_recent(
     session: Session = Depends(get_session_dep),
 ) -> list[dict]:
     return usage.recent(session, limit=limit)
+
+
+@router.get("/usage/prompts")
+def get_prompts() -> list[dict]:
+    """Catalog of every LLM prompt the app issues.
+
+    Read-only; sourced from :mod:`carrel.prompts` so the catalog stays
+    in sync with the actual call sites.
+    """
+    return prompts.list_prompts()
