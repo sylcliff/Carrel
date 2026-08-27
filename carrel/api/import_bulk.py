@@ -31,9 +31,9 @@ from carrel.db import get_session_dep
 from carrel.models import Job, JobKind, JobStatus
 from carrel.schemas import (
     BulkImportIn,
+    BulkImportItem,
     BulkImportItemOut,
     BulkImportOut,
-    ImportPaperIn,
 )
 from carrel.sources import openalex_client as oa
 from carrel.sources.normalize import is_zenodo
@@ -59,37 +59,147 @@ def _new_stats(total: int) -> dict[str, Any]:
     }
 
 
+# Fast-path trigger: when these three are all present we have enough inline
+# metadata to skip the OpenAlex / S2 round-trip and upsert straight to the
+# DB. ``source`` drives the upsert path in ``_import_one_paper``; ``title``
+# is mandatory on the Paper row; ``authors`` lets us populate the JSON column
+# without an OA authorship fetch.
+_FAST_PATH_KEYS = ("source", "title", "authors")
+
+
+def _has_inline_metadata(item: BulkImportItem) -> bool:
+    """True when ``item`` carries enough metadata to skip the resolver."""
+    return all(
+        getattr(item, k) is not None and getattr(item, k) != ""
+        for k in _FAST_PATH_KEYS
+    )
+
+
+def _search_result_to_work(item: BulkImportItem) -> tuple[dict, str]:
+    """Build an OpenAlex Work-shaped dict from inline metadata on a bulk item.
+
+    Used by the fast path: the Search page already had to fetch the work
+    once to render results, so re-fetching it from OpenAlex just to upsert
+    the same data is wasted work. This synthesises a dict shaped exactly
+    like the one :mod:`carrel.sources.openalex_client` returns, so the
+    existing :func:`_import_one_paper` upsert logic runs untouched.
+
+    Returns ``(work, source)`` where ``source`` is the value the caller
+    should pass to ``_import_one_paper``. ``source="openalex"`` is the
+    common case (search results from OA); ``"semantic_scholar"`` is used
+    when the item has an S2 id but no OA id.
+
+    Limitations vs. a real OpenAlex fetch:
+    - No ``abstract_inverted_index`` — only a flat abstract if the
+      search result carried one. S2's TLDR is the more common surrogate
+      anyway.
+    - Author affiliations / OpenAlex author ids are unknown. The author
+      list is plain ``{name}`` dicts; the backfill-authors pipeline can
+      enrich them later.
+    - No PDF candidate ranking — we trust whatever ``pdf_url`` the
+      search result gave us. The download-time fallback in
+      :func:`carrel.api.process._pdf_candidates` heals mislabeled ones.
+    """
+    source = item.source or "openalex"
+    authorships = [
+        {
+            "author": {"display_name": name, "id": None},
+            "institutions": [],
+        }
+        for name in (item.authors or [])
+        if isinstance(name, str) and name.strip()
+    ]
+
+    # Determine the canonical work id the upsert should use. For OA items
+    # it's the W-id (or the full URL — ``oa.work_id`` strips the prefix).
+    # For S2-only items the existing code stores ``"s2:" + paperId`` so
+    # dedup-by-s2_id still works downstream.
+    if source == "openalex":
+        work_id = item.openalex_id or ""
+    elif source == "semantic_scholar":
+        work_id = f"s2:{item.s2}" if item.s2 else ""
+    else:
+        # arxiv-only or unknown — fall through to the resolver; we shouldn't
+        # be here because ``_has_inline_metadata`` only triggers the fast
+        # path for source ∈ {openalex, semantic_scholar}.
+        work_id = item.openalex_id or (f"s2:{item.s2}" if item.s2 else "")
+
+    work: dict[str, Any] = {
+        "id": work_id,
+        "title": item.title or "(untitled)",
+        "doi": item.doi,
+        "publication_date": item.publication_date,
+        "publication_year": None,
+        "cited_by_count": item.citation_count,
+        "primary_location": (
+            {"source": {"display_name": item.venue}} if item.venue else None
+        ),
+        "authorships": authorships,
+        # S2's upsert path reads ``work["authors"]`` as ``[{"name": "..."}]``
+        # rather than the OA-shaped ``authorships`` list. Populate it so
+        # the S2 fast path produces a non-empty authors column. For OA
+        # items the OA upsert path uses ``authorships`` and ignores this.
+        "authors": [{"name": name} for name in (item.authors or []) if name],
+        # Search results carry the flat abstract when OA / S2 had one; the
+        # import path accepts both shapes. Don't set abstract_inverted_index
+        # — we'd have to fabricate it.
+        "abstract": item.abstract,
+        "open_access": {"is_oa": bool(item.pdf_url)},
+        "ids": {"arxiv": item.arxiv_id} if item.arxiv_id else {},
+        # Marker the S2 path uses to branch; harmless when source=openalex.
+        "s2_paper_id": item.s2 if source == "semantic_scholar" else None,
+    }
+    return work, source
+
+
 def _process_one(
-    session: Session, item: ImportPaperIn
+    session: Session, item: BulkImportItem
 ) -> BulkImportItemOut:
     """Resolve + upsert one paper, returning a per-item outcome.
 
-    All exceptions are caught and surfaced as ``status="error"`` so the
-    batch never aborts on a single bad item (matches the soft-fail model
-    of ``POST /search``'s ``warnings`` field).
+    Fast path: when the item carries inline metadata (``source`` + ``title``
+    + ``authors``), build a Work-shaped dict directly and skip the per-item
+    OpenAlex / S2 round-trip. This is the common case for the Search page,
+    which already fetched the data to render results.
+
+    Slow path: when only identifiers are present, fall back to
+    :func:`_resolve_work_for_import` — same chain ``POST /import`` uses.
+    This is the path CLI / curl callers take.
+
+    All exceptions on either path are caught and surfaced as
+    ``status="error"`` so the batch never aborts on a single bad item
+    (matches the soft-fail model of ``POST /search``'s ``warnings``).
     """
     try:
-        resolved = _resolve_work_for_import(
-            oa_id=item.openalex_id,
-            doi=item.doi,
-            arxiv_id=item.arxiv_id,
-            s2_id=item.s2,
-            title=item.title,
-            session=session,
-        )
-        if not resolved:
-            return BulkImportItemOut(
-                id=None,
+        if _has_inline_metadata(item):
+            # Fast path — no HTTP. The frontend already paid for the
+            # metadata once during search; re-fetching is wasted work.
+            work, source = _search_result_to_work(item)
+            display_title = work["title"]
+        else:
+            resolved = _resolve_work_for_import(
+                oa_id=item.openalex_id,
+                doi=item.doi,
+                arxiv_id=item.arxiv_id,
+                s2_id=item.s2,
                 title=item.title,
-                created=False,
-                status="error",
-                error="not found on OpenAlex or Semantic Scholar",
+                session=session,
             )
-        work, source = resolved
+            if not resolved:
+                return BulkImportItemOut(
+                    id=None,
+                    title=item.title,
+                    created=False,
+                    status="error",
+                    error="not found on OpenAlex or Semantic Scholar",
+                )
+            work, source = resolved
+            display_title = oa.work_title(work) or item.title
+
         if is_zenodo(oa.work_doi(work), oa.work_venue(work)):
             return BulkImportItemOut(
                 id=None,
-                title=oa.work_title(work) or item.title,
+                title=display_title,
                 created=False,
                 status="error",
                 error="Zenodo deposits cannot be imported",
@@ -97,7 +207,7 @@ def _process_one(
         out = _import_one_paper(session, work, source)
         return BulkImportItemOut(
             id=out.id,
-            title=oa.work_title(work) or item.title,
+            title=display_title,
             created=out.created,
             status="ok",
         )
@@ -141,7 +251,7 @@ def _record_item(job: Job, item_out: BulkImportItemOut, index: int) -> None:
 
 
 def _drive_batch(
-    session: Session, job_id: int, items: list[ImportPaperIn]
+    session: Session, job_id: int, items: list[BulkImportItem]
 ) -> list[BulkImportItemOut]:
     """Run the batch serially against ``session``; mutate job.stats as we go.
 
@@ -237,6 +347,6 @@ def _run_bulk_background(job_id: int, items_payload: list[dict[str, Any]]) -> No
     from carrel.db import get_app_engine
 
     engine = get_app_engine()
-    items = [ImportPaperIn.model_validate(it) for it in items_payload]
+    items = [BulkImportItem.model_validate(it) for it in items_payload]
     with SqlSession(engine) as session:
         _drive_batch(session, job_id, items)

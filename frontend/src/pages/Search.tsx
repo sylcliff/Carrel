@@ -20,6 +20,7 @@ import {
   importPapers,
   searchPapers,
   searchSemantic,
+  type BulkImportItem,
   type SearchResultItem,
   type SearchSource,
   type SemanticSearchResult,
@@ -375,13 +376,38 @@ export default function Search() {
     setErr(null);
     setBulkDoneSummary(null);
 
-    const payload = items.map((r) => ({
-      openalex_id: r.ids.openalex ?? undefined,
-      doi: r.ids.doi ?? undefined,
-      arxiv_id: r.ids.arxiv ?? undefined,
-      s2: r.ids.s2 ?? undefined,
-      title: r.title,
-    }));
+    const payload: BulkImportItem[] = items.map((r) => {
+      // Pick the strongest available id for the upsert and tag ``source``
+      // so the backend takes the fast path. The Search page already paid
+      // to fetch the metadata once during search — re-fetching it just
+      // to upsert the same data is wasted work (~1s/paper of HTTP).
+      //
+      // Priority mirrors the backend's resolver: OA id > S2 id (only used
+      // when OA had no copy). arxiv-only items fall back to the slow
+      // resolver path; that's fine because the search results almost
+      // always carry an OA id alongside an arxiv id.
+      const oa = r.ids.openalex ?? undefined;
+      const s2 = r.ids.s2 ?? undefined;
+      const source: BulkImportItem["source"] = oa
+        ? "openalex"
+        : s2
+          ? "semantic_scholar"
+          : r.sources[0] ?? null;
+      return {
+        openalex_id: oa,
+        doi: r.ids.doi ?? undefined,
+        arxiv_id: r.ids.arxiv ?? undefined,
+        s2,
+        title: r.title,
+        authors: r.authors,
+        venue: r.venue,
+        publication_date: r.publication_date,
+        abstract: r.abstract,
+        citation_count: r.citation_count,
+        pdf_url: r.pdf_url,
+        source,
+      };
+    });
 
     // ≤20 items: inline (per-item results back immediately, no polling).
     // >20 items: background (returns just a job_id; we poll /sync/jobs/{id}).

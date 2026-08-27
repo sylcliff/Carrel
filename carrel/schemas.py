@@ -455,6 +455,33 @@ class ImportPaperOut(BaseModel):
     created: bool  # True if newly inserted, False if already existed
 
 
+class BulkImportItem(ImportPaperIn):
+    """One element of a bulk import. Carries the same identifiers as
+    :class:`ImportPaperIn` plus optional inline metadata.
+
+    The inline metadata fields (``authors`` / ``venue`` / ``publication_date``
+    / ``abstract`` / ``citation_count`` / ``pdf_url`` / ``source``) are
+    populated by the Search page from a live ``SearchResultItem`` and let
+    the backend skip the per-item OpenAlex / S2 HTTP lookup — the data is
+    already in hand. When *all* of ``source`` + ``title`` + ``authors`` are
+    provided, the worker takes the "fast path": build an OpenAlex
+    Work-shaped dict from the inline fields and upsert straight to the DB.
+    Items missing any of those three fall back to the resolver path used by
+    :func:`import_external_paper` (CLI / curl callers who only have ids).
+    """
+
+    authors: list[str] | None = None
+    venue: str | None = None
+    publication_date: str | None = None  # ISO date (YYYY or YYYY-MM-DD)
+    abstract: str | None = None
+    citation_count: int | None = None
+    pdf_url: str | None = None
+    # Which search source the metadata came from. Drives the upsert path
+    # in ``_import_one_paper`` (openalex → OA schema, semantic_scholar →
+    # S2 schema, arxiv → resolved via the existing fallback).
+    source: str | None = None  # "openalex" | "semantic_scholar" | "arxiv"
+
+
 class BulkImportIn(BaseModel):
     """One-shot import of N papers by any combination of identifiers.
 
@@ -467,9 +494,14 @@ class BulkImportIn(BaseModel):
     caller polls ``GET /sync/jobs/{id}`` for progress. Pass
     ``background=false`` to get the full per-item result inline (suitable
     for 1-20 papers selected from a search).
+
+    Items can carry inline metadata (see :class:`BulkImportItem`) to avoid
+    re-fetching from OpenAlex / S2 when the caller already has it. The
+    Search page does this; CLI / curl users who only have ids can omit
+    those fields and the resolver path runs.
     """
 
-    items: list[ImportPaperIn] = Field(..., min_length=1, max_length=1000)
+    items: list[BulkImportItem] = Field(..., min_length=1, max_length=1000)
     background: bool = True
 
 

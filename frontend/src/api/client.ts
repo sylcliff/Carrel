@@ -986,14 +986,25 @@ export const importPaper = (body: {
 // upserts in the background. Inline mode (`background=false`) is reserved
 // for ≤20 items where the user wants per-row results immediately.
 //
-// Each item mirrors `importPaper`'s body — the backend runs each through
-// the same _resolve_work_for_import → _import_one_paper chain.
+// Each item mirrors `importPaper`'s body plus optional inline metadata.
+// When `source` + `title` + `authors` are all present, the backend takes
+// the fast path: it builds the upsert payload from these fields and skips
+// the per-item OpenAlex / S2 round-trip. The Search page always sends
+// inline data; CLI / curl callers can omit the optional fields and the
+// resolver path runs.
 export interface BulkImportItem {
   openalex_id?: string;
   doi?: string;
   arxiv_id?: string;
   s2?: string;
   title?: string;
+  authors?: string[];
+  venue?: string | null;
+  publication_date?: string | null;
+  abstract?: string | null;
+  citation_count?: number | null;
+  pdf_url?: string | null;
+  source?: "openalex" | "semantic_scholar" | "arxiv" | "library" | null;
 }
 
 export interface BulkImportResultItem {

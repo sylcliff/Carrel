@@ -391,3 +391,199 @@ def test_single_import_still_works_after_refactor(session, client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body == {"id": "WREFACTOR", "created": True}
+
+
+# ---------------------------------------------------------------------------
+# Fast path: inline metadata skips the resolver
+# ---------------------------------------------------------------------------
+
+
+def _fast_path_item(**overrides):
+    """Build a BulkImportItem that exercises the fast path (source+title+authors)."""
+    base = {
+        "openalex_id": "WFAST",
+        "title": "Fast path paper",
+        "authors": ["Alice", "Bob"],
+        "venue": "ICML",
+        "publication_date": "2024-06-01",
+        "abstract": "An abstract.",
+        "citation_count": 42,
+        "pdf_url": "https://example.com/paper.pdf",
+        "source": "openalex",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_fast_path_skips_resolver(session, client, monkeypatch):
+    """Items with inline metadata must NOT call ``_resolve_work_for_import``.
+
+    Proves the fast path is actually taken: if the resolver is patched to
+    raise, an all-inline batch still completes successfully.
+    """
+    import carrel.api.import_bulk as bulk_mod
+
+    def explode(**_kwargs):
+        raise AssertionError("resolver should not be called for inline-metadata items")
+
+    monkeypatch.setattr(bulk_mod, "_resolve_work_for_import", explode)
+
+    r = _post_bulk(
+        client,
+        [_fast_path_item(openalex_id="WFAST1"), _fast_path_item(openalex_id="WFAST2")],
+        background=False,
+    )
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert [it["status"] for it in items] == ["ok", "ok"]
+    assert all(it["created"] for it in items)
+    for wid in ("WFAST1", "WFAST2"):
+        p = session.get(Paper, wid)
+        assert p is not None
+        assert p.title == "Fast path paper"
+        assert p.venue == "ICML"
+        assert [a["name"] for a in p.authors] == ["Alice", "Bob"]
+
+
+def test_fast_path_idempotent_reimport(session, client, monkeypatch):
+    """A fast-path re-import of an already-existing paper gets
+    ``created=False`` on the second call, just like the slow path."""
+    import carrel.api.import_bulk as bulk_mod
+
+    def explode(**_kwargs):
+        raise AssertionError("resolver should not be called")
+
+    monkeypatch.setattr(bulk_mod, "_resolve_work_for_import", explode)
+
+    item = _fast_path_item(openalex_id="WREI")
+    r1 = _post_bulk(client, [item], background=False)
+    assert r1.status_code == 200, r1.text
+    assert r1.json()["items"][0]["created"] is True
+
+    r2 = _post_bulk(client, [item], background=False)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["items"][0]["created"] is False
+
+
+def test_fast_path_heals_arxiv_pdf_on_existing_row(session, client, monkeypatch):
+    """An existing paper with arxiv_id but no pdf_url gets healed by the
+    fast path — same behaviour as the slow path, no resolver needed."""
+    paper = Paper(
+        id="WHEAL",
+        id_kind="openalex",
+        title="Heal me",
+        publication_date=date(2024, 1, 1),
+        authors=[],
+        arxiv_id="2401.00001",
+        pdf_url=None,
+        oa_status="none",
+        status=PaperStatus.pending.value,
+        source=SourceKind.openalex.value,
+        in_library=True,
+        discarded=False,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    session.add(paper)
+    session.commit()
+
+    import carrel.api.import_bulk as bulk_mod
+
+    def explode(**_kwargs):
+        raise AssertionError("resolver should not be called")
+
+    monkeypatch.setattr(bulk_mod, "_resolve_work_for_import", explode)
+
+    r = _post_bulk(
+        client,
+        [_fast_path_item(
+            openalex_id="WHEAL",
+            arxiv_id="2401.00001",
+            pdf_url=None,
+        )],
+        background=False,
+    )
+    assert r.status_code == 200, r.text
+    session.refresh(paper)
+    assert paper.pdf_url == "https://arxiv.org/pdf/2401.00001.pdf"
+    assert paper.oa_status == "oa"
+
+
+def test_fast_path_s2_record_uses_s2_id_kind(session, client, monkeypatch):
+    """A fast-path item with ``source=semantic_scholar`` is inserted with
+    id ``s2:<paperId>`` and ``id_kind=semantic_scholar`` — same as the
+    slow-path S2 branch."""
+    import carrel.api.import_bulk as bulk_mod
+
+    def explode(**_kwargs):
+        raise AssertionError("resolver should not be called")
+
+    monkeypatch.setattr(bulk_mod, "_resolve_work_for_import", explode)
+
+    r = _post_bulk(
+        client,
+        [{
+            "s2": "fastabc",
+            "title": "S2-only paper",
+            "authors": ["Carol"],
+            "venue": "Workshop Y",
+            "publication_date": "2023-09-15",
+            "citation_count": 7,
+            "source": "semantic_scholar",
+        }],
+        background=False,
+    )
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items[0]["status"] == "ok"
+    assert items[0]["id"] == "s2:fastabc"
+    p = session.get(Paper, "s2:fastabc")
+    assert p is not None
+    # id_kind is a free-form string (the SourceKind enum doesn't have an
+    # S2 value); the existing S2 path uses "semanticscholar" (no underscore).
+    assert p.id_kind == "semanticscholar"
+    assert p.source == SourceKind.both.value
+    assert [a["name"] for a in p.authors] == ["Carol"]
+
+
+def test_fallback_to_resolver_when_inline_metadata_missing(
+    session, client, monkeypatch
+):
+    """Items without source+title+authors go through the resolver path.
+    Backward compatibility for id-only callers (CLI / curl)."""
+    _patch_resolver(
+        monkeypatch,
+        by_oa_id={"W1": (_oa_work(w_id="W1", title="Resolver path"), "openalex")},
+    )
+    r = _post_bulk(client, [{"openalex_id": "W1"}], background=False)
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items[0]["status"] == "ok"
+    assert items[0]["title"] == "Resolver path"
+    assert session.get(Paper, "W1") is not None
+
+
+def test_fast_path_zenodo_blocked(session, client, monkeypatch):
+    """Fast-path Zenodo rejection mirrors the slow path: a Zenodo DOI
+    is blocked even when the item has full inline metadata."""
+    import carrel.api.import_bulk as bulk_mod
+
+    def explode(**_kwargs):
+        raise AssertionError("resolver should not be called")
+
+    monkeypatch.setattr(bulk_mod, "_resolve_work_for_import", explode)
+
+    r = _post_bulk(
+        client,
+        [_fast_path_item(
+            openalex_id="ZEN1",
+            doi="https://doi.org/10.5281/zenodo.9999",
+            venue="Zenodo",
+        )],
+        background=False,
+    )
+    assert r.status_code == 200, r.text
+    items = r.json()["items"]
+    assert items[0]["status"] == "error"
+    assert "Zenodo" in items[0]["error"]
+    assert session.get(Paper, "ZEN1") is None
