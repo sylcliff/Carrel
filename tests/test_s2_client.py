@@ -410,6 +410,35 @@ def test_max_retries_config_is_wired(monkeypatch):
     assert hits["n"] == 1  # range(1): a single attempt, no retries
 
 
+def test_5xx_retries_use_aggressive_backoff_config(monkeypatch):
+    # Pin the aggressive retry policy: 5 attempts with base wait 4s. If
+    # anyone tunes these back down, this test fails loudly.
+    assert s2.MAX_RETRIES == 5
+    assert s2._BASE_WAIT_SECONDS == 4.0
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))
+    # Don't call configure() — it would re-enable the limiter and add its own
+    # spacing sleeps to the list. We're testing the retry path, not the limiter.
+    s2._limiter = s2._RateLimiter()
+    s2._max_retries = s2.MAX_RETRIES
+    # Force a fixed backoff so we can assert the sequence deterministically.
+    monkeypatch.setattr(s2, "_backoff", lambda attempt: float(attempt + 1))
+
+    hits = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        hits["n"] += 1
+        return httpx.Response(500, json={"error": "boom"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    with pytest.raises(S2Error):
+        fetch_citations(doi="10.1/x", client=client)
+    # 5 attempts → 4 sleeps between them.
+    assert hits["n"] == 5
+    assert sleeps == [1.0, 2.0, 3.0, 4.0]
+
+
 def test_429_retry_after_sets_global_penalty_and_caps(monkeypatch):
     sleeps: list[float] = []
     monkeypatch.setattr(s2.time, "sleep", lambda s: sleeps.append(s))

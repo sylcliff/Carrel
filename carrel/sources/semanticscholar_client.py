@@ -36,8 +36,12 @@ DEFAULT_BASE_URL = "https://api.semanticscholar.org"
 DEFAULT_USER_AGENT = "Carrel/0.1 (+https://github.com/)"
 # S2 caps the citations page size at 1000; we default lower to stay polite.
 DEFAULT_CITATIONS_LIMIT = 500
-MAX_RETRIES = 3
-_BASE_WAIT_SECONDS = 2.0
+MAX_RETRIES = 5
+_BASE_WAIT_SECONDS = 4.0
+# S2 occasionally surfaces 5xx for short blips. Bumping retries from 3→5 and
+# base wait 2s→4s buys ~30-60s of cumulative backoff to absorb transient
+# outages before surfacing a "source unavailable" warning to the user.
+# Trade-off: worst-case latency per request when S2 is genuinely down.
 # S2 rate limits (per semanticscholar.org/product/api): an API key gets an
 # introductory 1 request/second shared across ALL endpoints; unauthenticated
 # traffic shares a congested pool that "may be further throttled". We default
