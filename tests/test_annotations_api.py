@@ -215,6 +215,53 @@ def test_delete_paper_removes_paper_tags(client, session):
     assert tags["nlp"] == 0
 
 
+def test_delete_paper_cascades_concept_question_chat_rows(client, session):
+    """Regression: paper_concepts / paper_questions / chat_messages FK to
+    papers.id without ON DELETE CASCADE. delete_paper must clean them up
+    before the commit, otherwise the request 500s with IntegrityError.
+    """
+    from datetime import UTC, datetime
+    from sqlmodel import select
+
+    from carrel.models import ChatMessage, PaperConcept, PaperQuestion
+
+    session.add(_paper("W1"))
+    session.commit()
+
+    # Seed child rows that previously blocked the delete.
+    session.add(
+        PaperConcept(
+            paper_id="W1",
+            term_normalized="rag",
+            term_display="Retrieval-Augmented Generation",
+        )
+    )
+    session.add(
+        PaperQuestion(
+            paper_id="W1",
+            question_normalized="how does rag work",
+            question_display="How does RAG work?",
+        )
+    )
+    session.add(
+        ChatMessage(
+            paper_id="W1",
+            role="user",
+            content="hi",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    session.commit()
+
+    r = client.delete("/papers/W1")
+    assert r.status_code == 200, r.text
+    assert session.get(Paper, "W1") is None
+    assert session.exec(select(PaperConcept).where(PaperConcept.paper_id == "W1")).all() == []
+    assert session.exec(select(PaperQuestion).where(PaperQuestion.paper_id == "W1")).all() == []
+    assert session.exec(select(ChatMessage).where(ChatMessage.paper_id == "W1")).all() == []
+
+
 # ---- notes in local search ----
 
 

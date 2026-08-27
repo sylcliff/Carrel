@@ -11,7 +11,17 @@ from sqlalchemy import String, cast, func
 from sqlmodel import Session, col, or_, select
 
 from carrel.db import get_session_dep
-from carrel.models import Chunk, Paper, PaperTag, PaperTopic, Tag, Topic
+from carrel.models import (
+    ChatMessage,
+    Chunk,
+    Paper,
+    PaperConcept,
+    PaperQuestion,
+    PaperTag,
+    PaperTopic,
+    Tag,
+    Topic,
+)
 from carrel.schemas import AuthorRef, PaperDetail, PaperSummary
 
 logger = logging.getLogger(__name__)
@@ -318,6 +328,25 @@ def delete_paper(
     ).all()
     for link in tp_links:
         session.delete(link)
+
+    # LLM-extracted concept/question rows and any RAG chat transcript also FK
+    # to papers.id without ON DELETE CASCADE. Clean them up so the Paper delete
+    # doesn't hit a foreign-key violation (which surfaces as a 500).
+    concepts = session.exec(
+        select(PaperConcept).where(PaperConcept.paper_id == paper_id)
+    ).all()
+    for row in concepts:
+        session.delete(row)
+    questions = session.exec(
+        select(PaperQuestion).where(PaperQuestion.paper_id == paper_id)
+    ).all()
+    for row in questions:
+        session.delete(row)
+    chat_rows = session.exec(
+        select(ChatMessage).where(ChatMessage.paper_id == paper_id)
+    ).all()
+    for row in chat_rows:
+        session.delete(row)
 
     # Resolve the on-disk paper directory before deleting the row.
     from carrel.main import app_config
