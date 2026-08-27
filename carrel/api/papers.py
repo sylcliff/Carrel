@@ -6,7 +6,7 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import String, cast, func
 from sqlmodel import Session, col, or_, select
 
@@ -23,6 +23,7 @@ from carrel.models import (
     Topic,
 )
 from carrel.schemas import AuthorRef, PaperDetail, PaperSummary
+from carrel.sources.normalize import format_journal_citation
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ def _to_summary(
         favorite=p.favorite,
         tags=tags or [],
         topics=topics or [],
+        doi=p.doi,
+        arxiv_id=p.arxiv_id,
+        s2_paper_id=p.s2_paper_id,
     )
 
 
@@ -82,6 +86,7 @@ def _to_detail(
         md_path=p.md_path,
         summary_zh=p.summary_zh,
         error=p.error,
+        journal_citation=format_journal_citation(p.raw_meta),
         influential_citation_count=p.influential_citation_count,
         reference_count=p.reference_count,
         citations_updated_at=p.citations_updated_at,
@@ -161,6 +166,12 @@ def list_papers(
         None, description="Case-insensitive substring match on title or authors"
     ),
     sort: str = Query("added", description="Sort order"),
+    # FastAPI injects the live Response object when the parameter is annotated
+    # as `Response`; do NOT union with None (FastAPI rejects that as an
+    # invalid Pydantic field type). A default of `Response()` keeps Python
+    # happy — the previous parameters all have Query() defaults so this one
+    # must too. We use it to publish X-Total-Count.
+    response: Response = Response(),
 ) -> list[PaperSummary]:
     allowed_sorts = {
         "added",
@@ -184,26 +195,24 @@ def list_papers(
         "title_za": [func.lower(Paper.title).desc()],
         "favorites": [Paper.favorite.desc(), Paper.created_at.desc()],
     }
-    stmt = (
-        select(Paper)
-        .order_by(*sort_clauses[sort])
-        .offset(offset)
-        .limit(limit)
-    )
+    # Build the WHERE clauses once and reuse for both the data query and the
+    # parallel COUNT(*) that backs the X-Total-Count header. Order/order_by
+    # must be cleared for the count or PostgreSQL rejects it.
+    where_clauses: list = []
     if status:
-        stmt = stmt.where(Paper.status == status)
+        where_clauses.append(Paper.status == status)
     if venue:
-        stmt = stmt.where(Paper.venue.ilike(f"%{venue}%"))
+        where_clauses.append(Paper.venue.ilike(f"%{venue}%"))
     if in_library is not None:
-        stmt = stmt.where(Paper.in_library.is_(in_library))
+        where_clauses.append(Paper.in_library.is_(in_library))
         if not in_library:
             # Inbox view hides discarded papers.
-            stmt = stmt.where(Paper.discarded.is_(False))
+            where_clauses.append(Paper.discarded.is_(False))
     if favorite is not None:
-        stmt = stmt.where(Paper.favorite.is_(favorite))
+        where_clauses.append(Paper.favorite.is_(favorite))
     if q:
         like = f"%{q}%"
-        stmt = stmt.where(
+        where_clauses.append(
             or_(
                 col(Paper.title).ilike(like),
                 cast(Paper.authors, String).ilike(like),
@@ -217,7 +226,7 @@ def list_papers(
                 .join(Tag, Tag.id == PaperTag.tag_id)
                 .where(Tag.name.in_(names))
             )
-            stmt = stmt.where(Paper.id.in_(tag_subq))
+            where_clauses.append(Paper.id.in_(tag_subq))
     if topic:
         names = [t.strip() for t in topic if t and t.strip()]
         if names:
@@ -226,7 +235,20 @@ def list_papers(
                 .join(Topic, Topic.id == PaperTopic.topic_id)
                 .where(Topic.name.in_(names))
             )
-            stmt = stmt.where(Paper.id.in_(topic_subq))
+            where_clauses.append(Paper.id.in_(topic_subq))
+
+    total = session.exec(
+        select(func.count()).select_from(Paper).where(*where_clauses)
+    ).one()
+    response.headers["X-Total-Count"] = str(int(total))
+
+    stmt = (
+        select(Paper)
+        .where(*where_clauses)
+        .order_by(*sort_clauses[sort])
+        .offset(offset)
+        .limit(limit)
+    )
     rows = session.exec(stmt).all()
     tags_map = _load_tags_map(session, [p.id for p in rows])
     topics_map = _load_topics_map(session, [p.id for p in rows])

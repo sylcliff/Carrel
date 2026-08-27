@@ -1096,7 +1096,14 @@ def _import_from_s2(session: Session, work: dict[str, Any], now: datetime) -> Im
     except ValueError:
         parsed_date = None
 
-    arxiv_id = work.get("arxiv_id")
+    # arXiv id can live at work["arxiv_id"] (S2 convention) or under
+    # work["ids"]["arxiv"] (OA convention; the bulk-import fast path uses
+    # the latter because the resolved Work dict it builds mirrors an OA
+    # record). Read both so the column doesn't end up empty for S2 imports
+    # that carry an arXiv id only in the OA-shaped ids block.
+    arxiv_id = work.get("arxiv_id") or (work.get("ids") or {}).get("arxiv")
+    if arxiv_id:
+        arxiv_id = merge_mod._strip_arxiv_version(arxiv_id)
     pdf_url, oa_status = _arxiv_pdf_fallback(
         work.get("pdf_url"),
         "oa" if work.get("pdf_url") else "none",

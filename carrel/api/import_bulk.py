@@ -146,6 +146,11 @@ def _search_result_to_work(item: BulkImportItem) -> tuple[dict, str]:
         "abstract": item.abstract,
         "open_access": {"is_oa": bool(item.pdf_url)},
         "ids": {"arxiv": item.arxiv_id} if item.arxiv_id else {},
+        # Mirror the arxiv id at the top level too. The S2 import branch in
+        # ``_import_from_s2`` only reads ``work["arxiv_id"]``; without this
+        # mirror, S2-tagged fast-path imports lose the arxiv id from the
+        # column even though it survives in ``raw_meta.ids.arxiv``.
+        "arxiv_id": item.arxiv_id,
         # Marker the S2 path uses to branch; harmless when source=openalex.
         "s2_paper_id": item.s2 if source == "semantic_scholar" else None,
     }

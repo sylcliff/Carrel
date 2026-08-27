@@ -8,7 +8,7 @@ import { TopicsLayout } from "@/components/TopicsLayout";
 import PaperDedupPanel from "@/components/PaperDedupPanel";
 import {
   deletePaper,
-  listPapers,
+  listPapersPaged,
   listTags,
   type PaperSummary,
   type TagWithCount,
@@ -26,8 +26,12 @@ type SortKey =
   | "title_za"
   | "favorites";
 
+const PAGE_SIZE = 100;
+
 export default function Library() {
   const [papers, setPapers] = useState<PaperSummary[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [allTags, setAllTags] = useState<TagWithCount[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -73,19 +77,26 @@ export default function Library() {
       .catch(() => setAllTags([]));
   }, []);
 
+  // Reset and load the first page whenever filters/sort change. We deliberately
+  // do NOT include `papers.length` here — the Load-More button owns the
+  // append-only path so the filter reset stays a hard reset.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    listPapers({
-      limit: 200,
+    listPapersPaged({
+      limit: PAGE_SIZE,
+      offset: 0,
       favorite: favOnly || undefined,
       q: debouncedQ.trim() || undefined,
       tag: selectedTags.length ? selectedTags : undefined,
       topic: selectedTopics.length ? selectedTopics : undefined,
       sort,
     })
-      .then((rows) => {
-        if (!cancelled) setPapers(rows);
+      .then(({ items, total }) => {
+        if (!cancelled) {
+          setPapers(items);
+          setTotal(total);
+        }
       })
       .catch((e) => {
         if (!cancelled) setErr(String(e));
@@ -118,10 +129,36 @@ export default function Library() {
     try {
       await deletePaper(p.id);
       setPapers((prev) => prev.filter((x) => x.id !== p.id));
+      setTotal((t) => Math.max(0, t - 1));
     } catch (e) {
       setErr(`Failed to delete ${p.id}: ${String(e)}`);
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMore) return;
+    const nextOffset = papers.length;
+    if (nextOffset >= total) return;
+    setLoadingMore(true);
+    setErr(null);
+    try {
+      const { items, total: newTotal } = await listPapersPaged({
+        limit: PAGE_SIZE,
+        offset: nextOffset,
+        favorite: favOnly || undefined,
+        q: debouncedQ.trim() || undefined,
+        tag: selectedTags.length ? selectedTags : undefined,
+        topic: selectedTopics.length ? selectedTopics : undefined,
+        sort,
+      });
+      setPapers((prev) => [...prev, ...items]);
+      setTotal(newTotal);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -130,6 +167,9 @@ export default function Library() {
     selectedTags.length +
     selectedTopics.length +
     (debouncedQ.trim() ? 1 : 0);
+
+  const hasMore = papers.length < total;
+  const remaining = Math.max(0, total - papers.length);
 
   const tagNameSet = useMemo(() => new Set(allTags.map((t) => t.name)), [allTags]);
 
@@ -260,7 +300,9 @@ export default function Library() {
       <p className="text-sm text-muted-foreground">
         {loading
           ? "Loading…"
-          : `${papers.length} paper(s) shown${activeFilterCount ? " (filtered)" : ""}.`}
+          : total > 0
+            ? `Showing ${papers.length} of ${total}${activeFilterCount ? " (filtered)" : ""}.`
+            : `${papers.length} paper(s) shown${activeFilterCount ? " (filtered)" : ""}.`}
       </p>
       {err && <p className="text-sm text-red-600">{err}</p>}
 
@@ -353,6 +395,29 @@ export default function Library() {
           </Card>
         ))}
       </div>
+
+      {!loading && hasMore && (
+        <div className="flex flex-col items-center gap-1 pt-2">
+          <Button
+            variant="outline"
+            onClick={loadMore}
+            disabled={loadingMore}
+          >
+            {loadingMore
+              ? "Loading…"
+              : `Load more (${remaining} remaining)`}
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Page {Math.floor(papers.length / PAGE_SIZE) + 1} of{" "}
+            {Math.max(1, Math.ceil(total / PAGE_SIZE))}
+          </span>
+        </div>
+      )}
+      {!loading && !hasMore && total > 0 && (
+        <p className="pt-2 text-center text-xs text-muted-foreground">
+          End of library — {total} paper(s).
+        </p>
+      )}
       </main>
     </TopicsLayout>
   );

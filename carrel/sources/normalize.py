@@ -18,9 +18,10 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from sqlmodel import Session
+
 from carrel.sources import openalex_client as oa
 from carrel.sources.arxiv import ArxivEntry
-from sqlmodel import Session
 
 logger = logging.getLogger(__name__)
 
@@ -213,5 +214,53 @@ def enrich_with_openalex(rec: PaperRecord, session: Session | None = None) -> Pa
 def _strip_arxiv_version(arxiv_id: str) -> str:
     """Strip trailing version (v1, v2) so identity is stable across revisions."""
     return re.sub(r"v\d+$", "", arxiv_id)
+
+
+def format_journal_citation(raw_meta: dict | None) -> str | None:
+    """Return a short bibliographic locator from a Work's ``biblio`` block.
+
+    OpenAlex exposes volume / issue / first_page / last_page under
+    ``work["biblio"]``; Semantic Scholar does not. We render a compact
+    locator that fits next to a venue name without duplicating it:
+
+      * ``"11(1), 147-174"``     — volume, issue, page range
+      * ``"11(1)"``              — volume and issue only
+      * ``"11, 147-174"``        — volume and page range
+      * ``"11"``                 — volume only
+      * ``"147-174"``            — page range only
+      * ``None``                 — no biblio data (arXiv preprints, S2 papers)
+
+    Empty strings and ``None`` fields are skipped; a single-page article
+    collapses to ``"147"`` rather than ``"147-147"``.
+    """
+    if not raw_meta:
+        return None
+    biblio = raw_meta.get("biblio") or {}
+    if not isinstance(biblio, dict):
+        return None
+    volume = biblio.get("volume") or None
+    issue = biblio.get("issue") or None
+    first = biblio.get("first_page") or None
+    last = biblio.get("last_page") or None
+
+    parts: list[str] = []
+    if volume and issue:
+        parts.append(f"{volume}({issue})")
+    elif volume:
+        parts.append(str(volume))
+
+    if first and last and first != last:
+        pages = f"{first}-{last}"
+    elif first:
+        pages = str(first)
+    elif last:
+        pages = str(last)
+    else:
+        pages = None
+    if pages:
+        parts.append(pages)
+
+    return ", ".join(parts) or None
+
 
 

@@ -48,6 +48,13 @@ class PaperSummary(BaseModel):
     favorite: bool = False
     tags: list[str] = []
     topics: list[str] = []
+    # Identifier triplet — surfaced on the list so the UI can flag "no DOI"
+    # and link to the paper on arXiv / S2 when the DOI is missing. Kept on
+    # the summary (not just PaperDetail) because missing-DOI papers need
+    # visible context, not a click-through to discover it.
+    doi: str | None = None
+    arxiv_id: str | None = None
+    s2_paper_id: str | None = None
 
 
 class PaperDetail(PaperSummary):
@@ -59,6 +66,9 @@ class PaperDetail(PaperSummary):
     md_path: str | None = None
     summary_zh: str | None = None
     error: str | None = None
+    # Compact "Vol X(Y), pp. A-B" string from raw_meta.biblio. Populated
+    # for OpenAlex-sourced papers; None for S2 / arXiv / unknown.
+    journal_citation: str | None = None
     # Full author records (with IDs/affiliation) for clickable author links;
     # the inherited `authors: list[str]` stays for compact display.
     author_list: list[AuthorRef] = []

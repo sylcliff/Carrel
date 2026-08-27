@@ -19,6 +19,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
+// Like request(), but also returns the response headers. Used by paginated
+// list endpoints that publish their total count in X-Total-Count.
+async function requestWithHeaders<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; headers: Headers }> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    ...init,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new APIError(res.status, text || res.statusText);
+  }
+  if (res.status === 204) return { data: undefined as T, headers: res.headers };
+  return { data: (await res.json()) as T, headers: res.headers };
+}
+
 // ---- Health ----
 
 export interface Health {
@@ -51,6 +69,11 @@ export interface PaperSummary {
   favorite: boolean;
   tags: string[];
   topics: string[];
+  // Identifier triplet — used by the Library list to surface a "No DOI" hint
+  // for fresh arXiv preprints where S2 didn't return a DOI.
+  doi: string | null;
+  arxiv_id: string | null;
+  s2_paper_id: string | null;
 }
 
 export interface PaperDetail extends PaperSummary {
@@ -68,6 +91,8 @@ export interface PaperDetail extends PaperSummary {
   notes_markdown: string | null;
   pdf_origin: string | null;
   journal_doi: string | null;
+  // "Vol X(Y), pp. A-B" from raw_meta.biblio (OA only). Null for S2 / arXiv.
+  journal_citation: string | null;
   pdf_files: Record<string, string> | null;
   published_checked_at: string | null;
   created_at: string;
@@ -311,7 +336,7 @@ export const listPapers = (params?: {
   topic?: string[];
   q?: string;
   sort?: string;
-}) => {
+}): Promise<PaperSummary[]> => {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
   if (params?.offset) q.set("offset", String(params.offset));
@@ -325,6 +350,42 @@ export const listPapers = (params?: {
   if (params?.topic) for (const t of params.topic) q.append("topic", t);
   const qs = q.toString();
   return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
+};
+
+// Paginated variant: returns the page rows plus the server's X-Total-Count
+// header so the UI can show "Showing N of M" and a Load-More button without a
+// second round-trip.
+export const listPapersPaged = (params?: {
+  limit?: number;
+  offset?: number;
+  status?: string;
+  venue?: string;
+  in_library?: boolean;
+  favorite?: boolean;
+  tag?: string[];
+  topic?: string[];
+  q?: string;
+  sort?: string;
+}): Promise<{ items: PaperSummary[]; total: number }> => {
+  const q = new URLSearchParams();
+  if (params?.limit) q.set("limit", String(params.limit));
+  if (params?.offset) q.set("offset", String(params.offset));
+  if (params?.status) q.set("status", params.status);
+  if (params?.venue) q.set("venue", params.venue);
+  if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
+  if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
+  if (params?.q) q.set("q", params.q);
+  if (params?.sort) q.set("sort", params.sort);
+  if (params?.tag) for (const t of params.tag) q.append("tag", t);
+  if (params?.topic) for (const t of params.topic) q.append("topic", t);
+  const qs = q.toString();
+  return requestWithHeaders<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`).then(
+    ({ data, headers }) => {
+      const headerVal = headers.get("X-Total-Count");
+      const total = headerVal ? Number(headerVal) : data.length;
+      return { items: data, total: Number.isFinite(total) ? total : data.length };
+    },
+  );
 };
 
 export const getPaper = (id: string) => request<PaperDetail>(`/papers/${encodeURIComponent(id)}`);

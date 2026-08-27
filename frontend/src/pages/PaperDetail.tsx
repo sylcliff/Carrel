@@ -325,6 +325,11 @@ export default function PaperDetail({ onProcessed }: Props) {
               </div>
               <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                 {p.venue && <span>📰 {p.venue}</span>}
+                {p.journal_citation && (
+                  <span title="Volume / issue / pages (from OpenAlex biblio)">
+                    📖 {p.journal_citation}
+                  </span>
+                )}
                 {p.publication_date && <span>📅 {p.publication_date}</span>}
                 {(() => {
                   const journalDoi = p.journal_doi || "";
