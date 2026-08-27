@@ -209,6 +209,19 @@ def test_search_citations_uses_bulk_endpoint():
     assert "sort=citationCount%3Adesc" in calls[0]
 
 
+def test_search_relevance_with_high_limit_uses_bulk_with_valid_sort():
+    # When limit > 100 with the default sort=relevance, the client switches to
+    # the bulk endpoint. S2's bulk endpoint rejects `relevance:desc` with
+    # HTTP 400 "Sort field must be one of: paperId, publicationDate, citationCount"
+    # — the client must map to a valid sort instead.
+    client, calls = _make_search_client()
+    search_papers("rag", client=client, sort="relevance", limit=200)
+    assert "/paper/search/bulk?" in calls[0]
+    from urllib.parse import urlparse, parse_qs
+    sort = parse_qs(urlparse(calls[0]).query).get("sort", [""])[0]
+    assert sort in {"publicationDate:desc", "citationCount:desc", "paperId:desc"}
+
+
 def test_bulk_endpoint_does_not_request_tldr():
     # The bulk endpoint rejects `tldr` with HTTP 400; it must only appear on
     # the relevance endpoint's field list.

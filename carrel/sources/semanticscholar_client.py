@@ -386,15 +386,19 @@ def _search_bulk(
     open_access_only: bool,
 ) -> list[dict[str, Any]]:
     """Token-paginated bulk fetch. Follows the ``token`` cursor as needed."""
+    # S2's bulk endpoint only accepts paperId / publicationDate / citationCount
+    # (no `relevance`); when the bulk path is taken with sort=relevance (e.g.
+    # limit > 100 with the default sort), fall back to a valid S2 sort. See
+    # test_search_relevance_with_high_limit_uses_bulk_with_valid_sort.
     sort_map = {
         "citations": "citationCount:desc",
         "date": "publicationDate:desc",
-        "relevance": "relevance:desc",
+        "relevance": "publicationDate:desc",
     }
     params: dict[str, str] = {
         "query": query,
         "fields": _SEARCH_FIELDS_BULK,
-        "sort": sort_map.get(sort, "citationCount:desc"),
+        "sort": sort_map[sort],
     }
     year = _build_year_param(year_from, year_to)
     if year:
