@@ -981,6 +981,46 @@ export const importPaper = (body: {
     body: JSON.stringify(body),
   });
 
+// Bulk counterpart of `importPaper`. Accepts up to 1000 identifier dicts;
+// `background=true` (default) returns just a job_id and the worker drives
+// upserts in the background. Inline mode (`background=false`) is reserved
+// for ≤20 items where the user wants per-row results immediately.
+//
+// Each item mirrors `importPaper`'s body — the backend runs each through
+// the same _resolve_work_for_import → _import_one_paper chain.
+export interface BulkImportItem {
+  openalex_id?: string;
+  doi?: string;
+  arxiv_id?: string;
+  s2?: string;
+  title?: string;
+}
+
+export interface BulkImportResultItem {
+  id: string | null;
+  title: string | null;
+  created: boolean;
+  status: "ok" | "error";
+  error: string | null;
+}
+
+export interface BulkImportResponse {
+  job_id: number;
+  items: BulkImportResultItem[] | null;
+}
+
+export const importPapers = (body: {
+  items: BulkImportItem[];
+  background?: boolean;
+}) =>
+  request<BulkImportResponse>("/import/bulk", {
+    method: "POST",
+    body: JSON.stringify({
+      items: body.items,
+      background: body.background ?? true,
+    }),
+  });
+
 // ---- Token usage (M13) ----
 
 export interface UsageSummary {

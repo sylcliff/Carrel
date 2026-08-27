@@ -25,6 +25,7 @@ from carrel.api import (
     citations,
     embed,
     health,
+    import_bulk,
     mcp,
     papers,
     paper_dedup,
@@ -190,6 +191,7 @@ def create_app() -> FastAPI:
     app.include_router(embed.router)
     app.include_router(search.router)
     app.include_router(search_brave.router)
+    app.include_router(import_bulk.router)
     app.include_router(mcp.router)
     app.include_router(chat.router)
     app.include_router(settings.router)

@@ -94,6 +94,10 @@ class JobKind(str, Enum):
     # OpenAlex". Reuses the Job / BackgroundTasks / JobOut shape that
     # authors_backfill and citations refresh use.
     scholar_works_sync = "scholar_works_sync"
+    # One-shot bulk import of N papers (resolved via OA/S2/arXiv like the
+    # single-paper /import). Serial worker; one Job wraps the whole batch so
+    # 1000-paper imports don't flood the jobs table.
+    import_bulk = "import_bulk"
 
 
 class WikiKind(str, Enum):

@@ -364,7 +364,7 @@ def search(
         if cat_part != "all:all":
             query = f"({query}) AND ({cat_part})"
 
-    page_size = min(max(limit, 10), 50)
+    page_size = min(max(limit, 10), 200)
     with httpx.Client(headers={"User-Agent": ARXIV_USER_AGENT}) as client:
         try:
             entries = _one_query(

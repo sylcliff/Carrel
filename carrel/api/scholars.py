@@ -382,7 +382,7 @@ def list_scholar_works(
         None,
         description="Opaque pagination cursor (offset:N) from the previous page",
     ),
-    limit: int = Query(50, ge=1, le=50),
+    limit: int = Query(50, ge=1, le=500),
     session: Session = Depends(get_session_dep),
 ) -> ScholarWorksResponse:
     """OpenAlex works authored by this scholar (newest first), paginated.

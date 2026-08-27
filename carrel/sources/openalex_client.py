@@ -451,7 +451,7 @@ def search_work(
         q = Works().search(query)
         if filters:
             q = q.filter(**filters)
-        results = q.sort(**sort_kwargs).get(per_page=min(max(limit, 1), 50))
+        results = q.sort(**sort_kwargs).get(per_page=min(max(limit, 1), 100))
     except Exception as e:
         logger.warning("OpenAlex search failed for %r: %s", query, e)
         return []

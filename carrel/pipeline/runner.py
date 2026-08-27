@@ -162,7 +162,7 @@ def fetch_candidates(
         ):
             try:
                 works = oa.fetch_recent_by_author(
-                    s.value, since=since, max_results=50
+                    s.value, since=since, max_results=200
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("openalex author fetch failed for %s: %s", s.value, e)
@@ -183,7 +183,7 @@ def fetch_candidates(
         ):
             try:
                 works = oa.fetch_recent_by_venue(
-                    s.value, since=since, max_results=100
+                    s.value, since=since, max_results=200
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("openalex venue fetch failed for %s: %s", s.value, e)
@@ -204,7 +204,7 @@ def fetch_candidates(
             detail={"subscription": q},
         ):
             try:
-                works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
+                works = oa.fetch_recent_by_keyword(q, since=since, max_results=200)
             except Exception as e:  # noqa: BLE001
                 logger.warning("openalex keyword fetch failed for %s: %s", q, e)
                 errors[f"openalex_keyword:{q}"] = f"{type(e).__name__}: {e}"

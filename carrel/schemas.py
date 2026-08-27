@@ -455,6 +455,37 @@ class ImportPaperOut(BaseModel):
     created: bool  # True if newly inserted, False if already existed
 
 
+class BulkImportIn(BaseModel):
+    """One-shot import of N papers by any combination of identifiers.
+
+    Each item runs through the same resolution + upsert chain as
+    ``POST /import``; partial failures don't abort the batch — the response
+    carries per-item ``status`` (ok / error) so the UI can show a list view.
+
+    ``background=true`` (default) is the right choice for large batches
+    (≥50 papers): the worker runs serially via ``BackgroundTasks`` and the
+    caller polls ``GET /sync/jobs/{id}`` for progress. Pass
+    ``background=false`` to get the full per-item result inline (suitable
+    for 1-20 papers selected from a search).
+    """
+
+    items: list[ImportPaperIn] = Field(..., min_length=1, max_length=1000)
+    background: bool = True
+
+
+class BulkImportItemOut(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    created: bool = False
+    status: str  # "ok" | "error"
+    error: str | None = None
+
+
+class BulkImportOut(BaseModel):
+    job_id: int
+    items: list[BulkImportItemOut] | None = None  # null when background=True
+
+
 # -------- Subscriptions --------
 
 

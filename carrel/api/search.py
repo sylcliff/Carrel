@@ -492,7 +492,7 @@ def _parse_filters(
 @router.get("/search/local", response_model=list[SearchResultItem])
 def search_local(
     q: str = Query("", min_length=1, max_length=200),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> list[SearchResultItem]:
@@ -508,7 +508,7 @@ def search_local(
 @router.get("/search/external", response_model=list[SearchResultItem])
 def search_external(
     q: str = Query("", min_length=1, max_length=200),
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(20, ge=1, le=1000),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     min_citations: int | None = Query(None, ge=0),
@@ -536,7 +536,7 @@ def search_external(
 @router.get("/search", response_model=SearchResponse)
 def search_combined(
     q: str = Query("", min_length=1, max_length=200),
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(20, ge=1, le=1000),
     year_from: int | None = Query(None, ge=1900, le=2100),
     year_to: int | None = Query(None, ge=1900, le=2100),
     min_citations: int | None = Query(None, ge=0),
@@ -763,7 +763,7 @@ def _excerpt(text: str, q: str, *, width: int = 280) -> str:
 @router.get("/search/semantic", response_model=SemanticSearchResponse)
 def search_semantic(
     q: str = Query("", min_length=0, max_length=500),
-    limit: int = Query(10, ge=1, le=30),
+    limit: int = Query(10, ge=1, le=100),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> SemanticSearchResponse:
@@ -966,6 +966,8 @@ def import_external_paper(
 
     Accepts any of ``openalex_id`` / ``doi`` / ``arxiv_id`` / ``s2``.
     """
+    from fastapi import HTTPException
+
     resolved = _resolve_work_for_import(
         oa_id=body.openalex_id,
         doi=body.doi,
@@ -975,7 +977,6 @@ def import_external_paper(
         session=session,
     )
     if not resolved:
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=404,
             detail="Could not find this paper on OpenAlex or Semantic Scholar.",
@@ -984,12 +985,24 @@ def import_external_paper(
 
     # Block Zenodo deposits (same filter as subscription sync).
     if is_zenodo(oa.work_doi(work), oa.work_venue(work)):
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=422,
             detail="Zenodo deposits are not papers and cannot be imported into the library",
         )
 
+    return _import_one_paper(session, work, source)
+
+
+def _import_one_paper(
+    session: Session, work: dict[str, Any], source: str
+) -> ImportPaperOut:
+    """Pure DB upsert of one already-resolved work dict. No HTTP, no exception
+    translation — callers wrap the response / convert to per-item error.
+
+    Used by both the single-paper ``POST /import`` endpoint and the batch
+    ``POST /import/bulk`` worker; factoring it out keeps the dedup / heal /
+    insert logic in exactly one place.
+    """
     s2_id = work.get("s2_paper_id") if source == "semantic_scholar" else None
     existing = _find_library_match(
         session,
@@ -1023,9 +1036,10 @@ def import_external_paper(
     if source == "semantic_scholar":
         return _import_from_s2(session, work, now)
 
+    from fastapi import HTTPException
+
     pid = oa.work_id(work)
     if not pid:
-        from fastapi import HTTPException
         raise HTTPException(status_code=502, detail="OpenAlex returned a work without an id")
 
     arxiv_id = oa.work_arxiv_id(work)

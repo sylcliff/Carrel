@@ -334,14 +334,16 @@ def test_works_response_includes_total(
     assert body["total"] == 230  # echoed on every page so the UI can show "X of 230"
 
 
-def test_works_limit_clamped_to_50(
+def test_works_limit_clamped_to_500(
     session: Session, client: TestClient, monkeypatch
 ):
     _seed_paper(session, pid="W9", id_kind="openalex", doi="10.1/a")
     _seed_author_works_cache(session, "A123", [], total_count=0)
-    r = client.get("/scholars/A123/works?limit=500")
-    assert r.status_code == 422  # FastAPI Query(le=50) rejects out-of-range
-    r2 = client.get("/scholars/A123/works?limit=50")
+    # limit=500 is now allowed (was 50 before the per-page cap bump); limit=1000
+    # is rejected by FastAPI Query(le=500).
+    r = client.get("/scholars/A123/works?limit=1000")
+    assert r.status_code == 422  # FastAPI Query(le=500) rejects out-of-range
+    r2 = client.get("/scholars/A123/works?limit=500")
     assert r2.status_code == 200
 
 

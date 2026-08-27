@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Search as SearchIcon,
@@ -10,11 +10,14 @@ import {
   X,
   FileText,
   AlertTriangle,
+  Loader2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import {
+  getJob,
   importPaper,
+  importPapers,
   searchPapers,
   searchSemantic,
   type SearchResultItem,
@@ -149,6 +152,28 @@ export default function Search() {
   const [importing, setImporting] = useState<string | null>(null);
   const [imported, setImported] = useState<Record<string, string>>({});
   const [history, setHistory] = useLocalList(HISTORY_KEY);
+
+  // Bulk-import state. ``selected`` is the set of row keys the user has
+  // ticked (only not-in-library rows are eligible). ``bulkJob`` is the
+  // server-side Job driving a background batch import; we poll ``getJob``
+  // every 1.5s while it's running. ``bulkDoneSummary`` is a short
+  // "Imported N" line that surfaces for a few seconds after a successful
+  // inline import or background job, then auto-dismisses.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkJob, setBulkJob] = useState<{
+    id: number;
+    total: number;
+    mode: "inline" | "background";
+  } | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<{
+    succeeded: number;
+    failed: number;
+    current: string | null;
+  } | null>(null);
+  const [bulkDoneSummary, setBulkDoneSummary] = useState<string | null>(null);
+  // Sequence counter so a newer batch (or a new search) can supersede an
+  // in-flight poll without showing stale results.
+  const bulkSeqRef = useRef(0);
   const [favorites, setFavorites] = useLocalList(FAVORITES_KEY);
 
   // Facets.
@@ -211,7 +236,10 @@ export default function Search() {
     });
     const [metaResult] = await Promise.all([
       searchPapers(query, {
-        limit: 30,
+        // Server caps at 1000; see SearchFilters in carrel/api/search.py.
+        // A 1000-row list is the user's explicit "see everything for one
+        // query" target so they can bulk-import the whole result page.
+        limit: 1000,
         correct,
         sort,
         yearFrom,
@@ -282,6 +310,203 @@ export default function Search() {
       setImporting(null);
     }
   }
+
+  // ---- Bulk import ----
+
+  // Each result row gets a stable key derived from the strongest identifier
+  // available; the same key the single-row Import button uses so the
+  // `imported` map and the `selected` set share one namespace.
+  function rowKey(r: SearchResultItem): string {
+    return (
+      r.ids.openalex ||
+      r.ids.doi ||
+      r.ids.arxiv ||
+      r.ids.s2 ||
+      r.title
+    );
+  }
+
+  function toggleSelected(key: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  // Toggle every not-in-library row in the currently filtered set.
+  function toggleSelectAllEligible() {
+    const allKeys = visible
+      .filter((r) => !r.in_library)
+      .map(rowKey);
+    const allSelected = allKeys.length > 0 && allKeys.every((k) => selected.has(k));
+    setSelected((prev) => {
+      if (allSelected) {
+        const next = new Set(prev);
+        for (const k of allKeys) next.delete(k);
+        return next;
+      }
+      const next = new Set(prev);
+      for (const k of allKeys) next.add(k);
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelected(new Set());
+  }
+
+  // Pull the SearchResultItem for each selected key. Selection is the
+  // checkbox state; the items we POST to /import/bulk come from the live
+  // ``results`` list so the server gets the same identifiers the user sees.
+  function gatherSelectedItems(): SearchResultItem[] {
+    const out: SearchResultItem[] = [];
+    for (const r of visible) {
+      if (selected.has(rowKey(r))) out.push(r);
+    }
+    return out;
+  }
+
+  async function runBulkImport() {
+    if (bulkJob) return; // a batch is already running
+    const items = gatherSelectedItems();
+    if (items.length === 0) return;
+    setErr(null);
+    setBulkDoneSummary(null);
+
+    const payload = items.map((r) => ({
+      openalex_id: r.ids.openalex ?? undefined,
+      doi: r.ids.doi ?? undefined,
+      arxiv_id: r.ids.arxiv ?? undefined,
+      s2: r.ids.s2 ?? undefined,
+      title: r.title,
+    }));
+
+    // ≤20 items: inline (per-item results back immediately, no polling).
+    // >20 items: background (returns just a job_id; we poll /sync/jobs/{id}).
+    const inline = items.length <= 20;
+    if (inline) {
+      bulkSeqRef.current += 1;
+      const seq = bulkSeqRef.current;
+      setBulkJob({ id: -seq, total: items.length, mode: "inline" });
+      try {
+        const out = await importPapers({ items: payload, background: false });
+        if (seq !== bulkSeqRef.current) return; // a newer batch superseded us
+        const next: Record<string, string> = {};
+        let ok = 0;
+        let failed = 0;
+        if (out.items) {
+          for (let i = 0; i < out.items.length; i++) {
+            const it = out.items[i];
+            const row = items[i];
+            const key = rowKey(row);
+            if (it.status === "ok" && it.id) {
+              next[key] = it.id;
+              ok += 1;
+            } else {
+              failed += 1;
+            }
+          }
+        }
+        setImported((prev) => ({ ...prev, ...next }));
+        clearSelection();
+        setBulkJob(null);
+        setBulkProgress(null);
+        setBulkDoneSummary(
+          failed > 0
+            ? `Imported ${ok} of ${items.length} (${failed} failed — see console)`
+            : `Imported ${ok} ${ok === 1 ? "paper" : "papers"}`,
+        );
+        if (failed > 0) {
+          console.warn(
+            "Bulk import per-item errors:",
+            out.items?.filter((it) => it.status === "error"),
+          );
+        }
+      } catch (e) {
+        if (seq !== bulkSeqRef.current) return;
+        setErr(`Bulk import failed: ${e}`);
+        setBulkJob(null);
+        setBulkProgress(null);
+      }
+      return;
+    }
+
+    // Background path.
+    try {
+      const out = await importPapers({ items: payload, background: true });
+      setBulkJob({ id: out.job_id, total: items.length, mode: "background" });
+      setBulkProgress({ succeeded: 0, failed: 0, current: items[0]?.title ?? null });
+    } catch (e) {
+      setErr(`Bulk import failed: ${e}`);
+      setBulkJob(null);
+    }
+  }
+
+  // Poll the background job every 1.5s; update progress + finalize.
+  useEffect(() => {
+    if (!bulkJob || bulkJob.mode !== "background") return;
+    const jobId = bulkJob.id;
+    const total = bulkJob.total;
+    const seq = ++bulkSeqRef.current;
+    const timer = window.setInterval(async () => {
+      try {
+        const next = await getJob(jobId);
+        if (seq !== bulkSeqRef.current) return;
+        const stats = (next.stats ?? {}) as {
+          succeeded?: number;
+          failed?: number;
+          current?: string | null;
+        };
+        setBulkProgress({
+          succeeded: stats.succeeded ?? 0,
+          failed: stats.failed ?? 0,
+          current: stats.current ?? null,
+        });
+        if (next.status === "done" || next.status === "failed") {
+          window.clearInterval(timer);
+          // Background mode doesn't return per-item ids, so re-run the
+          // current search to refresh in_library flags. The active query
+          // is captured in ``activeQuery`` state (may be null if the user
+          // hasn't searched yet, but the bulk button is only enabled after
+          // a search so this is safe).
+          if (next.status === "done" && activeQuery) {
+            void runSearch(activeQuery.text, activeQuery.correct);
+          }
+          clearSelection();
+          setBulkJob(null);
+          const ok = stats.succeeded ?? 0;
+          const failed = stats.failed ?? 0;
+          setBulkDoneSummary(
+            failed > 0
+              ? `Imported ${ok} of ${total} (${failed} failed)`
+              : `Imported ${ok} ${ok === 1 ? "paper" : "papers"}`,
+          );
+          setBulkProgress(null);
+        }
+      } catch (e) {
+        window.clearInterval(timer);
+        if (seq !== bulkSeqRef.current) return;
+        setErr(`Job poll failed: ${e}`);
+        setBulkJob(null);
+        setBulkProgress(null);
+      }
+    }, 1500);
+    return () => window.clearInterval(timer);
+    // runSearch and activeQuery change reference on every render; the
+    // interval should only restart when the active job changes, not on
+    // every keystroke.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bulkJob]);
+
+  // Auto-dismiss the post-import toast so the user doesn't have to
+  // manually close it.
+  useEffect(() => {
+    if (!bulkDoneSummary) return;
+    const t = window.setTimeout(() => setBulkDoneSummary(null), 5000);
+    return () => window.clearTimeout(t);
+  }, [bulkDoneSummary]);
 
   const historyOnly = history.filter(
     (h) => !favorites.some((f) => f.toLowerCase() === h.toLowerCase()),
@@ -488,8 +713,8 @@ export default function Search() {
             </label>
           </div>
 
-          {/* Source chip filter */}
-          <div className="flex flex-wrap gap-1.5">
+          {/* Source chip filter + bulk-select-all toggle */}
+          <div className="flex flex-wrap items-center gap-1.5">
             {(["all", "library", "openalex", "semantic_scholar", "arxiv"] as ChipFilter[]).map((s) => (
               <button
                 key={s}
@@ -506,6 +731,28 @@ export default function Search() {
                 <span className="opacity-70">({counts[s]})</span>
               </button>
             ))}
+            {(() => {
+              const eligibleKeys = visible
+                .filter((r) => !r.in_library)
+                .map(rowKey);
+              if (eligibleKeys.length === 0) return null;
+              const allSelected = eligibleKeys.every((k) => selected.has(k));
+              return (
+                <button
+                  type="button"
+                  onClick={toggleSelectAllEligible}
+                  className="ml-auto inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-0.5 text-xs hover:bg-muted"
+                  title={
+                    allSelected
+                      ? "Deselect all visible (eligible)"
+                      : "Select all visible (eligible)"
+                  }
+                >
+                  {allSelected ? "Deselect all" : "Select all"}
+                  <span className="text-muted-foreground">({eligibleKeys.length})</span>
+                </button>
+              );
+            })()}
           </div>
 
           {visible.length === 0 ? (
@@ -513,8 +760,7 @@ export default function Search() {
           ) : (
             <div className="grid gap-2">
               {visible.map((r) => {
-                const key =
-                  r.ids.openalex || r.ids.doi || r.ids.arxiv || r.ids.s2 || r.title;
+                const key = rowKey(r);
                 const justImported = imported[key];
                 return (
                   <ResultRow
@@ -523,6 +769,9 @@ export default function Search() {
                     q={submitted}
                     importing={importing === key}
                     importedId={justImported ?? (r.in_library ? r.library_id : null)}
+                    selectable={!r.in_library}
+                    selected={selected.has(key)}
+                    onToggleSelect={() => toggleSelected(key)}
                     onOpen={() => {
                       const id = justImported ?? r.library_id;
                       if (id) nav(`/papers/${encodeURIComponent(id)}`);
@@ -533,6 +782,32 @@ export default function Search() {
               })}
             </div>
           )}
+
+          {/* Bulk import action bar — sticky to the bottom of the viewport
+              so it stays visible while the user scrolls a long result list.
+              Three modes: idle (N selected), running (progress), done
+              (transient toast). */}
+          <BulkActionBar
+            selectedCount={selected.size}
+            totalEligible={visible.filter((r) => !r.in_library).length}
+            running={
+              bulkJob
+                ? {
+                    processed:
+                      (bulkProgress?.succeeded ?? 0) +
+                      (bulkProgress?.failed ?? 0),
+                    total: bulkJob.total,
+                    current: bulkProgress?.current ?? null,
+                    succeeded: bulkProgress?.succeeded ?? 0,
+                    failed: bulkProgress?.failed ?? 0,
+                  }
+                : null
+            }
+            doneSummary={bulkDoneSummary}
+            onImport={runBulkImport}
+            onClear={clearSelection}
+            onDismissDone={() => setBulkDoneSummary(null)}
+          />
         </div>
       )}
 
@@ -606,6 +881,7 @@ function SourceBadges({ sources }: { sources: SearchSource[] }) {
 
 function ResultRow({
   r, q, importing, importedId, onOpen, onImport,
+  selectable, selected, onToggleSelect,
 }: {
   r: SearchResultItem;
   q: string;
@@ -613,6 +889,9 @@ function ResultRow({
   importedId: string | null;
   onOpen: () => void;
   onImport: () => void;
+  selectable: boolean;
+  selected: boolean;
+  onToggleSelect: () => void;
 }) {
   const inLibrary = importedId !== null;
   const doiBare = r.ids.doi ? r.ids.doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "") : null;
@@ -620,6 +899,15 @@ function ResultRow({
     <Card>
       <CardContent className="space-y-2 p-4">
         <div className="flex items-start gap-2">
+          {selectable && (
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={onToggleSelect}
+              aria-label={`Select ${r.title} for import`}
+              className="mt-1 h-4 w-4 shrink-0 cursor-pointer accent-primary"
+            />
+          )}
           <button
             onClick={inLibrary ? onOpen : undefined}
             className={
@@ -691,6 +979,104 @@ function ResultRow({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// Sticky bottom-of-viewport bar that surfaces the "Import N selected"
+// action, runs a single progress display while a bulk job is in flight,
+// and shows a transient "Imported N" toast for ~5s after completion.
+// Hidden entirely when there's nothing to show (no selection, no job).
+function BulkActionBar({
+  selectedCount,
+  totalEligible,
+  running,
+  doneSummary,
+  onImport,
+  onClear,
+  onDismissDone,
+}: {
+  selectedCount: number;
+  totalEligible: number;
+  running: {
+    processed: number;
+    total: number;
+    current: string | null;
+    succeeded: number;
+    failed: number;
+  } | null;
+  doneSummary: string | null;
+  onImport: () => void;
+  onClear: () => void;
+  onDismissDone: () => void;
+}) {
+  // The bar is only relevant when there's a selection, a job in flight,
+  // or a transient success/error to show.
+  const visible = selectedCount > 0 || running !== null || doneSummary !== null;
+  if (!visible) return null;
+
+  const pct = running
+    ? Math.min(100, Math.round((running.processed / Math.max(1, running.total)) * 100))
+    : 0;
+  // Indeterminate vs determinate: when processed < total we show a track
+  // with the filled portion; when finished (== total) the track goes full
+  // and the toast shows underneath. We keep the bar mounted while doneSummary
+  // is showing so the user can see the final state before it auto-dismisses.
+  return (
+    <div className="sticky bottom-0 z-10 mt-2 rounded-md border border-border/60 bg-background/95 px-3 py-2 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/75">
+      {running ? (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between gap-3 text-sm">
+            <div className="flex items-center gap-2 truncate">
+              <Loader2 className="h-4 w-4 animate-spin shrink-0" />
+              <span className="truncate">
+                Importing {running.processed} / {running.total}
+                {running.current && (
+                  <span className="ml-1 text-muted-foreground">
+                    — {running.current}
+                  </span>
+                )}
+              </span>
+            </div>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {running.succeeded} ok · {running.failed} failed
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded bg-muted">
+            <div
+              className="h-full bg-primary transition-[width] duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        </div>
+      ) : doneSummary ? (
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span>{doneSummary}</span>
+          <Button size="sm" variant="ghost" onClick={onDismissDone}>
+            Dismiss
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+          <div className="flex items-center gap-2">
+            <span className="font-medium">{selectedCount} selected</span>
+            {totalEligible > selectedCount && (
+              <span className="text-xs text-muted-foreground">
+                ({totalEligible - selectedCount} more available)
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={onClear}>
+              Clear
+            </Button>
+            <Button size="sm" onClick={onImport} disabled={selectedCount === 0}>
+              <FileDown className="mr-1 h-3.5 w-3.5" />
+              Import {selectedCount}
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
