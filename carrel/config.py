@@ -131,6 +131,18 @@ class LLMConfig(BaseModel):
     # tool calls; one tool call counts as part of the same iteration.
     wiki_chat_max_tool_iterations: int = 5
 
+    # ---- Scholar enrich (M14.x) — web-research agent ----
+    # Per-click agent on the Scholar Detail page. The agent uses
+    # brave_search__brave_web_search + builtin__save_scholar_note to
+    # research the scholar and append a "## Web research" note to the
+    # preserved <section data-user="true">. Falls back to chat_model /
+    # summarize_model when None so the same auth chain covers it.
+    wiki_enrich_model: str | None = None
+    wiki_enrich_fallback_model: str | None = None
+    # Agentic loop budget. Generous: research needs multiple searches
+    # plus the final save call plus one retry on tool error.
+    wiki_enrich_max_iterations: int = 8
+
     # ---- Paper dedup LLM judge (M10.6) ----
     # paper_dedup_judge_model defaults to the summarizer so the LLM judge uses
     # whatever model is already authenticated. paper_dedup_judge_fallback

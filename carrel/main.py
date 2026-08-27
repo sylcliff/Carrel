@@ -18,6 +18,7 @@ load_dotenv()
 
 from carrel import __version__
 from carrel.api import (
+    agent_runs,
     annotations,
     authors_backfill,
     chat,
@@ -193,6 +194,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router)
     app.include_router(settings.router)
     app.include_router(usage.router)
+    app.include_router(agent_runs.router)
 
     # Serve parsed markdown images (and PDFs) straight from storage. The
     # bootstrap step above created the directory, so StaticFiles can mount it.

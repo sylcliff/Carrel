@@ -12,6 +12,12 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session, select
 
+from carrel.agent_recorder import (
+    AgentRecorder,
+    clear_current_recorder,
+    pipeline_display_name,
+    set_current_recorder,
+)
 from carrel.db import get_session_dep
 from carrel.models import Job, JobKind, JobStatus
 from carrel.pipeline.runner import run_sync
@@ -63,10 +69,27 @@ def trigger_sync(
 def _run_inline(session: Session, job_id: int, lookback_hours: int) -> None:
     from carrel.main import app_config
 
+    # Agent run + steps are recorded alongside the coarse Job. The
+    # recorder is bound as the ambient one so the inner pipeline
+    # functions can call ``agent_step(...)`` without threading the
+    # recorder through every signature.
+    rec = AgentRecorder(
+        session, pipeline_id="sync", pipeline_name=pipeline_display_name("sync"),
+        trigger="manual",
+    )
+    rec.start(
+        context={"lookback_hours": lookback_hours, "sources": None},
+        job_id=job_id,
+    )
+    token = set_current_recorder(rec)
     try:
         run_sync(session, app_config, lookback_hours=lookback_hours, job=session.get(Job, job_id))
+        rec.finish(summary={"lookback_hours": lookback_hours})
     except Exception as e:
+        rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
         logger.exception("inline sync failed: %s", e)
+    finally:
+        clear_current_recorder(token)
 
 
 def _run_in_background(job_id: int, lookback_hours: int) -> None:
@@ -78,6 +101,17 @@ def _run_in_background(job_id: int, lookback_hours: int) -> None:
 
     engine = get_app_engine()
     with SqlSession(engine) as session:
+        # Separate recorder for the background path so the inline + bg
+        # runs don't share a seq counter.
+        rec = AgentRecorder(
+            session, pipeline_id="sync", pipeline_name=pipeline_display_name("sync"),
+            trigger="background",
+        )
+        rec.start(
+            context={"lookback_hours": lookback_hours, "sources": None},
+            job_id=job_id,
+        )
+        token = set_current_recorder(rec)
         try:
             run_sync(
                 session,
@@ -85,8 +119,12 @@ def _run_in_background(job_id: int, lookback_hours: int) -> None:
                 lookback_hours=lookback_hours,
                 job=session.get(Job, job_id),
             )
+            rec.finish(summary={"lookback_hours": lookback_hours})
         except Exception as e:
+            rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
             logger.exception("background sync failed: %s", e)
+        finally:
+            clear_current_recorder(token)
 
 
 @router.get("/jobs", response_model=list[JobOut])

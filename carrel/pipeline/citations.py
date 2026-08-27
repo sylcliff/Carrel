@@ -30,6 +30,7 @@ from carrel.config import CarrelYAML
 from carrel.models import Paper
 from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
+from carrel.agent_recorder import agent_step
 
 logger = logging.getLogger(__name__)
 
@@ -191,22 +192,34 @@ def enrich_paper(
         return False
 
     _progress("Querying Semantic Scholar…", paper_id=paper.id)
-    result = s2.fetch_citations(
-        doi=paper.doi,
-        arxiv_id=paper.arxiv_id,
-        s2_id=paper.s2_paper_id,
-        limit=limit,
-    )
+    with agent_step(
+        "s2_fetch",
+        label="Semantic Scholar fetch",
+        kind="step",
+        detail={"paper_id": paper.id, "limit": limit},
+    ):
+        result = s2.fetch_citations(
+            doi=paper.doi,
+            arxiv_id=paper.arxiv_id,
+            s2_id=paper.s2_paper_id,
+            limit=limit,
+        )
 
     # OpenAlex merge — best-effort, never blocks the S2 result from being saved.
     oa_works: list[dict] = []
     oa_id = _openalex_identifier(paper)
     if oa_id:
         _progress("Merging OpenAlex citing works…", paper_id=paper.id)
-        try:
-            oa_works = oa.fetch_citing_works(oa_id, limit=_OPENALEX_CITES_LIMIT)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("openalex citing fetch failed for %s: %s", paper.id, e)
+        with agent_step(
+            "oa_citing",
+            label="OpenAlex citing merge",
+            kind="step",
+            detail={"oa_id": oa_id},
+        ):
+            try:
+                oa_works = oa.fetch_citing_works(oa_id, limit=_OPENALEX_CITES_LIMIT)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("openalex citing fetch failed for %s: %s", paper.id, e)
     oa_citing = [_openalex_to_citing(w) for w in oa_works]
 
     now = datetime.now(UTC)

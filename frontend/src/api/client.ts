@@ -200,6 +200,9 @@ export const compileWiki = (body: {
 export const recompileWikiPage = (id: number) =>
   request<Job>(`/wiki/pages/${id}/recompile`, { method: "POST" });
 
+export const enrichScholarPage = (id: number) =>
+  request<Job>(`/wiki/pages/${id}/enrich`, { method: "POST" });
+
 export interface ScholarDetail {
   scholar: ScholarSummary;
   papers: PaperSummary[];
@@ -1042,7 +1045,131 @@ export interface UsagePrompt {
   source: string;
   system: string;
   user_template: string;
+  system_default: string;
+  user_template_default: string;
+  overridden: boolean;
+  override_updated_at: string | null;
+  placeholders: string[];
+  danger: boolean;
   notes: string;
 }
 
 export const getUsagePrompts = () => request<UsagePrompt[]>("/usage/prompts");
+
+export interface UsagePromptDetail extends UsagePrompt {}
+
+export const getUsagePromptDetail = (feature: string) =>
+  request<UsagePromptDetail>(`/usage/prompts/${encodeURIComponent(feature)}`);
+
+export interface UsagePromptOverride {
+  system: string | null;
+  user_template: string | null;
+}
+
+export interface UsagePromptOverrideResult {
+  feature: string;
+  override: {
+    system: string | null;
+    user_template: string | null;
+    updated_at: string | null;
+  };
+  warnings: string[];
+}
+
+export const updateUsagePrompt = (
+  feature: string,
+  body: UsagePromptOverride,
+) =>
+  request<UsagePromptOverrideResult>(
+    `/usage/prompts/${encodeURIComponent(feature)}`,
+    { method: "PUT", body: JSON.stringify(body) },
+  );
+
+export const resetUsagePrompt = (feature: string) =>
+  request<void>(`/usage/prompts/${encodeURIComponent(feature)}`, {
+    method: "DELETE",
+  });
+
+// ---- Agent runs (M17) ----
+
+export interface AgentStepOut {
+  id: number;
+  seq: number;
+  node_id: string | null;
+  label: string;
+  kind: "step" | "llm";
+  feature: string | null;
+  status: "running" | "success" | "failed" | "skipped" | string;
+  error: string | null;
+  input_summary: string | null;
+  output_summary: string | null;
+  detail: Record<string, unknown> | null;
+  model: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+}
+
+export interface AgentRunOut {
+  id: number;
+  pipeline_id: string;
+  pipeline_name: string;
+  status: "running" | "success" | "failed" | "cancelled" | string;
+  trigger: string;
+  context: Record<string, unknown> | null;
+  summary: Record<string, unknown> | null;
+  error: string | null;
+  job_id: number | null;
+  paper_id: string | null;
+  subject: string | null;
+  step_count: number;
+  success_count: number;
+  failed_count: number;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
+  created_at: string;
+}
+
+export interface AgentRunDetail extends AgentRunOut {
+  steps: AgentStepOut[];
+}
+
+export interface AgentPipelineSummary {
+  pipeline_id: string;
+  pipeline_name: string;
+  run_count: number;
+  last_status: string | null;
+  last_started_at: string | null;
+  last_run_id: number | null;
+  last_subject: string | null;
+}
+
+export interface AgentRunFilters {
+  pipeline_id?: string;
+  status?: string;
+  paper_id?: string;
+  limit?: number;
+}
+
+function _buildAgentRunQS(f: AgentRunFilters): string {
+  const sp = new URLSearchParams();
+  if (f.pipeline_id) sp.set("pipeline_id", f.pipeline_id);
+  if (f.status) sp.set("status", f.status);
+  if (f.paper_id) sp.set("paper_id", f.paper_id);
+  if (f.limit) sp.set("limit", String(f.limit));
+  const qs = sp.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export const listAgentRuns = (filters: AgentRunFilters = {}) =>
+  request<AgentRunOut[]>(`/agent/runs${_buildAgentRunQS(filters)}`);
+
+export const getAgentRun = (runId: number) =>
+  request<AgentRunDetail>(`/agent/runs/${runId}`);
+
+export const listAgentPipelines = () =>
+  request<AgentPipelineSummary[]>("/agent/pipelines");

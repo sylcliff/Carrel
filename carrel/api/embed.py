@@ -16,6 +16,12 @@ from carrel.db import get_session_dep
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.embed import EmbedError, embed_paper
 from carrel.schemas import EmbedRequest, JobOut
+from carrel.agent_recorder import (
+    AgentRecorder,
+    clear_current_recorder,
+    pipeline_display_name,
+    set_current_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +110,21 @@ def _run_all(session: Session, job_ids: list[int], paper_ids: list[str]) -> None
 
 def _run_one(session: Session, job_id: int, paper_id: str, cfg) -> None:
     job = session.get(Job, job_id)
+    paper = session.get(Paper, paper_id)
     progress = _make_progress_cb(session, job_id)
+    title = paper.title if paper is not None else ""
+    rec = AgentRecorder(
+        session,
+        pipeline_id="embed",
+        pipeline_name=pipeline_display_name("embed"),
+    )
+    rec.start(
+        context={"paper_id": paper_id},
+        job_id=job_id,
+        paper_id=paper_id,
+        subject=title[:200] if title else None,
+    )
+    token = set_current_recorder(rec)
     try:
         if job is not None:
             job.status = JobStatus.running.value
@@ -119,7 +139,9 @@ def _run_one(session: Session, job_id: int, paper_id: str, cfg) -> None:
             job.message = "Done"
             session.add(job)
             session.commit()
+        rec.finish(summary={"paper_id": paper_id})
     except EmbedError as e:
+        rec.finish(status="failed", error=str(e))
         if job is not None:
             job.status = JobStatus.failed.value
             job.finished_at = datetime.now(UTC)
@@ -128,12 +150,15 @@ def _run_one(session: Session, job_id: int, paper_id: str, cfg) -> None:
             session.commit()
     except Exception as e:  # noqa: BLE001
         logger.exception("embed job %d crashed", job_id)
+        rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
         if job is not None:
             job.status = JobStatus.failed.value
             job.finished_at = datetime.now(UTC)
             job.message = f"{type(e).__name__}: {e}"[:200]
             session.add(job)
             session.commit()
+    finally:
+        clear_current_recorder(token)
 
 
 def _run_all_background(job_ids: list[int], paper_ids: list[str]) -> None:

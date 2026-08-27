@@ -328,17 +328,33 @@ def test_api_usage_prompts_lists_every_feature(client):
         "wiki_question",
         "paper_chat",
         "wiki_chat",
+        "wiki_enrich",
     }
     assert features == expected, features ^ expected
     # Each row has the contract shape the UI relies on.
     for r in rows:
-        for key in ("feature", "label", "source", "system", "user_template", "notes"):
+        for key in (
+            "feature", "label", "source", "system", "user_template", "notes",
+            "system_default", "user_template_default",
+            "overridden", "override_updated_at", "placeholders", "danger",
+        ):
             assert key in r, f"{r['feature']} missing {key}"
         assert r["system"].strip(), f"{r['feature']} has empty system prompt"
         assert r["user_template"].strip(), f"{r['feature']} has empty user template"
         # `source` points at the module that owns the system prompt
         # constant, so an editor can jump from the UI to the file.
-        assert "._SYSTEM_PROMPT" in r["source"] or r["source"].endswith(":_SYSTEM_PROMPT")
+        assert (
+            "._SYSTEM_PROMPT" in r["source"]
+            or r["source"].endswith(":_SYSTEM_PROMPT")
+            or "._SYSTEM_TEMPLATE" in r["source"]
+            or r["source"].endswith(":_SYSTEM_TEMPLATE")
+        )
+    # Danger flags are correct.
+    by_feat = {r["feature"]: r for r in rows}
+    assert by_feat["paper_chat"]["danger"] is True
+    assert by_feat["wiki_chat"]["danger"] is True
+    assert by_feat["wiki_enrich"]["danger"] is True
+    assert by_feat["summarize"]["danger"] is False
 
 
 def test_api_usage_prompts_is_readonly(client):
@@ -412,3 +428,172 @@ def test_chat_json_on_usage_optional(monkeypatch):
         model="openai/gpt-4o-mini",
     )
     assert out == {"x": 1}
+
+
+# ---------------------------------------------------------------------------
+# Prompt editor endpoints (M16)
+# ---------------------------------------------------------------------------
+
+
+def test_api_usage_prompts_get_detail(client):
+    """GET /usage/prompts/{feature} returns default + effective + override state."""
+    r = client.get("/usage/prompts/summarize")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feature"] == "summarize"
+    assert body["system_default"].strip()
+    assert body["user_template_default"].strip()
+    assert body["system"] == body["system_default"]
+    assert body["user_template"] == body["user_template_default"]
+    assert body["overridden"] is False
+    assert body["override_updated_at"] is None
+    assert "body" in body["placeholders"]
+
+
+def test_api_usage_prompts_get_unknown_feature_404(client):
+    r = client.get("/usage/prompts/this_feature_does_not_exist")
+    assert r.status_code == 404
+
+
+def test_api_usage_prompts_put_round_trip(client):
+    """PUT → list shows overridden → GET returns the new effective value → DELETE → defaults back."""
+    # The validator runs over both system and user_template, so both must
+    # reference the catalog's placeholders for a clean save.
+    new_system = (
+        "Sys: title={title} authors={authors} venue={venue_date} "
+        "abstract={abstract} body={body}"
+    )
+    new_user = (
+        "Title: {title}\nAuthors: {authors}\nVenue/date: {venue_date}\n"
+        "Abstract: {abstract}\nBody: {body}"
+    )
+
+    # PUT
+    r = client.put(
+        "/usage/prompts/summarize",
+        json={"system": new_system, "user_template": new_user},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["feature"] == "summarize"
+    assert body["override"]["system"] == new_system
+    assert body["override"]["user_template"] == new_user
+    assert body["override"]["updated_at"]
+    assert body["warnings"] == []
+
+    # List now reports overridden.
+    rows = client.get("/usage/prompts").json()
+    summarize_row = next(r for r in rows if r["feature"] == "summarize")
+    assert summarize_row["overridden"] is True
+    assert summarize_row["system"] == new_system
+    assert summarize_row["user_template"] == new_user
+    assert summarize_row["override_updated_at"]
+
+    # Detail endpoint matches.
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["overridden"] is True
+    assert detail["system"] == new_system
+    assert detail["user_template"] == new_user
+
+    # DELETE — idempotent, 204.
+    r = client.delete("/usage/prompts/summarize")
+    assert r.status_code == 204
+    r = client.delete("/usage/prompts/summarize")  # second time still 204
+    assert r.status_code == 204
+
+    # Back to defaults.
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["overridden"] is False
+    assert detail["system"] == detail["system_default"]
+
+
+def test_api_usage_prompts_put_partial_update(client):
+    """null = leave alone; '' = reset; non-empty = set."""
+    # First set both.
+    client.put(
+        "/usage/prompts/summarize",
+        json={"system": "S1", "user_template": "T1 {body}"},
+    )
+
+    # Update only system, user_template = null (missing in JSON) is left alone.
+    r = client.put("/usage/prompts/summarize", json={"system": "S2"})
+    assert r.status_code == 200
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["system"] == "S2"  # updated
+    assert detail["user_template"] == "T1 {body}"  # left alone
+
+    # Now reset user_template with '' — system = null is left alone.
+    r = client.put("/usage/prompts/summarize", json={"user_template": ""})
+    assert r.status_code == 200
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["system"] == "S2"  # left alone
+    assert detail["user_template"] == detail["user_template_default"]  # reset
+
+    # Reset system with ''.
+    r = client.put("/usage/prompts/summarize", json={"system": ""})
+    assert r.status_code == 200
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["system"] == detail["system_default"]
+    assert detail["user_template"] == detail["user_template_default"]
+
+
+def test_api_usage_prompts_put_placeholder_warnings(client):
+    """Bad placeholders surface in `warnings`, not 4xx."""
+    # Unknown placeholder in user_template.
+    r = client.put(
+        "/usage/prompts/summarize",
+        json={"user_template": "Hello {body} and {unknown_thing}"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    warnings = body["warnings"]
+    assert any("unknown placeholder" in w and "unknown_thing" in w for w in warnings), warnings
+
+    # Missing required placeholder.
+    r = client.put(
+        "/usage/prompts/summarize",
+        json={"user_template": "Hello no placeholders here"},
+    )
+    assert r.status_code == 200
+    warnings = r.json()["warnings"]
+    # body, title, authors, venue_date, abstract are all required → all 5 missing.
+    missing_msgs = [w for w in warnings if "missing placeholder" in w]
+    assert len(missing_msgs) == 5, warnings
+
+    # The save still happened — the row is now overridden despite the warnings.
+    detail = client.get("/usage/prompts/summarize").json()
+    assert detail["overridden"] is True
+
+
+def test_api_usage_prompts_put_unknown_feature_404(client):
+    r = client.put(
+        "/usage/prompts/this_feature_does_not_exist",
+        json={"system": "x"},
+    )
+    assert r.status_code == 404
+
+
+def test_api_usage_prompts_delete_unknown_feature_404(client):
+    r = client.delete("/usage/prompts/this_feature_does_not_exist")
+    assert r.status_code == 404
+
+
+def test_api_usage_prompts_put_invalidates_runtime_cache(client, session):
+    """PUT must call invalidate so the next LLM call sees the new value
+    without waiting for the 60s TTL."""
+    from carrel import prompts_runtime
+    # Warm the cache.
+    assert (
+        prompts_runtime.get_system("summarize", "D-SYS", session=session)
+        != "OVERRIDE-FRESH"
+    )
+    # Edit.
+    client.put(
+        "/usage/prompts/summarize",
+        json={"system": "OVERRIDE-FRESH"},
+    )
+    # Cache should be invalidated → next read sees the new value.
+    assert (
+        prompts_runtime.get_system("summarize", "D-SYS", session=session)
+        == "OVERRIDE-FRESH"
+    )

@@ -28,7 +28,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import embeddings, llm, usage
+from carrel import embeddings, llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import WikiKind, WikiPage, WikiSource
 from carrel.pipeline.summarize import _prepare_body
@@ -120,8 +120,12 @@ def _build_user_prompt(*, question_display, papers, old_body):
             "Previous version of this page (revise and update):\n"
             + _prepare_body(old_body, 2500)
         )
-    parts.append("\nReturn the JSON object now, with no commentary.")
-    return "\n\n".join(parts)
+    return prompts_runtime.get_user_template(
+        "wiki_question", _USER_TEMPLATE
+    ).format(parts="\n\n".join(parts))
+
+
+_USER_TEMPLATE = "{parts}\n\nReturn the JSON object now, with no commentary."
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +401,7 @@ def compile_question(
     try:
         data = llm.chat_json(
             [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": prompts_runtime.get_system("wiki_question", _SYSTEM_PROMPT, session=session)},
                 {"role": "user", "content": prompt},
             ],
             model=cfg.llm.summarize_model,

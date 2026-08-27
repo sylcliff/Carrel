@@ -21,6 +21,7 @@ from sqlmodel import Session, select
 
 from carrel.config import CarrelYAML
 from carrel.db import get_session_dep
+from carrel.agent_recorder import run_with_recorder
 from carrel.models import Job, JobKind, JobStatus, Paper, WikiKind, WikiPage, WikiSource
 from carrel.pipeline.paper_extract import (
     PaperExtractError,
@@ -406,6 +407,8 @@ def _run_batch(
             session.commit()
         return
 
+    from carrel.agent_recorder import run_with_recorder
+
     try:
         if job is not None:
             job.status = JobStatus.running.value
@@ -416,53 +419,59 @@ def _run_batch(
         prev_noop = False
         per_stage: dict[str, dict] = {}
 
-        for stage in selected:
-            if prev_noop:
-                progress({"stage": stage, "detail": f"Skipping {stage} (previous stage no-op)"})
-                per_stage[stage] = {"skipped": True, "reason": "prev_noop"}
-                continue
+        with run_with_recorder(
+            session,
+            pipeline_id="wiki",
+            context={"limit": limit, "force": force, "stages": selected},
+            job_id=job_id,
+        ):
+            for stage in selected:
+                if prev_noop:
+                    progress({"stage": stage, "detail": f"Skipping {stage} (previous stage no-op)"})
+                    per_stage[stage] = {"skipped": True, "reason": "prev_noop"}
+                    continue
+                try:
+                    if stage == _STAGE_PAPER_EXTRACT:
+                        counts = extract_papers_pending(
+                            session, app_config, limit=limit, force=force,
+                            on_progress=progress,
+                        )
+                    elif stage == _STAGE_SCHOLAR:
+                        counts = compile_scholars_pending(
+                            session, app_config, limit=limit, force=force,
+                            on_progress=progress,
+                        )
+                    elif stage == _STAGE_CONCEPT:
+                        counts = compile_concepts_pending(
+                            session, app_config, limit=limit, force=force,
+                            on_progress=progress,
+                        )
+                    else:  # _STAGE_QUESTION
+                        counts = compile_questions_pending(
+                            session, app_config, limit=limit, force=force,
+                            on_progress=progress,
+                        )
+                except Exception as e:  # noqa: BLE001
+                    # Failure isolation: log + record, do not abort the job.
+                    logger.exception("wiki compile stage %s crashed", stage)
+                    per_stage[stage] = {"error": f"{type(e).__name__}: {e}"[:200]}
+                    # A crashed stage is not a "no-op" — keep going so the
+                    # user gets diagnostic data for every stage.
+                    prev_noop = False
+                    continue
+
+                per_stage[stage] = counts
+                prev_noop = not _stage_did_work(stage, counts)
+
+            # Final pass: prune dead links on auto-generated concept/question
+            # pages, then recompute backlinks so the UI shows fresh counts.
             try:
-                if stage == _STAGE_PAPER_EXTRACT:
-                    counts = extract_papers_pending(
-                        session, app_config, limit=limit, force=force,
-                        on_progress=progress,
-                    )
-                elif stage == _STAGE_SCHOLAR:
-                    counts = compile_scholars_pending(
-                        session, app_config, limit=limit, force=force,
-                        on_progress=progress,
-                    )
-                elif stage == _STAGE_CONCEPT:
-                    counts = compile_concepts_pending(
-                        session, app_config, limit=limit, force=force,
-                        on_progress=progress,
-                    )
-                else:  # _STAGE_QUESTION
-                    counts = compile_questions_pending(
-                        session, app_config, limit=limit, force=force,
-                        on_progress=progress,
-                    )
-            except Exception as e:  # noqa: BLE001
-                # Failure isolation: log + record, do not abort the job.
-                logger.exception("wiki compile stage %s crashed", stage)
-                per_stage[stage] = {"error": f"{type(e).__name__}: {e}"[:200]}
-                # A crashed stage is not a "no-op" — keep going so the
-                # user gets diagnostic data for every stage.
-                prev_noop = False
-                continue
-
-            per_stage[stage] = counts
-            prev_noop = not _stage_did_work(stage, counts)
-
-        # Final pass: prune dead links on auto-generated concept/question
-        # pages, then recompute backlinks so the UI shows fresh counts.
-        try:
-            pruned = _reindex.prune_dead_links(session)
-            recomputed = _reindex.recompute_backlinks(session)
-        except Exception:
-            logger.exception("wiki compile: final reindex pass failed")
-            pruned = None
-            recomputed = None
+                pruned = _reindex.prune_dead_links(session)
+                recomputed = _reindex.recompute_backlinks(session)
+            except Exception:
+                logger.exception("wiki compile: final reindex pass failed")
+                pruned = None
+                recomputed = None
 
         if job is not None:
             job.status = JobStatus.done.value
@@ -627,7 +636,14 @@ def recompile_page(
                 j.started_at = datetime.now(UTC)
                 sess.add(j)
                 sess.commit()
-            compile_fn(sess, app_config, key)
+            with run_with_recorder(
+                sess,
+                pipeline_id="wiki_recompile",
+                context={"wiki_page_id": page_id, "wiki_kind": row.kind, "compile_key": key},
+                job_id=jid,
+                subject=row.title[:200],
+            ):
+                compile_fn(sess, app_config, key)
             if j is not None:
                 j.status = JobStatus.done.value
                 j.finished_at = datetime.now(UTC)
@@ -646,6 +662,168 @@ def recompile_page(
                 sess.commit()
         except Exception as e:  # noqa: BLE001
             logger.exception("wiki recompile job %d crashed", jid)
+            if j is not None:
+                j.status = JobStatus.failed.value
+                j.finished_at = datetime.now(UTC)
+                j.message = f"{type(e).__name__}: {e}"[:200]
+                sess.add(j)
+                sess.commit()
+
+    def _run_one_bg() -> None:
+        from sqlmodel import Session as SqlSession  # noqa: PLC0415
+
+        from carrel.db import get_app_engine  # noqa: PLC0415
+
+        with SqlSession(get_app_engine()) as s:
+            _run_one(s, job_id)
+
+    if background:
+        bg_tasks.add_task(_run_one_bg)
+    else:
+        _run_one(session, job_id)
+        session.refresh(job)
+
+    return JobOut(
+        id=job.id or 0,
+        kind=job.kind,
+        status=job.status,
+        message=job.message,
+        stats=job.stats,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        created_at=job.created_at,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scholar "Research & enrich" — LLM-with-tools web research (M14.x)
+# ---------------------------------------------------------------------------
+#
+# The enrich agent has access to two tools:
+#   - brave_search__brave_web_search — search the live web for current info
+#   - builtin__save_scholar_note — append a "## Web research" block to the
+#     page's preserved <section data-user="true">.
+# It does NOT regenerate the LLM-authored sections; the user can hit
+# "Recompile profile" for that. This endpoint is scholar-only.
+
+
+@router.post("/pages/{page_id}/enrich", response_model=JobOut)
+def enrich_page(
+    page_id: int,
+    bg_tasks: BackgroundTasks,
+    background: bool = True,
+    session: Session = Depends(get_session_dep),
+) -> JobOut:
+    """LLM-with-tools web research for one scholar page.
+
+    The agent searches the web (Brave MCP) for up-to-date information
+    about the scholar and appends a ``## Web research`` block to the
+    page's preserved user-section. Does NOT regenerate the LLM-authored
+    sections (Summary, Research lines, …) — use the existing recompile
+    endpoint for that.
+    """
+    row = _get_page_row(session, page_id)
+    if row.kind != WikiKind.scholar.value:
+        raise HTTPException(
+            status_code=422,
+            detail=f"only scholar pages are enrichable, got kind={row.kind!r}",
+        )
+    # The file must exist — save_scholar_note raises otherwise and the
+    # job would hard-fail instead of taking the graceful path.
+    from carrel.main import app_config  # noqa: PLC0415
+
+    if not (Path(app_config.storage.root) / row.path).exists():
+        raise HTTPException(
+            status_code=404,
+            detail="scholar page file missing — recompile first",
+        )
+
+    now = datetime.now(UTC)
+    job = Job(
+        kind=JobKind.wiki_enrich.value,
+        status=JobStatus.queued.value,
+        message=f"Queued — enrich {row.title}",
+        stats={
+            "stage": "queued",
+            "detail": "Queued…",
+            "wiki_page_id": page_id,
+            "scholar_slug": row.slug,
+            "iterations": 0,
+            "tools_called": [],
+            "notes_saved": [],
+        },
+        created_at=now,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    job_id = job.id
+    assert job_id is not None
+
+    def _on_progress(sess: Session, jid: int, payload: dict) -> None:
+        j = sess.get(Job, jid)
+        if j is None:
+            return
+        merged = {**(j.stats or {}), **payload}
+        j.stats = merged
+        if "detail" in payload and payload["detail"]:
+            j.message = str(payload["detail"])[:200]
+        sess.add(j)
+        sess.commit()
+
+    def _run_one(sess: Session, jid: int) -> None:
+        from carrel.main import app_config  # noqa: PLC0415
+        from carrel.pipeline.wiki.scholar_enrich import enrich_scholar_wiki
+
+        page = sess.get(WikiPage, page_id)
+        if page is None:
+            j = sess.get(Job, jid)
+            if j is not None:
+                j.status = JobStatus.failed.value
+                j.finished_at = datetime.now(UTC)
+                j.message = "wiki page disappeared before enrich ran"
+                sess.add(j)
+                sess.commit()
+            return
+
+        j = sess.get(Job, jid)
+        if j is not None:
+            j.status = JobStatus.running.value
+            j.started_at = datetime.now(UTC)
+            sess.add(j)
+            sess.commit()
+
+        def _cb(payload: dict) -> None:
+            _on_progress(sess, jid, payload)
+
+        try:
+            with run_with_recorder(
+                sess,
+                pipeline_id="scholar_enrich",
+                context={"wiki_page_id": page_id, "scholar_slug": page.slug},
+                job_id=jid,
+                subject=page.title[:200],
+            ):
+                stats = enrich_scholar_wiki(sess, app_config, page, on_progress=_cb)
+            j = sess.get(Job, jid)
+            if j is not None:
+                j.status = JobStatus.done.value
+                j.finished_at = datetime.now(UTC)
+                j.stats = {**(j.stats or {}), **stats, "stage": "done"}
+                tools_n = len(stats.get("tools_called", []))
+                if stats.get("notes_saved"):
+                    j.message = (
+                        f"Saved 'Web research' note ({tools_n} tool calls)"
+                    )
+                else:
+                    j.message = (
+                        f"Finished ({tools_n} tool calls, no note saved)"
+                    )
+                sess.add(j)
+                sess.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("wiki enrich job %d crashed", jid)
+            j = sess.get(Job, jid)
             if j is not None:
                 j.status = JobStatus.failed.value
                 j.finished_at = datetime.now(UTC)

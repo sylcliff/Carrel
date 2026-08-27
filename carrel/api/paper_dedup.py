@@ -31,6 +31,7 @@ from carrel.pipeline import paper_dedup as dedup
 from carrel.pipeline import paper_dedup_judge as judge
 from carrel.pipeline import paper_dedup_ops as ops
 from carrel.schemas import JobOut
+from carrel.agent_recorder import run_with_recorder
 
 logger = logging.getLogger(__name__)
 
@@ -289,12 +290,18 @@ def run_dedup_job(
             cfg, _ = load_settings()
             j_judge = judge.build_judge(sess, cfg.llm)
 
-            result = dedup.run_dedup(
+            with run_with_recorder(
                 sess,
-                auto_apply=body.auto_apply,
-                on_progress=_progress,
-                judge=j_judge,
-            )
+                pipeline_id="paper_dedup",
+                context={"auto_apply": body.auto_apply},
+                job_id=job_id,
+            ):
+                result = dedup.run_dedup(
+                    sess,
+                    auto_apply=body.auto_apply,
+                    on_progress=_progress,
+                    judge=j_judge,
+                )
             # Refresh the suggestion cache from the just-scored pass so the
             # panel opens instantly and merge / reject actions below mutate
             # this snapshot rather than paying for another rescore.

@@ -30,6 +30,7 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from carrel import prompts_runtime
 from carrel.config import LLMConfig
 from carrel.llm import LLMError, chat_json
 from carrel.models import Paper, PaperDedupVerdict
@@ -74,38 +75,50 @@ Respond with ONLY a JSON object in this exact shape:
 """
 
 
+def _paper_block(p: Paper) -> str:
+    """Render one paper's metadata as a structured block for the user prompt."""
+    return (
+        f"id: {p.id}\n"
+        f"doi: {p.doi or ''}\n"
+        f"arxiv_id: {p.arxiv_id or ''}\n"
+        f"s2_paper_id: {p.s2_paper_id or ''}\n"
+        f"journal_doi: {p.journal_doi or ''}\n"
+        f"title: {(p.title or '')[:300]}\n"
+        f"authors: {_fmt_authors(p)}\n"
+        f"venue: {p.venue or ''}\n"
+        f"year: {_year_str(p)}\n"
+        f"abstract: {(p.abstract or '')[:1200]}\n"
+    )
+
+
+_USER_TEMPLATE = (
+    "PAPER A\n{paper_a_block}\n\n"
+    "PAPER B\n{paper_b_block}\n\n"
+    "{trailer}"
+)
+
+_DEFAULT_TRAILER = "Reply with JSON only — no prose, no markdown."
+
+
 def _build_user_prompt(a: Paper, b: Paper) -> str:
     """Render the two papers' metadata as a structured prompt.
 
-    Truncates long fields so the prompt stays bounded.
+    The trailer (final instruction line) is editable via the user template
+    override; if the user removes the ``{trailer}`` placeholder, we fall
+    back to a no-trailer render so a missing placeholder doesn't crash.
     """
-    return (
-        "PAPER A\n"
-        f"id: {a.id}\n"
-        f"doi: {a.doi or ''}\n"
-        f"arxiv_id: {a.arxiv_id or ''}\n"
-        f"s2_paper_id: {a.s2_paper_id or ''}\n"
-        f"journal_doi: {a.journal_doi or ''}\n"
-        f"title: {(a.title or '')[:300]}\n"
-        f"authors: {_fmt_authors(a)}\n"
-        f"venue: {a.venue or ''}\n"
-        f"year: {_year_str(a)}\n"
-        f"abstract: {(a.abstract or '')[:1200]}\n"
-        "\n"
-        "PAPER B\n"
-        f"id: {b.id}\n"
-        f"doi: {b.doi or ''}\n"
-        f"arxiv_id: {b.arxiv_id or ''}\n"
-        f"s2_paper_id: {b.s2_paper_id or ''}\n"
-        f"journal_doi: {b.journal_doi or ''}\n"
-        f"title: {(b.title or '')[:300]}\n"
-        f"authors: {_fmt_authors(b)}\n"
-        f"venue: {b.venue or ''}\n"
-        f"year: {_year_str(b)}\n"
-        f"abstract: {(b.abstract or '')[:1200]}\n"
-        "\n"
-        "Reply with JSON only — no prose, no markdown."
-    )
+    template = prompts_runtime.get_user_template("dedup_judge", _USER_TEMPLATE)
+    try:
+        return template.format(
+            paper_a_block=_paper_block(a),
+            paper_b_block=_paper_block(b),
+            trailer=_DEFAULT_TRAILER,
+        )
+    except KeyError:
+        return template.replace("{trailer}", _DEFAULT_TRAILER).format(
+            paper_a_block=_paper_block(a),
+            paper_b_block=_paper_block(b),
+        )
 
 
 def _fmt_authors(p: Paper) -> str:
@@ -126,12 +139,22 @@ def _year_str(p: Paper) -> str:
     return str(p.publication_date.year) if p.publication_date else ""
 
 
-def _prompt_hash(a: Paper, b: Paper, model: str, prompt_version: int) -> str:
-    """Stable sha256 of (paper content + model + prompt_version).
+def _prompt_hash(
+    a: Paper,
+    b: Paper,
+    model: str,
+    prompt_version: int,
+    *,
+    system: str,
+    user_template: str,
+) -> str:
+    """Stable sha256 of (paper content + model + prompt_version + prompt text).
 
     The pair is sorted before hashing so the LLM and the lookup key agree on
-    order. Bumping the prompt version yields a fresh hash automatically,
-    invalidating cached verdicts without DB surgery.
+    order. Bumping the prompt version yields a fresh hash automatically;
+    editing the system prompt or user template in the UI also yields a fresh
+    hash (via the SHA256 prefixes of the resolved texts) so cached verdicts
+    transparently invalidate without DB surgery.
     """
     a_sig, b_sig = sorted(
         [_paper_signature(a), _paper_signature(b)],
@@ -140,6 +163,8 @@ def _prompt_hash(a: Paper, b: Paper, model: str, prompt_version: int) -> str:
     payload = {
         "v": prompt_version,
         "model": model,
+        "sys_sha": hashlib.sha256(system.encode("utf-8")).hexdigest()[:16],
+        "ut_sha": hashlib.sha256(user_template.encode("utf-8")).hexdigest()[:16],
         "a": a_sig,
         "b": b_sig,
     }
@@ -240,7 +265,12 @@ class LLMJudge:
         return max(0, self.calls_remaining)
 
     def judge(self, a: Paper, b: Paper) -> PaperPairVerdict:
-        ph = _prompt_hash(a, b, self.model, self.prompt_version)
+        system = prompts_runtime.get_system("dedup_judge", _SYSTEM_PROMPT, session=self.session)
+        user_template = prompts_runtime.get_user_template("dedup_judge", _USER_TEMPLATE, session=self.session)
+        ph = _prompt_hash(
+            a, b, self.model, self.prompt_version,
+            system=system, user_template=user_template,
+        )
         a_key, b_key = sorted((a.id, b.id))
 
         cached = self.session.exec(
@@ -291,10 +321,11 @@ class LLMJudge:
 
     def _call_llm(self, a: Paper, b: Paper) -> PaperPairVerdict:
         from carrel import usage as _usage
+        system = prompts_runtime.get_system("dedup_judge", _SYSTEM_PROMPT, session=self.session)
         try:
             raw = chat_json(
                 [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": system},
                     {"role": "user", "content": _build_user_prompt(a, b)},
                 ],
                 model=self.model,

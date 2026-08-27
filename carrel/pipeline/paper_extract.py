@@ -34,7 +34,7 @@ from typing import Any
 
 from sqlmodel import Session, func, select
 
-from carrel import chunking, llm, usage
+from carrel import chunking, llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperConcept, PaperQuestion, PaperStatus
 
@@ -450,8 +450,8 @@ def extract_paper(
     try:
         data = llm.chat_json(
             [
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": body},
+                {"role": "system", "content": prompts_runtime.get_system("extract", _SYSTEM_PROMPT)},
+                {"role": "user", "content": prompts_runtime.get_user_template("extract", "{body}").format(body=body)},
             ],
             model=cfg.llm.summarize_model,
             fallback_model=cfg.llm.fallback_model,

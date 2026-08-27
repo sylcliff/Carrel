@@ -27,6 +27,12 @@ from carrel.schemas import (
     JobOut,
     ReferenceListOut,
 )
+from carrel.agent_recorder import (
+    AgentRecorder,
+    clear_current_recorder,
+    pipeline_display_name,
+    set_current_recorder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -397,6 +403,18 @@ def _run(session: Session, job_id: int, paper_id: str) -> None:
     def progress(p: dict) -> None:
         base_cb({**p, "paper_id": paper_id, "paper_title": p.get("paper_title") or title})
 
+    rec = AgentRecorder(
+        session,
+        pipeline_id="citations",
+        pipeline_name=pipeline_display_name("citations"),
+    )
+    rec.start(
+        context={"paper_id": paper_id},
+        job_id=job_id,
+        paper_id=paper_id,
+        subject=title[:200] if title else None,
+    )
+    token = set_current_recorder(rec)
     try:
         if job is not None:
             job.status = JobStatus.running.value
@@ -413,14 +431,18 @@ def _run(session: Session, job_id: int, paper_id: str) -> None:
             job.message = "Done"
             session.add(job)
             session.commit()
+        rec.finish(summary={"paper_id": paper_id})
     except Exception as e:  # noqa: BLE001
         logger.exception("citations job %d failed", job_id)
+        rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
         if job is not None:
             job.status = JobStatus.failed.value
             job.finished_at = datetime.now(UTC)
             job.message = f"{type(e).__name__}: {e}"[:200]
             session.add(job)
             session.commit()
+    finally:
+        clear_current_recorder(token)
 
 
 def _run_background(job_id: int, paper_id: str) -> None:

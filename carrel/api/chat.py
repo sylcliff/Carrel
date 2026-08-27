@@ -24,11 +24,12 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from carrel import embeddings as emb
-from carrel import llm, usage
+from carrel import llm, prompts_runtime, usage
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
 from carrel.models import ChatMessage, Chunk, Paper
 from carrel.pipeline.summarize import _prepare_body
+from carrel.pipeline._llm_recorder import make_record_usage_callback
 from carrel.schemas import (
     ChatMessageOut,
     ChatMessagesIn as ChatHistoryIn,
@@ -150,25 +151,39 @@ def _format_chunks(
 
 
 def _build_messages(
-    paper: Paper, context_block: str, history: list[ChatTurn], history_limit: int
+    paper: Paper,
+    context_block: str,
+    history: list[ChatTurn],
+    history_limit: int,
+    *,
+    session: Session | None = None,
 ) -> list[dict[str, str]]:
-    context_msg = (
-        f"<paper-context>\n"
-        f"Title: {paper.title}\n"
-        f"Authors: {_authors(paper)}\n\n"
-        f"{context_block}\n"
-        f"</paper-context>\n\n"
-        f"依据以上论文片段回答用户的问题。"
+    context_msg = prompts_runtime.get_user_template(
+        "paper_chat", _USER_TEMPLATE, session=session
+    ).format(
+        title=paper.title or "",
+        authors=_authors(paper),
+        context_block=context_block,
     )
     # Keep the most recent turns; drop any system turns from the client.
     trimmed = [t for t in history if t.role != "system"][-history_limit:]
     msgs: list[dict[str, str]] = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": prompts_runtime.get_system("paper_chat", _SYSTEM_PROMPT, session=session)},
         {"role": "user", "content": context_msg},
     ]
     for t in trimmed:
         msgs.append({"role": t.role, "content": t.content})
     return msgs
+
+
+_USER_TEMPLATE = (
+    "<paper-context>\n"
+    "Title: {title}\n"
+    "Authors: {authors}\n\n"
+    "{context_block}\n"
+    "</paper-context>\n\n"
+    "依据以上论文片段回答用户的问题。"
+)
 
 
 def _authors(paper: Paper) -> str:
@@ -240,8 +255,45 @@ def paper_chat(
 
     top_k = app_config.llm.rag_top_k
     history_limit = app_config.llm.chat_history_limit
-    context_block, sources = _retrieve_chunks(session, paper, query, top_k)
-    messages = _build_messages(paper, context_block, req.messages, history_limit)
+
+    # One AgentRun per chat turn. Record the RAG retrieval as a step, then
+    # the LLM streaming call. The recorder is bound as the ambient one
+    # so the existing LLM usage callback (see
+    # :mod:`carrel.pipeline._llm_recorder`) attaches token counts to the
+    # right step.
+    from carrel.agent_recorder import (
+        AgentRecorder,
+        agent_step,
+        clear_current_recorder,
+        pipeline_display_name,
+        set_current_recorder,
+    )
+    rec = AgentRecorder(
+        session,
+        pipeline_id="paper_chat",
+        pipeline_name=pipeline_display_name("paper_chat"),
+    )
+    rec.start(
+        context={"paper_id": paper_id, "query": query[:200]},
+        paper_id=paper_id,
+        subject=paper.title[:200] if paper.title else None,
+    )
+    rec_token = set_current_recorder(rec)
+    try:
+        with agent_step(
+            "retrieve",
+            label="RAG retrieve",
+            kind="step",
+            detail={"top_k": top_k, "query_chars": len(query)},
+        ) as step:
+            context_block, sources = _retrieve_chunks(session, paper, query, top_k)
+            step.set_output(f"{len(sources)} sources")
+    except Exception:
+        clear_current_recorder(rec_token)
+        rec.finish(status="failed", error="retrieve failed")
+        raise
+
+    messages = _build_messages(paper, context_block, req.messages, history_limit, session=session)
 
     model = _chat_model()
     fallback = _chat_fallback()
@@ -251,24 +303,34 @@ def paper_chat(
     def generate():
         # Sources frame first so the UI can render provenance before tokens.
         yield _event({"sources": sources})
-        try:
-            for delta in llm.chat_stream(
-                messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=temperature,
-                timeout=timeout,
-                feature="paper_chat",
-                on_usage=usage.make_usage_callback(
-                    session, feature="paper_chat", paper_id=paper_id,
-                ),
-            ):
-                yield _event({"t": delta})
-        except Exception as e:  # noqa: BLE001 - surface any LLM error on the stream
-            logger.warning("chat stream for %s failed: %s", paper_id, e)
-            yield _event({"error": str(e)})
-            return
+        with agent_step(
+            "llm",
+            label="LLM answer",
+            kind="llm",
+            feature="paper_chat",
+        ):
+            try:
+                for delta in llm.chat_stream(
+                    messages,
+                    model=model,
+                    fallback_model=fallback,
+                    temperature=temperature,
+                    timeout=timeout,
+                    feature="paper_chat",
+                    on_usage=make_record_usage_callback(
+                        session, paper_id=paper_id, feature="paper_chat"
+                    ),
+                ):
+                    yield _event({"t": delta})
+            except Exception as e:  # noqa: BLE001 - surface any LLM error on the stream
+                logger.warning("chat stream for %s failed: %s", paper_id, e)
+                yield _event({"error": str(e)})
+                rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
+                clear_current_recorder(rec_token)
+                return
         yield _sse(_DONE)
+        rec.finish(summary={"paper_id": paper_id, "sources": len(sources)})
+        clear_current_recorder(rec_token)
 
     from fastapi.responses import StreamingResponse
 

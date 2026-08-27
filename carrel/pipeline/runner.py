@@ -9,6 +9,12 @@ discipline, same kind of log line at the end. Differences:
 
 This module is intentionally synchronous. A single-user daily sync is tens
 to hundreds of papers; we don't need Celery/RQ.
+
+Per-step observability (M17) is wired via the ambient ``agent_step``
+context manager. If the caller set up an :class:`AgentRecorder`, every
+named step lands in the run timeline; without one the helpers are
+silent no-ops. This keeps the pipeline callable from CLI/tests that
+don't care about the audit trail.
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlmodel import Session, select
 
+from carrel.agent_recorder import agent_step
 from carrel.config import CarrelYAML
 from carrel.models import Job, JobStatus, Paper, PaperStatus, Subscription
 from carrel.sources import arxiv as arxiv_src
@@ -42,11 +49,12 @@ logger = logging.getLogger(__name__)
 
 
 def list_enabled_subscriptions(session: Session) -> list[Subscription]:
-    return list(
-        session.exec(
-            select(Subscription).where(Subscription.enabled.is_(True))
-        ).all()
-    )
+    with agent_step("load_subs", label="Load subscriptions", kind="step"):
+        return list(
+            session.exec(
+                select(Subscription).where(Subscription.enabled.is_(True))
+            ).all()
+        )
 
 
 def partition_subscriptions(
@@ -100,81 +108,111 @@ def fetch_candidates(
     arxiv_cats_str = [s.value for s in arxiv_cats]
     arxiv_queries = [s.value for s in keywords]
     if arxiv_cats_str:
-        try:
-            entries = arxiv_src.fetch_recent(
-                lookback_hours=lookback_hours,
-                categories=arxiv_cats_str,
-                max_results=cfg.arxiv.max_results_per_query,
-                timeout=cfg.arxiv.request_timeout_seconds,
-                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-            )
-        except Exception as e:  # noqa: BLE001 - log and continue
-            logger.warning("arxiv category fetch failed: %s", e)
-            errors["arxiv_categories"] = f"{type(e).__name__}: {e}"
-            entries = []
-        for e in entries:
-            rec = enrich_with_openalex(from_arxiv(e), session=session)
-            _merge_record(records, rec)
+        with agent_step(
+            "fetch_arxiv_categories",
+            label=f"Fetch arXiv categories ({len(arxiv_cats_str)})",
+            kind="step",
+            detail={"categories": arxiv_cats_str},
+        ):
+            try:
+                entries = arxiv_src.fetch_recent(
+                    lookback_hours=lookback_hours,
+                    categories=arxiv_cats_str,
+                    max_results=cfg.arxiv.max_results_per_query,
+                    timeout=cfg.arxiv.request_timeout_seconds,
+                    delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+                )
+            except Exception as e:  # noqa: BLE001 - log and continue
+                logger.warning("arxiv category fetch failed: %s", e)
+                errors["arxiv_categories"] = f"{type(e).__name__}: {e}"
+                entries = []
+            for e in entries:
+                rec = enrich_with_openalex(from_arxiv(e), session=session)
+                _merge_record(records, rec)
     if arxiv_queries:
-        try:
-            entries = arxiv_src.fetch_recent(
-                lookback_hours=lookback_hours,
-                queries=arxiv_queries,
-                max_results=cfg.arxiv.max_results_per_query,
-                timeout=cfg.arxiv.request_timeout_seconds,
-                delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("arxiv keyword fetch failed: %s", e)
-            errors["arxiv_keywords"] = f"{type(e).__name__}: {e}"
-            entries = []
-        for e in entries:
-            rec = enrich_with_openalex(from_arxiv(e), session=session)
-            _merge_record(records, rec)
+        with agent_step(
+            "fetch_arxiv_keywords",
+            label=f"Fetch arXiv keywords ({len(arxiv_queries)})",
+            kind="step",
+            detail={"queries": arxiv_queries},
+        ):
+            try:
+                entries = arxiv_src.fetch_recent(
+                    lookback_hours=lookback_hours,
+                    queries=arxiv_queries,
+                    max_results=cfg.arxiv.max_results_per_query,
+                    timeout=cfg.arxiv.request_timeout_seconds,
+                    delay_between_requests=cfg.arxiv.delay_between_requests_seconds,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("arxiv keyword fetch failed: %s", e)
+                errors["arxiv_keywords"] = f"{type(e).__name__}: {e}"
+                entries = []
+            for e in entries:
+                rec = enrich_with_openalex(from_arxiv(e), session=session)
+                _merge_record(records, rec)
 
     # --- OpenAlex: author subscriptions -----------------------------------------
     for s in authors:
-        try:
-            works = oa.fetch_recent_by_author(
-                s.value, since=since, max_results=50
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("openalex author fetch failed for %s: %s", s.value, e)
-            errors[f"openalex_author:{s.value}"] = f"{type(e).__name__}: {e}"
-            works = []
-        for w in works:
-            rec = from_openalex(w)
-            if rec is not None:
-                _merge_record(records, rec)
+        with agent_step(
+            "fetch_oa_author",
+            label=f"Fetch OpenAlex author {s.value}",
+            kind="step",
+            detail={"subscription": s.value},
+        ):
+            try:
+                works = oa.fetch_recent_by_author(
+                    s.value, since=since, max_results=50
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("openalex author fetch failed for %s: %s", s.value, e)
+                errors[f"openalex_author:{s.value}"] = f"{type(e).__name__}: {e}"
+                works = []
+            for w in works:
+                rec = from_openalex(w)
+                if rec is not None:
+                    _merge_record(records, rec)
 
     # --- OpenAlex: venue subscriptions ------------------------------------------
     for s in venues:
-        try:
-            works = oa.fetch_recent_by_venue(
-                s.value, since=since, max_results=100
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("openalex venue fetch failed for %s: %s", s.value, e)
-            errors[f"openalex_venue:{s.value}"] = f"{type(e).__name__}: {e}"
-            works = []
-        for w in works:
-            rec = from_openalex(w)
-            if rec is not None:
-                _merge_record(records, rec)
+        with agent_step(
+            "fetch_oa_venue",
+            label=f"Fetch OpenAlex venue {s.value}",
+            kind="step",
+            detail={"subscription": s.value},
+        ):
+            try:
+                works = oa.fetch_recent_by_venue(
+                    s.value, since=since, max_results=100
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("openalex venue fetch failed for %s: %s", s.value, e)
+                errors[f"openalex_venue:{s.value}"] = f"{type(e).__name__}: {e}"
+                works = []
+            for w in works:
+                rec = from_openalex(w)
+                if rec is not None:
+                    _merge_record(records, rec)
 
     # --- OpenAlex: keyword subscriptions (in addition to arXiv) ---------------
     keyword_strs = {s.value for s in keywords}
     for q in keyword_strs:
-        try:
-            works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("openalex keyword fetch failed for %s: %s", q, e)
-            errors[f"openalex_keyword:{q}"] = f"{type(e).__name__}: {e}"
-            works = []
-        for w in works:
-            rec = from_openalex(w)
-            if rec is not None:
-                _merge_record(records, rec)
+        with agent_step(
+            "fetch_oa_keyword",
+            label=f"Fetch OpenAlex keyword {q}",
+            kind="step",
+            detail={"subscription": q},
+        ):
+            try:
+                works = oa.fetch_recent_by_keyword(q, since=since, max_results=30)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("openalex keyword fetch failed for %s: %s", q, e)
+                errors[f"openalex_keyword:{q}"] = f"{type(e).__name__}: {e}"
+                works = []
+            for w in works:
+                rec = from_openalex(w)
+                if rec is not None:
+                    _merge_record(records, rec)
 
     return list(records.values()), errors
 
@@ -458,15 +496,29 @@ def run_sync(
     logger.info("sync start: subs=%d lookback_h=%d", len(subs), lookback_hours)
 
     try:
-        records, fetch_errors = fetch_candidates(
-            cfg, subs, lookback_hours=lookback_hours, session=session
-        )
+        with agent_step(
+            "fetch_all",
+            label=f"Fetch candidates (lookback={lookback_hours}h)",
+            kind="step",
+            detail={"lookback_hours": lookback_hours, "subscriptions": len(subs)},
+        ) as step:
+            records, fetch_errors = fetch_candidates(
+                cfg, subs, lookback_hours=lookback_hours, session=session
+            )
+            step.set_output(f"{len(records)} records fetched")
+            step.set_detail({"fetch_errors": fetch_errors} if fetch_errors else None)
         logger.info("fetched %d candidate records", len(records))
-        counts = upsert_records(session, records)
-        counts["fetched"] = len(records)
-        counts["subscriptions"] = len(subs)
-        if fetch_errors:
-            counts["source_errors"] = fetch_errors
+        with agent_step(
+            "upsert",
+            label="Upsert into inbox/library",
+            kind="step",
+        ) as step:
+            counts = upsert_records(session, records)
+            counts["fetched"] = len(records)
+            counts["subscriptions"] = len(subs)
+            if fetch_errors:
+                counts["source_errors"] = fetch_errors
+            step.set_detail({k: v for k, v in counts.items() if k != "discovered_ids"})
 
         # Best-effort citation enrichment. Newly *discovered* papers are in the
         # inbox (in_library=False) and are NOT enriched — don't spend S2 quota on
@@ -483,46 +535,56 @@ def run_sync(
         if cfg.semantic_scholar.fetch_on_sync:
             from carrel.pipeline import citations as cite_pipe
 
-            backfill = [
-                p.id for p in cite_pipe.select_missing_references(
-                    session, limit=cfg.semantic_scholar.references_backfill_batch
-                )
-            ]
-            refresh_batch = cfg.semantic_scholar.citations_refresh_batch or 0
-            stale = [
-                p.id for p in cite_pipe.select_stale(session, limit=refresh_batch)
-            ] if refresh_batch > 0 else []
+            with agent_step(
+                "citations_enrich",
+                label="Citation enrichment (S2)",
+                kind="step",
+            ) as step:
+                backfill = [
+                    p.id for p in cite_pipe.select_missing_references(
+                        session, limit=cfg.semantic_scholar.references_backfill_batch
+                    )
+                ]
+                refresh_batch = cfg.semantic_scholar.citations_refresh_batch or 0
+                stale = [
+                    p.id for p in cite_pipe.select_stale(session, limit=refresh_batch)
+                ] if refresh_batch > 0 else []
 
-            # De-dup while preserving order: missing-references backfill first,
-            # then any stale candidates not already in the backfill set.
-            seen: set[str] = set()
-            cite_ids: list[str] = []
-            for pid in backfill + stale:
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    cite_ids.append(pid)
+                # De-dup while preserving order: missing-references backfill first,
+                # then any stale candidates not already in the backfill set.
+                seen: set[str] = set()
+                cite_ids: list[str] = []
+                for pid in backfill + stale:
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        cite_ids.append(pid)
 
-            counts["references_backfilled"] = len(backfill)
-            counts["citations_refresh_candidates"] = len(stale)
+                counts["references_backfilled"] = len(backfill)
+                counts["citations_refresh_candidates"] = len(stale)
 
-            def _cite_progress(progress: dict) -> None:
-                if job is not None:
-                    job.stats = {**(job.stats or {}), **progress, **counts}
-                    session.add(job)
-                    session.commit()
+                def _cite_progress(progress: dict) -> None:
+                    if job is not None:
+                        job.stats = {**(job.stats or {}), **progress, **counts}
+                        session.add(job)
+                        session.commit()
 
-            if cite_ids:
-                cite_counts = cite_pipe.enrich_papers(
-                    session, cfg, cite_ids, on_progress=_cite_progress
-                )
-                counts["citations_enriched"] = cite_counts["enriched"]
-                counts["citations_failed"] = cite_counts["failed"]
-                logger.info(
-                    "citation enrichment: enriched=%d failed=%d "
-                    "(reference-backfill=%d stale-refresh=%d unique=%d)",
-                    cite_counts["enriched"], cite_counts["failed"],
-                    len(backfill), len(stale), len(cite_ids),
-                )
+                if cite_ids:
+                    cite_counts = cite_pipe.enrich_papers(
+                        session, cfg, cite_ids, on_progress=_cite_progress
+                    )
+                    counts["citations_enriched"] = cite_counts["enriched"]
+                    counts["citations_failed"] = cite_counts["failed"]
+                    logger.info(
+                        "citation enrichment: enriched=%d failed=%d "
+                        "(reference-backfill=%d stale-refresh=%d unique=%d)",
+                        cite_counts["enriched"], cite_counts["failed"],
+                        len(backfill), len(stale), len(cite_ids),
+                    )
+                step.set_detail({
+                    k: v for k, v in counts.items()
+                    if k.startswith("citations_") or k.endswith("_backfilled")
+                    or k == "citations_refresh_candidates"
+                })
 
         logger.info(
             "sync done: fetched=%d new_discovered=%d updated=%d skipped=%d",

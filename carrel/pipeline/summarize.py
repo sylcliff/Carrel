@@ -33,9 +33,10 @@ from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import llm, usage
+from carrel import llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
+from carrel.pipeline._llm_recorder import make_record_usage_callback
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,17 @@ _SYSTEM_PROMPT = (
 )
 
 
+_USER_TEMPLATE = (
+    "Title: {title}\n"
+    "Authors: {authors}\n"
+    "Venue/date: {venue_date}\n\n"
+    "Abstract:\n{abstract}\n\n"
+    "Paper text (parsed from PDF; may contain OCR noise; truncated):\n\n"
+    "{body}\n\n"
+    "Return the JSON object now, with no commentary."
+)
+
+
 def _build_user_prompt(
     *,
     title: str,
@@ -86,21 +98,13 @@ def _build_user_prompt(
     abstract: str,
     body: str,
 ) -> str:
-    parts = [
-        f"Title: {title}",
-        f"Authors: {authors or 'unknown'}",
-        f"Venue/date: {venue_date or 'unknown'}",
-    ]
-    if abstract:
-        parts.append(f"Abstract:\n{abstract}")
-    parts.append(
-        "Paper text (parsed from PDF; may contain OCR noise; "
-        f"truncated):\n\n{body}"
+    return prompts_runtime.get_user_template("summarize", _USER_TEMPLATE).format(
+        title=title,
+        authors=authors or "unknown",
+        venue_date=venue_date or "unknown",
+        abstract=abstract or "",
+        body=body,
     )
-    parts.append(
-        "\nReturn the JSON object now, with no commentary."
-    )
-    return "\n\n".join(parts)
 
 
 def _authors_string(paper: Paper) -> str:
@@ -194,7 +198,7 @@ def summarize_paper(
     md = md_path.read_text(encoding="utf-8", errors="replace")
     body = _prepare_body(md, cfg.llm.max_input_chars)
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": prompts_runtime.get_system("summarize", _SYSTEM_PROMPT)},
         {
             "role": "user",
             "content": _build_user_prompt(
@@ -216,8 +220,8 @@ def summarize_paper(
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
             feature="summarize",
-            on_usage=usage.make_usage_callback(
-                session, feature="summarize", paper_id=paper.id,
+            on_usage=make_record_usage_callback(
+                session, paper_id=paper.id, feature="summarize"
             ),
         )
     except llm.LLMError as e:

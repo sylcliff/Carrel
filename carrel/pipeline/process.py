@@ -30,6 +30,7 @@ from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
 from carrel.sources import mineru_client
 from carrel.sources.pdf_download import download_pdf_with_fallback, safe_paper_dir
+from carrel.agent_recorder import agent_step
 
 logger = logging.getLogger(__name__)
 
@@ -182,9 +183,21 @@ def process_paper(
 
     try:
         _emit({"stage": "download", "detail": "Downloading PDF…"})
-        _step_download(session, cfg, paper, client=client)
+        with agent_step(
+            "download",
+            label="Download PDF",
+            kind="step",
+            detail={"paper_id": paper.id},
+        ):
+            _step_download(session, cfg, paper, client=client)
         _emit({"stage": "parse", "detail": "Queued for parsing…"})
-        _step_parse(session, cfg, paper, client=client, emit=_emit)
+        with agent_step(
+            "parse",
+            label="MinerU parse to MD",
+            kind="step",
+            detail={"paper_id": paper.id},
+        ):
+            _step_parse(session, cfg, paper, client=client, emit=_emit)
         # M4: best-effort LLM summary. Runs chained after a successful parse;
         # failures are non-fatal — the paper stays `parsed` and embedding can
         # still run. We import lazily and guard against a missing API key so
@@ -193,10 +206,17 @@ def process_paper(
             from carrel.pipeline.summarize import SummarizeError, summarize_paper
 
             _emit({"stage": "summarize", "detail": "Generating summary…"})
-            summarize_paper(
-                session, cfg, paper.id,
-                on_progress=lambda d: _emit({"stage": "summarize", **d}),
-            )
+            with agent_step(
+                "summarize",
+                label="LLM summary",
+                kind="llm",
+                feature="summarize",
+                detail={"paper_id": paper.id},
+            ):
+                summarize_paper(
+                    session, cfg, paper.id,
+                    on_progress=lambda d: _emit({"stage": "summarize", **d}),
+                )
         except SummarizeError as e:
             logger.info("summarize skipped/failed for %s: %s", paper_id, e)
         except Exception as e:  # noqa: BLE001 - never poison a successful parse
@@ -207,10 +227,17 @@ def process_paper(
             from carrel.pipeline.topics import TopicsError, topics_paper
 
             _emit({"stage": "topics", "detail": "Classifying topics…"})
-            topics_paper(
-                session, cfg, paper.id,
-                on_progress=lambda d: _emit({"stage": "topics", **d}),
-            )
+            with agent_step(
+                "topics",
+                label="Classify topics",
+                kind="llm",
+                feature="topics",
+                detail={"paper_id": paper.id},
+            ):
+                topics_paper(
+                    session, cfg, paper.id,
+                    on_progress=lambda d: _emit({"stage": "topics", **d}),
+                )
         except TopicsError as e:
             logger.info("topics skipped/failed for %s: %s", paper_id, e)
         except Exception as e:  # noqa: BLE001 - never poison a successful parse

@@ -73,6 +73,13 @@ class JobKind(str, Enum):
     wiki_compile = "wiki_compile"
     # Force-recompile a single wiki page.
     wiki_recompile = "wiki_recompile"
+    # Run an LLM-with-tools agent that researches the scholar online
+    # (Brave web search) and appends a `## Web research` note to the
+    # scholar's preserved <section data-user="true"> block. The note is
+    # not part of the LLM-generated sections; the user can edit it
+    # freely and recompiles don't clobber it. Triggered manually from
+    # the Scholar Detail page; not scheduled.
+    wiki_enrich = "wiki_enrich"
     # Cluster same-named A-IDs and apply high-confidence scholar merges.
     scholar_dedup = "scholar_dedup"
     # Cluster near-duplicate paper records (DOI / arXiv / s2 / journal_doi
@@ -130,6 +137,34 @@ class TokenUsage(SQLModel, table=True):
     prompt_tokens: int = Field(default=0)
     completion_tokens: int = Field(default=0)
     total_tokens: int = Field(default=0)
+
+
+class PromptOverride(SQLModel, table=True):
+    """Per-feature user override of system + user-template LLM prompts.
+
+    A row exists only when the user has saved an override via the prompt
+    editor on the Agent page. Absence means "use the module default".
+    ``system`` and ``user_template`` are both nullable so a partial override
+    is allowed — the runtime resolver does ``override.<col> or default``.
+
+    The PK is the feature name (matches the ``feature`` column on
+    :class:`TokenUsage`); the catalog in :mod:`carrel.prompts` pins the
+    valid feature set so the API can 404 on unknown names.
+
+    Read at call time by :mod:`carrel.prompts_runtime` with a 60s in-process
+    TTL cache; writes from the editor call :func:`prompts_runtime.invalidate`
+    synchronously so the next LLM call sees the new value.
+    """
+
+    __tablename__ = "prompt_overrides"
+
+    feature: str = Field(primary_key=True, max_length=64)
+    system: str | None = Field(default=None, sa_column=Column(Text))
+    user_template: str | None = Field(default=None, sa_column=Column(Text))
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
 
 # ------------------ Tables ------------------
@@ -674,6 +709,163 @@ class Job(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+
+# ------------------ Agent execution trace (M17) ------------------
+
+
+class AgentRunStatus(str, Enum):
+    running = "running"
+    success = "success"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class AgentStepStatus(str, Enum):
+    running = "running"
+    success = "success"
+    failed = "failed"
+    skipped = "skipped"
+
+
+class AgentRun(SQLModel, table=True):
+    """One end-to-end execution of an agent/pipeline.
+
+    An ``AgentRun`` is the durable audit record for a single invocation of
+    anything the front-end shows on the /agent page (the per-pipeline flow
+    cards). It always has a ``pipeline_id`` matching an entry in
+    ``frontend/src/lib/agentPipelines.ts``. It may optionally link to a
+    ``Job`` (the existing coarse job row) and a ``paper_id`` when the run
+    is per-paper.
+
+    Steps are stored separately in :class:`AgentStep` and linked by
+    ``run_id``. The run row carries the aggregate status + timing; per-step
+    detail lives on the steps.
+    """
+
+    __tablename__ = "agent_runs"
+
+    id: int | None = Field(default=None, primary_key=True)
+    pipeline_id: str = Field(max_length=32, index=True)
+    # Display name cached from the pipeline catalog so an outdated catalog
+    # never breaks the row.
+    pipeline_name: str = Field(max_length=120)
+    status: str = Field(
+        default=AgentRunStatus.running.value, max_length=16, index=True
+    )
+    # Trigger: "manual" | "scheduled" | "api:<route>" | "background". Lets
+    # the UI tell apart a user click from a cron tick from a BackgroundTask.
+    trigger: str = Field(default="manual", max_length=32)
+    # Free-form context: who/what this run acted on. e.g. a sync run
+    # carries ``{"lookback_hours": 24, "sources": null}``; a process run
+    # carries ``{"paper_id": "W12345"}``; a wiki compile run carries
+    # ``{"limit": 20}``.
+    context: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    # Aggregate counters from the run (same shape as Job.stats where
+    # available). Cheap to read for the list view; the step-level detail
+    # is the source of truth for the per-node timeline.
+    summary: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    error: str | None = None
+    # Optional FK to the coarse Job row that scheduled this run, so the
+    # /agent page can link to the existing /sync/jobs/{id} detail. The
+    # AgentRun is independent — runs can exist with no Job (e.g. one
+    # paper_chat turn).
+    job_id: int | None = Field(default=None, index=True, foreign_key="jobs.id")
+    paper_id: str | None = Field(default=None, index=True, max_length=64)
+    # Top-level subject (e.g. the wiki page slug, the author A-ID, the
+    # paper dedup pair). Free-form so each pipeline can use it.
+    subject: str | None = Field(default=None, max_length=300)
+    step_count: int = Field(default=0)
+    success_count: int = Field(default=0)
+    failed_count: int = Field(default=0)
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False, index=True),
+    )
+    finished_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+    __table_args__ = (
+        Index("ix_agent_runs_pipeline_started", "pipeline_id", "started_at"),
+    )
+
+
+class AgentStep(SQLModel, table=True):
+    """One node (step or LLM call) inside an :class:`AgentRun`.
+
+    Mirrors the shape of ``FlowNode`` in agentPipelines.ts: a step has
+    ``kind='step'`` or ``kind='llm'``; LLM steps additionally carry the
+    ``feature`` key used in the token-usage log so an admin can join
+    AgentStep ⨝ TokenUsage on (run_id, feature) to attribute tokens to a
+    specific execution.
+
+    ``input_summary`` / ``output_summary`` are deliberately short string
+    blobs (or arbitrary JSON truncated to ~4KB) so the step table stays
+    small enough to read in bulk; full prompt/response text is left on
+    the existing usage / chat_messages tables.
+    """
+
+    __tablename__ = "agent_steps"
+
+    id: int | None = Field(default=None, primary_key=True)
+    run_id: int = Field(
+        foreign_key="agent_runs.id", index=True, ondelete="CASCADE"
+    )
+    # Order within the run. The recorder increments a per-run counter
+    # as steps are entered; this lets the UI render a stable timeline
+    # without depending on wall-clock ordering (which is what we want
+    # for LLM retries that fire concurrently).
+    seq: int = Field(index=True)
+    # Stable node id from agentPipelines.ts (e.g. "download", "parse",
+    # "summarize", "topics", "find_candidate_pairs", "compile_concept").
+    # Nullable so ad-hoc runs (e.g. one paper_chat) can leave it blank.
+    node_id: str | None = Field(default=None, max_length=64)
+    label: str = Field(max_length=200)
+    kind: str = Field(max_length=8)  # "step" | "llm"
+    # For LLM steps, the feature key (e.g. "summarize", "topics",
+    # "wiki_scholar"). Same as TokenUsage.feature.
+    feature: str | None = Field(default=None, max_length=64)
+    status: str = Field(
+        default=AgentStepStatus.running.value, max_length=16, index=True
+    )
+    # ``error`` is a short message (type + trimmed text); the full
+    # stacktrace is in the application log.
+    error: str | None = Field(default=None, sa_column=Column(Text))
+    # Compact IO snapshots. The recorder truncates long values to keep
+    # the table lightweight — these are for debugging, not for prompt
+    # archaeology.
+    input_summary: str | None = Field(default=None, sa_column=Column(Text))
+    output_summary: str | None = Field(default=None, sa_column=Column(Text))
+    # Arbitrary JSON for per-step detail that doesn't fit a column
+    # (e.g. counts, list of paper_ids acted on). Capped to ~32KB by the
+    # recorder.
+    detail: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    # When kind='llm' the recorder back-fills these from the TokenUsage
+    # callback so the step carries the same numbers as the Usage page.
+    model: str | None = Field(default=None, max_length=120)
+    prompt_tokens: int | None = Field(default=None)
+    completion_tokens: int | None = Field(default=None)
+    total_tokens: int | None = Field(default=None)
+    started_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    finished_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+    # How long the step ran, in milliseconds. Duplicated from
+    # finished_at - started_at for cheap "find slow steps" queries.
+    duration_ms: int | None = Field(default=None, index=True)
+
+    __table_args__ = (
+        Index("ix_agent_steps_run_seq", "run_id", "seq", unique=True),
+        Index("ix_agent_steps_kind_status", "kind", "status"),
     )
 
 

@@ -1,8 +1,6 @@
 import { useEffect, useState } from "react";
 import {
   Bot,
-  ChevronDown,
-  ChevronRight,
   Coins,
   FileText,
   RefreshCw,
@@ -10,6 +8,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import AgentFlows from "@/components/AgentFlows";
+import { PromptEditor } from "@/components/PromptEditor";
 import {
   getUsageByFeature,
   getUsagePrompts,
@@ -21,83 +20,16 @@ function fmt(n: number): string {
   return n.toLocaleString();
 }
 
-function PromptBlock({ text, label }: { text: string; label: string }) {
-  return (
-    <div className="space-y-1">
-      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <pre className="max-h-80 overflow-auto rounded-md border bg-muted/30 p-3 text-[11px] leading-relaxed text-foreground whitespace-pre-wrap break-words">
-        {text}
-      </pre>
-    </div>
-  );
-}
-
-function PromptCard({
-  prompt,
-  usage,
-}: {
-  prompt: UsagePrompt;
-  usage: UsageBucket | null;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="rounded-md border">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-start gap-2 px-3 py-2 text-left hover:bg-muted/50"
-        aria-expanded={open}
-      >
-        <div className="mt-0.5 text-muted-foreground">
-          {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-baseline gap-2">
-            <span className="text-sm font-medium">{prompt.label}</span>
-            <span
-              className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-              title="Token usage feature name"
-            >
-              {prompt.feature}
-            </span>
-            {usage && (
-              <span
-                className="ml-auto rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary tabular-nums"
-                title={`${usage.calls} LLM call(s) recorded in the last 30 days`}
-              >
-                {fmt(usage.total_tokens)} tok · {usage.calls} call{usage.calls === 1 ? "" : "s"}
-              </span>
-            )}
-          </div>
-          <div
-            className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground"
-            title={prompt.source}
-          >
-            {prompt.source}
-          </div>
-          {prompt.notes && (
-            <div className="mt-1 text-[11px] text-muted-foreground">{prompt.notes}</div>
-          )}
-        </div>
-      </button>
-      {open && (
-        <div className="space-y-3 border-t px-3 py-3">
-          <PromptBlock text={prompt.system} label="System prompt" />
-          <PromptBlock text={prompt.user_template} label="User prompt (template)" />
-        </div>
-      )}
-    </div>
-  );
-}
-
 function PromptsSection({
   prompts,
   loading,
   usageByKey,
+  onPromptChanged,
 }: {
   prompts: UsagePrompt[];
   loading: boolean;
   usageByKey: Map<string, UsageBucket>;
+  onPromptChanged: (next: UsagePrompt) => void;
 }) {
   if (loading && prompts.length === 0) {
     return <div className="text-xs text-muted-foreground">Loading prompts…</div>;
@@ -108,7 +40,13 @@ function PromptsSection({
   return (
     <div className="space-y-2">
       {prompts.map((p) => (
-        <PromptCard key={p.feature} prompt={p} usage={usageByKey.get(p.feature) ?? null} />
+        <PromptEditor
+          key={p.feature}
+          prompt={p}
+          usage={usageByKey.get(p.feature) ?? null}
+          fmt={fmt}
+          onChanged={onPromptChanged}
+        />
       ))}
     </div>
   );
@@ -261,6 +199,9 @@ export default function Agent() {
             prompts={prompts}
             loading={loading}
             usageByKey={usageByKey}
+            onPromptChanged={(next) =>
+              setPrompts((prev) => prev.map((p) => (p.feature === next.feature ? next : p)))
+            }
           />
         </CardContent>
       </Card>

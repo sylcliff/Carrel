@@ -31,9 +31,10 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, func, select
 
-from carrel import llm, usage
+from carrel import llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperTopic, Topic
+from carrel.pipeline._llm_recorder import make_record_usage_callback
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,18 @@ _SYSTEM_PROMPT = (
 )
 
 
+_USER_TEMPLATE = (
+    "Title: {title}\n"
+    "Authors: {authors}\n"
+    "Venue/date: {venue_date}\n"
+    "Source categories: {categories}\n"
+    "Keywords: {keywords}\n\n"
+    "Abstract:\n{abstract}\n\n"
+    "{existing_topics_block}\n\n"
+    "Return the JSON object now, with no commentary."
+)
+
+
 def _build_user_prompt(
     *,
     title: str,
@@ -88,24 +101,22 @@ def _build_user_prompt(
     categories: list[str],
     existing_topics: list[str],
 ) -> str:
-    parts = [f"Title: {title}", f"Authors: {authors or 'unknown'}"]
-    if venue_date:
-        parts.append(f"Venue/date: {venue_date}")
-    if categories:
-        parts.append(f"Source categories: {', '.join(categories)}")
-    if keywords:
-        parts.append(f"Keywords: {', '.join(keywords)}")
-    if abstract:
-        parts.append(f"Abstract:\n{abstract}")
     if existing_topics:
-        parts.append(
+        existing_block = (
             "Existing topic names (REUSE one verbatim if it fits):\n"
             + "\n".join(f"- {t}" for t in existing_topics)
         )
     else:
-        parts.append("There are no existing topics yet; choose canonical names.")
-    parts.append("\nReturn the JSON object now, with no commentary.")
-    return "\n\n".join(parts)
+        existing_block = "There are no existing topics yet; choose canonical names."
+    return prompts_runtime.get_user_template("topics", _USER_TEMPLATE).format(
+        title=title,
+        authors=authors or "unknown",
+        venue_date=venue_date or "unknown",
+        categories=", ".join(categories) if categories else "",
+        keywords=", ".join(keywords) if keywords else "",
+        abstract=abstract or "",
+        existing_topics_block=existing_block,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +315,7 @@ def topics_paper(
     categories = _extract_source_categories(paper)
     existing = _existing_topic_names(session)
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": prompts_runtime.get_system("topics", _SYSTEM_PROMPT)},
         {
             "role": "user",
             "content": _build_user_prompt(
@@ -328,8 +339,8 @@ def topics_paper(
             temperature=cfg.llm.temperature,
             timeout=cfg.llm.request_timeout_seconds,
             feature="topics",
-            on_usage=usage.make_usage_callback(
-                session, feature="topics", paper_id=paper.id,
+            on_usage=make_record_usage_callback(
+                session, paper_id=paper.id, feature="topics"
             ),
         )
     except llm.LLMError as e:

@@ -45,7 +45,8 @@ from typing import TYPE_CHECKING, Any
 
 from mcp.types import TextContent
 
-from carrel.mcp.errors import MCPUnavailable
+from carrel import llm
+from carrel.mcp.errors import MCPError, MCPUnavailable
 
 if TYPE_CHECKING:
     from carrel.mcp import MCPClientRegistry
@@ -236,3 +237,143 @@ def litellm_arguments(call: dict[str, Any]) -> dict[str, Any]:
         logger.warning("tool call %r has unparseable arguments: %r", fn.get("name"), raw[:200])
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# Shared agentic tool loop
+# ---------------------------------------------------------------------------
+
+
+async def run_agentic_loop(
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    fallback_model: str | None,
+    temperature: float,
+    timeout: int,
+    on_usage: Any,
+    tools: list[dict[str, Any]],
+    registry: "MCPClientRegistry",
+    builtin_handlers: dict[str, Callable[[dict[str, Any]], str]] | None,
+    max_iters: int,
+    on_iteration: Callable[[list[str], list[dict[str, Any]], int], None] | None = None,
+    on_tool_result: Callable[[str, dict[str, Any], str, bool, int], None] | None = None,
+    on_cap_hit: Callable[[str], None] | None = None,
+) -> str:
+    """Drive the model + tool + model loop until the model emits a final
+    text answer (no tool calls) or ``max_iters`` is hit.
+
+    Returns the final concatenated text. Tool calls are dispatched via
+    :func:`dispatch_tool_call` and their results appended to ``messages``
+    in-place so the next iteration has the same ``tool_calls`` array the
+    model saw.
+
+    Three optional callbacks let the caller surface per-iteration,
+    per-tool, and cap-hit progress (e.g. to a Job's stats or to a
+    WebSocket) without re-plumbing the loop. The chat endpoint uses
+    these to emit SSE ``tool_call``/``tool_result`` events and a
+    terminal error frame on the cap; the enrich endpoint uses them to
+    update ``Job.stats`` mid-run.
+
+    When ``tools`` is empty the function degenerates to a single
+    non-streaming call (every byte is accumulated into the return
+    value, no ``on_iteration`` fires).
+
+    ``on_cap_hit`` (if given) is called when ``max_iters`` is exhausted
+    without a final text answer; its argument is the last buffered
+    text (may be empty). It does NOT replace the function's return
+    value — the caller still gets the same string back. Use it to
+    surface a "cap hit" signal that a simple return value can't carry
+    (the return is the same whether the model answered cleanly or we
+    ran out of budget).
+    """
+    if not tools:
+        chunks: list[str] = []
+        for delta in llm.chat_stream(
+            messages,
+            model=model,
+            fallback_model=fallback_model,
+            temperature=temperature,
+            timeout=timeout,
+            feature="agentic",
+            on_usage=on_usage,
+        ):
+            if delta:
+                chunks.append(delta)
+        return "".join(chunks)
+
+    last_text = ""
+    for it in range(max_iters):
+        text_buf: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        for delta in llm.chat_stream(
+            messages,
+            model=model,
+            fallback_model=fallback_model,
+            temperature=temperature,
+            timeout=timeout,
+            feature="agentic",
+            on_usage=on_usage,
+            tools=tools,
+            on_tool_calls=lambda c: tool_calls.extend(c),
+        ):
+            if delta:
+                text_buf.append(delta)
+
+        if on_iteration is not None:
+            try:
+                on_iteration(text_buf, tool_calls, it)
+            except Exception:  # noqa: BLE001
+                logger.warning("on_iteration callback failed", exc_info=True)
+
+        if not tool_calls:
+            return "".join(text_buf)
+
+        # Persist the assistant turn verbatim so the next iteration has
+        # the same tool_calls array the model saw.
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "".join(text_buf) or None,
+                "tool_calls": tool_calls,
+            }
+        )
+
+        for call in tool_calls:
+            name = (call.get("function") or {}).get("name") or ""
+            args = litellm_arguments(call)
+            try:
+                result_str = await dispatch_tool_call(
+                    registry, name, args, builtins=builtin_handlers
+                )
+                is_error = result_str.startswith("[tool error]")
+            except MCPUnavailable as e:
+                result_str, is_error = f"[unavailable] {e}", True
+            except MCPError as e:
+                result_str, is_error = f"[error] {e}", True
+            except ValueError as e:
+                result_str, is_error = f"[tool error] {e}", True
+
+            if on_tool_result is not None:
+                try:
+                    on_tool_result(name, args, result_str, is_error, it)
+                except Exception:  # noqa: BLE001
+                    logger.warning("on_tool_result callback failed", exc_info=True)
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id") or "",
+                    "content": result_str,
+                }
+            )
+        last_text = "".join(text_buf)
+
+    # Cap hit without a final answer — return whatever the last buffer
+    # held so callers can decide whether to mark the job failed.
+    if on_cap_hit is not None:
+        try:
+            on_cap_hit(last_text)
+        except Exception:  # noqa: BLE001
+            logger.warning("on_cap_hit callback failed", exc_info=True)
+    return last_text

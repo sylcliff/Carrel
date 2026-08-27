@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from carrel import embeddings as emb
-from carrel import llm, usage
+from carrel import llm, prompts_runtime, usage
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
 from carrel.mcp import (
@@ -51,7 +51,16 @@ from carrel.mcp import (
     get_mcp,
     litellm_arguments,
 )
+from carrel.mcp.tools import run_agentic_loop
 from carrel.models import WikiChatMessage, WikiPage
+from carrel.pipeline._llm_recorder import make_record_usage_callback
+from carrel.agent_recorder import (
+    AgentRecorder,
+    agent_step,
+    clear_current_recorder,
+    pipeline_display_name,
+    set_current_recorder,
+)
 from carrel.schemas import (
     ChatMessageOut,
     WikiChatMessagesIn,
@@ -235,21 +244,30 @@ def _build_context_block(pages: list[WikiPage], char_cap: int) -> str:
 
 
 def _build_messages(
-    context_block: str, history: list[ChatTurn], history_limit: int
+    context_block: str,
+    history: list[ChatTurn],
+    history_limit: int,
+    *,
+    session: Session | None = None,
 ) -> list[dict[str, str]]:
-    context_msg = (
-        f"<wiki-context>\n{context_block}\n</wiki-context>\n\n"
-        f"依据以上 wiki 页面回答用户的问题。"
-    )
+    context_msg = prompts_runtime.get_user_template(
+        "wiki_chat", _USER_TEMPLATE, session=session
+    ).format(context_block=context_block)
     # Keep the most recent turns; drop any system turns from the client.
     trimmed = [t for t in history if t.role != "system"][-history_limit:]
     msgs: list[dict[str, str]] = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": prompts_runtime.get_system("wiki_chat", _SYSTEM_PROMPT, session=session)},
         {"role": "user", "content": context_msg},
     ]
     for t in trimmed:
         msgs.append({"role": t.role, "content": t.content})
     return msgs
+
+
+_USER_TEMPLATE = (
+    "<wiki-context>\n{context_block}\n</wiki-context>\n\n"
+    "依据以上 wiki 页面回答用户的问题。"
+)
 
 
 def _chat_model() -> str:
@@ -297,16 +315,16 @@ async def _run_tool_loop(
 ) -> AsyncIterator[bytes]:
     """Run the model + tool + model loop, yielding SSE-ready bytes.
 
-    When ``tools`` is empty this is just a single streaming call that
-    yields text deltas as they arrive. When ``tools`` is non-empty we
-    buffer the text per iteration: the user never sees "thinking"
-    preambles — they only see the final text answer. Tool calls and
-    their results are surfaced as ``tool_call`` / ``tool_result`` events
-    so the UI can show what the agent did.
+    Thin wrapper around :func:`carrel.mcp.tools.run_agentic_loop`. The
+    shared helper owns the message bookkeeping; this function only
+    translates per-iteration deltas and per-tool results into the SSE
+    frames the front-end expects (``{"t": ...}`` for text, ``{"type":
+    "tool_call", ...}`` / ``{"type": "tool_result", ...}`` for tools,
+    ``{"error": ...}`` on LLM-stream failure or on the cap hit).
 
-    The loop is bounded by ``max_iters``; on the cap we emit a single
-    error frame and stop (no [DONE], so the client sees a broken stream
-    — the same shape as any other LLM failure).
+    When ``tools`` is empty we stream the response directly so the
+    front-end sees text deltas as they arrive (the shared helper
+    accumulates them internally for the no-tools code path).
     """
     if not tools:
         try:
@@ -323,86 +341,65 @@ async def _run_tool_loop(
         except Exception as e:  # noqa: BLE001
             logger.warning("wiki chat stream failed: %s", e)
             yield _event({"error": str(e)})
-            return
         return
 
-    for _iteration in range(max_iters):
-        text_buf: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
+    cap_hit = False
 
-        try:
-            for delta in llm.chat_stream(
-                messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=temperature,
-                timeout=timeout,
-                feature="wiki_chat",
-                on_usage=on_usage,
-                tools=tools,
-                on_tool_calls=lambda calls: tool_calls.extend(calls),
-            ):
-                if delta:
-                    text_buf.append(delta)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("wiki chat stream failed: %s", e)
-            yield _event({"error": str(e)})
-            return
-
+    def _on_iter(text_buf: list[str], tool_calls: list[dict[str, Any]], _it: int) -> None:
+        # When the model produced a final answer (no tool calls) we
+        # flush the text now. When it produced tool calls we stay
+        # silent — the agent hasn't finished yet, and the buffered text
+        # (any preamble) is persisted into messages[] for the next
+        # iteration.
         if not tool_calls:
-            # The model produced a final text answer — flush it.
             for d in text_buf:
-                yield _event({"t": d})
-            return
+                pending.append(_event({"t": d}))
 
-        # Persist the assistant turn (with the tool_calls array) into
-        # the message list so the next iteration has it as context.
-        assistant_content = "".join(text_buf) or None
-        messages.append({
-            "role": "assistant",
-            "content": assistant_content,
-            "tool_calls": tool_calls,
-        })
+    def _on_tool(
+        name: str,
+        args: dict[str, Any],
+        result_str: str,
+        is_error: bool,
+        _it: int,
+    ) -> None:
+        pending.append(_event({"type": "tool_call", "name": name, "args": args}))
+        pending.append(_event({
+            "type": "tool_result",
+            "name": name,
+            "content": result_str,
+            "is_error": is_error,
+        }))
 
-        for call in tool_calls:
-            name = (call.get("function") or {}).get("name") or ""
-            args = litellm_arguments(call)
-            yield _event({"type": "tool_call", "name": name, "args": args})
-            try:
-                result_str = await dispatch_tool_call(
-                    registry, name, args, builtins=builtin_handlers,
-                )
-                # The dispatcher prefixes upstream ``isError: True`` results
-                # (and in-process builtin handler errors) with ``[tool error]``
-                # rather than raising — the model is expected to see the
-                # message and degrade gracefully. The wire-format ``is_error``
-                # flag is the UI's signal to render the bubble as an error,
-                # so it MUST agree with that prefix.
-                is_error = result_str.startswith("[tool error]")
-            except MCPUnavailable as e:
-                logger.warning("wiki chat: MCP unavailable for %s: %s", name, e)
-                result_str = f"[unavailable] {e}"
-                is_error = True
-            except MCPError as e:
-                logger.warning("wiki chat: MCP error for %s: %s", name, e)
-                result_str = f"[error] {e}"
-                is_error = True
-            yield _event({
-                "type": "tool_result",
-                "name": name,
-                "content": result_str,
-                "is_error": is_error,
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": call.get("id") or "",
-                "content": result_str,
-            })
+    pending: list[bytes] = []
 
-    # Cap hit without a final text answer.
-    yield _event({
-        "error": f"wiki chat tool loop exceeded max iterations ({max_iters})",
-    })
+    def _on_cap(_text: str) -> None:
+        nonlocal cap_hit
+        cap_hit = True
+
+    try:
+        await run_agentic_loop(
+            messages,
+            model=model,
+            fallback_model=fallback,
+            temperature=temperature,
+            timeout=timeout,
+            on_usage=on_usage,
+            tools=tools,
+            registry=registry,
+            builtin_handlers=builtin_handlers,
+            max_iters=max_iters,
+            on_iteration=_on_iter,
+            on_tool_result=_on_tool,
+            on_cap_hit=_on_cap,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("wiki chat stream failed: %s", e)
+        pending.append(_event({"error": str(e)}))
+
+    for frame in pending:
+        yield frame
+    if cap_hit:
+        yield _event({"error": f"wiki chat tool loop exceeded max iterations ({max_iters})"})
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +436,7 @@ async def wiki_chat(
     char_cap = app_config.llm.wiki_chat_fulltext_chars
     history_limit = app_config.llm.chat_history_limit
     context_block = _build_context_block(pages, char_cap)
-    messages = _build_messages(context_block, req.messages, history_limit)
+    messages = _build_messages(context_block, req.messages, history_limit, session=session)
 
     model = _chat_model()
     fallback = _chat_fallback()
@@ -456,25 +453,66 @@ async def wiki_chat(
     registry = get_mcp()
     builtin_handlers = builtin_dispatch_map()
     tools = collect_tools(registry, builtins=collect_builtin_tools())
-    on_usage = usage.make_usage_callback(session, feature="wiki_chat")
+    on_usage = make_record_usage_callback(session, paper_id="", feature="wiki_chat")
+
+    # Bind a recorder for this turn. We capture the wiki-page retrieval as
+    # a step, then the agentic tool loop as a single LLM step (each inner
+    # model call is a token-usage event, not a separate step — the loop
+    # is one logical "agent run" from the user's perspective).
+    rec = AgentRecorder(
+        session,
+        pipeline_id="wiki_chat",
+        pipeline_name=pipeline_display_name("wiki_chat"),
+    )
+    rec.start(
+        context={"query": query[:200]},
+        subject=query[:200] or None,
+    )
 
     async def generate():
         # Sources frame first so the UI can render provenance before tokens.
         yield _event({"sources": sources})
-        async for frame in _run_tool_loop(
-            messages,
-            model=model,
-            fallback=fallback,
-            temperature=temperature,
-            timeout=timeout,
-            on_usage=on_usage,
-            tools=tools,
-            registry=registry,
-            builtin_handlers=builtin_handlers,
-            max_iters=max_iters,
-        ):
-            yield frame
+        # Bind the recorder for the duration of this async generator.
+        # ContextVar tokens are per-async-context so we set + reset here
+        # rather than in the outer sync handler.
+        rec_token = set_current_recorder(rec)
+        try:
+            with agent_step(
+                "llm",
+                label="Wiki LLM agent (tool loop)",
+                kind="llm",
+                feature="wiki_chat",
+            ):
+                try:
+                    async for frame in _run_tool_loop(
+                        messages,
+                        model=model,
+                        fallback=fallback,
+                        temperature=temperature,
+                        timeout=timeout,
+                        on_usage=on_usage,
+                        tools=tools,
+                        registry=registry,
+                        builtin_handlers=builtin_handlers,
+                        max_iters=max_iters,
+                    ):
+                        yield frame
+                except Exception as e:  # noqa: BLE001 - surface on the stream
+                    logger.warning("wiki chat tool loop failed: %s", e)
+                    yield _event({"error": str(e)})
+                    rec.finish(status="failed", error=f"{type(e).__name__}: {e}")
+                    return
+        finally:
+            try:
+                clear_current_recorder(rec_token)
+            except ValueError:
+                # Token was created in a different context (shouldn't
+                # happen now that we set it inside the generator, but
+                # be defensive — we don't want to crash the stream on
+                # cleanup).
+                pass
         yield _sse(_DONE)
+        rec.finish(summary={"sources": len(sources)})
 
     from fastapi.responses import StreamingResponse
 

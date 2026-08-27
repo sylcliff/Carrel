@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, RefreshCw } from "lucide-react";
+import { ArrowLeft, Globe, RefreshCw } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import MarkdownReader from "@/components/MarkdownReader";
 import { PaperList } from "@/components/PaperList";
 import {
+  enrichScholarPage,
   getScholar,
   getScholarWorks,
   getJob,
@@ -62,6 +63,7 @@ export default function ScholarDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [wikiJob, setWikiJob] = useState<Job | null>(null);
+  const [enrichJob, setEnrichJob] = useState<Job | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -95,6 +97,31 @@ export default function ScholarDetailPage() {
             window.clearInterval(timer);
             if (next.status === "done") setData(await getScholar(key));
             else setError(next.message || "Profile recompile failed.");
+          }
+        } catch (e) {
+          window.clearInterval(timer);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }, 1500);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function enrichProfile() {
+    if (!data?.wiki_page) return;
+    setError(null);
+    try {
+      const first = await enrichScholarPage(data.wiki_page.id);
+      setEnrichJob(first);
+      const timer = window.setInterval(async () => {
+        try {
+          const next = await getJob(first.id);
+          setEnrichJob(next);
+          if (next.status === "done" || next.status === "failed") {
+            window.clearInterval(timer);
+            if (next.status === "done") setData(await getScholar(key));
+            else setError(next.message || "Research failed.");
           }
         } catch (e) {
           window.clearInterval(timer);
@@ -202,9 +229,28 @@ export default function ScholarDetailPage() {
         <section className="space-y-3">
           <div className="flex items-center justify-between gap-4">
             <div><h2 className="text-lg font-semibold">Research profile</h2><p className="text-xs text-muted-foreground">{Math.round(data.wiki_page.confidence * 100)}% confidence · {data.wiki_page.evidence_count} evidence</p></div>
-            <Button variant="outline" size="sm" onClick={recompileProfile} disabled={!!wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed"}><RefreshCw className={`mr-2 h-3.5 w-3.5 ${wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed" ? "animate-spin" : ""}`} /> Recompile profile</Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="default"
+                size="sm"
+                onClick={enrichProfile}
+                disabled={!!enrichJob && enrichJob.status !== "done" && enrichJob.status !== "failed"}
+                title="Run an LLM agent that searches the web and appends a 'Web research' note to this page's user section."
+              >
+                <Globe className={`mr-2 h-3.5 w-3.5 ${enrichJob && enrichJob.status !== "done" && enrichJob.status !== "failed" ? "animate-spin" : ""}`} /> Research &amp; enrich
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={recompileProfile}
+                disabled={!!wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed"}
+              >
+                <RefreshCw className={`mr-2 h-3.5 w-3.5 ${wikiJob && wikiJob.status !== "done" && wikiJob.status !== "failed" ? "animate-spin" : ""}`} /> Recompile profile
+              </Button>
+            </div>
           </div>
-          {wikiJob && <p className="text-xs text-muted-foreground">{wikiJob.status}{wikiJob.message ? ` · ${wikiJob.message}` : ""}</p>}
+          {wikiJob && <p className="text-xs text-muted-foreground">Recompile · {wikiJob.status}{wikiJob.message ? ` · ${wikiJob.message}` : ""}</p>}
+          {enrichJob && <p className="text-xs text-muted-foreground">Enrich · {enrichJob.status}{enrichJob.message ? ` · ${enrichJob.message}` : ""}</p>}
           <Card><CardContent className="p-5"><MarkdownReader body={data.wiki_page.body} mdPath={data.wiki_page.path} internal /></CardContent></Card>
         </section>
       )}

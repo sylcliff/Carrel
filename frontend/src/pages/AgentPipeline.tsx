@@ -2,8 +2,6 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   ArrowLeft,
-  ChevronDown,
-  ChevronRight,
   Coins,
   FileText,
   Network,
@@ -18,6 +16,8 @@ import {
   type FlowNode,
   type Pipeline,
 } from "@/lib/agentPipelines";
+import { PromptEditor } from "@/components/PromptEditor";
+import AgentRuns from "@/components/AgentRuns";
 import {
   getUsageByFeature,
   getUsagePrompts,
@@ -100,67 +100,19 @@ function StepNode({ node, isLast }: { node: FlowNode; isLast: boolean }) {
 function PromptInline({
   prompt,
   usage,
+  onChanged,
 }: {
   prompt: UsagePrompt;
   usage: UsageBucket | null;
+  onChanged: (next: UsagePrompt) => void;
 }) {
-  const [open, setOpen] = useState(false);
   return (
-    <div className="rounded-md border">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-start gap-2 px-3 py-2 text-left hover:bg-muted/50"
-        aria-expanded={open}
-      >
-        <div className="mt-0.5 text-muted-foreground">
-          {open ? (
-            <ChevronDown className="h-3.5 w-3.5" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5" />
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-baseline gap-2">
-            <span className="text-sm font-medium">{prompt.label}</span>
-            <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-              {prompt.feature}
-            </span>
-            {usage && (
-              <span className="ml-auto rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary tabular-nums">
-                {fmt(usage.total_tokens)} tok · {usage.calls} call
-                {usage.calls === 1 ? "" : "s"}
-              </span>
-            )}
-          </div>
-          {prompt.notes && (
-            <div className="mt-1 text-[11px] text-muted-foreground">
-              {prompt.notes}
-            </div>
-          )}
-        </div>
-      </button>
-      {open && (
-        <div className="space-y-3 border-t px-3 py-3">
-          <div className="space-y-1">
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              System prompt
-            </div>
-            <pre className="max-h-80 overflow-auto rounded-md border bg-muted/30 p-3 text-[11px] leading-relaxed whitespace-pre-wrap break-words">
-              {prompt.system}
-            </pre>
-          </div>
-          <div className="space-y-1">
-            <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              User prompt (template)
-            </div>
-            <pre className="max-h-60 overflow-auto rounded-md border bg-muted/30 p-3 text-[11px] leading-relaxed whitespace-pre-wrap break-words">
-              {prompt.user_template}
-            </pre>
-          </div>
-        </div>
-      )}
-    </div>
+    <PromptEditor
+      prompt={prompt}
+      usage={usage}
+      fmt={fmt}
+      onChanged={onChanged}
+    />
   );
 }
 
@@ -389,6 +341,8 @@ export default function AgentPipeline() {
             </CardContent>
           </Card>
 
+          <AgentRuns pipelineId={pipeline.id} />
+
           {pipeline.jobKinds.length > 0 && (
             <Card>
               <CardHeader className="pb-2">
@@ -514,6 +468,11 @@ export default function AgentPipeline() {
                       key={p.feature}
                       prompt={p}
                       usage={usageByKey.get(p.feature) ?? null}
+                      onChanged={(next) =>
+                        setPrompts((prev) =>
+                          prev.map((q) => (q.feature === next.feature ? next : q)),
+                        )
+                      }
                     />
                   ))}
                 </div>
