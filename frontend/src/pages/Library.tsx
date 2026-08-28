@@ -9,12 +9,15 @@ import PaperDedupPanel from "@/components/PaperDedupPanel";
 import {
   deletePaper,
   listPapersPaged,
+  listPapersPagedCached,
   listTags,
   type PaperSummary,
   type TagWithCount,
 } from "@/api/client";
 import { useDebouncedCallback } from "@/lib/useDebouncedCallback";
 import { topicColorClass } from "@/lib/topicColor";
+import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
+import { queryKeys, type PaperFilters } from "@/lib/queryKeys";
 
 type SortKey =
   | "added"
@@ -29,13 +32,10 @@ type SortKey =
 const PAGE_SIZE = 100;
 
 export default function Library() {
-  const [papers, setPapers] = useState<PaperSummary[]>([]);
+  const [appended, setAppended] = useState<PaperSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [allTags, setAllTags] = useState<TagWithCount[]>([]);
-  const [err, setErr] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Filter state
@@ -71,19 +71,22 @@ export default function Library() {
     setDebouncedQ(value);
   }, 350);
 
-  useEffect(() => {
-    listTags()
-      .then(setAllTags)
-      .catch(() => setAllTags([]));
-  }, []);
+  // Tag dropdown contents. Tag mutations happen on PaperDetail and the
+  // global list is read-only here, so staleTime: Infinity is correct —
+  // the only writes (add/remove on a paper) invalidate [tags] explicitly.
+  const tagsQuery = useApiQueryWithFn<TagWithCount[]>({
+    key: queryKeys.tags(),
+    queryFn: () => listTags(),
+    staleTime: Infinity,
+  });
+  const allTags = tagsQuery.data ?? [];
 
-  // Reset and load the first page whenever filters/sort change. We deliberately
-  // do NOT include `papers.length` here — the Load-More button owns the
-  // append-only path so the filter reset stays a hard reset.
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    listPapersPaged({
+  // Page 1 — the canonical, React-Query-owned view. Filters are part of
+  // the key, so debounced search / sort / topic / tag changes refetch
+  // automatically and the previous result stays painted until the new one
+  // arrives (no flash of "Loading…").
+  const filters: PaperFilters = useMemo(
+    () => ({
       limit: PAGE_SIZE,
       offset: 0,
       favorite: favOnly || undefined,
@@ -91,23 +94,63 @@ export default function Library() {
       tag: selectedTags.length ? selectedTags : undefined,
       topic: selectedTopics.length ? selectedTopics : undefined,
       sort,
-    })
-      .then(({ items, total }) => {
-        if (!cancelled) {
-          setPapers(items);
-          setTotal(total);
-        }
-      })
-      .catch((e) => {
-        if (!cancelled) setErr(String(e));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [debouncedQ, favOnly, selectedTags, selectedTopics, sort]);
+    }),
+    [debouncedQ, favOnly, selectedTags, selectedTopics, sort],
+  );
+
+  const pageOne = useApiQueryWithFn<{ items: PaperSummary[]; total: number }>({
+    key: queryKeys.papersList(filters),
+    queryFn: async () => {
+      const { items, total: t } = await listPapersPagedCached(filters);
+      setTotal(t);
+      // Filter changes reset the appended list; page-1 is fully owned by
+      // the query, so the local buffer is for Load-More pages only.
+      setAppended([]);
+      return { items, total: t };
+    },
+  });
+
+  // Whenever the filters key changes, drop the appended buffer so Load
+  // More can't carry old rows into a new filter context.
+  useEffect(() => {
+    setAppended([]);
+  }, [filters]);
+
+  const papers = useMemo<PaperSummary[]>(
+    () => [...(pageOne.data?.items ?? []), ...appended],
+    [pageOne.data, appended],
+  );
+
+  const deleteMutation = useApiMutation<
+    { paper: PaperSummary },
+    { id: string; deleted: boolean; removed_files: boolean }
+  >({
+    mutate: ({ paper }) => deletePaper(paper.id),
+    invalidate: [queryKeys.papersRoot()],
+    onOptimistic: ({ paper }, qc) => {
+      // Optimistic removal from both page-1 and the appended buffer.
+      qc.setQueryData<{ items: PaperSummary[]; total: number }>(
+        queryKeys.papersList(filters),
+        (prev) =>
+          prev
+            ? {
+                ...prev,
+                items: prev.items.filter((p) => p.id !== paper.id),
+                total: Math.max(0, prev.total - 1),
+              }
+            : prev,
+      );
+      setAppended((prev) => prev.filter((p) => p.id !== paper.id));
+      setTotal((t) => Math.max(0, t - 1));
+    },
+  });
+
+  const loading = pageOne.isLoading;
+  const err = pageOne.error
+    ? String(pageOne.error)
+    : deleteMutation.error
+      ? `Failed to delete: ${String(deleteMutation.error)}`
+      : null;
 
   function toggleTag(name: string, on: boolean) {
     setSelectedTags((prev) =>
@@ -125,13 +168,8 @@ export default function Library() {
     );
     if (!confirmed) return;
     setDeletingId(p.id);
-    setErr(null);
     try {
-      await deletePaper(p.id);
-      setPapers((prev) => prev.filter((x) => x.id !== p.id));
-      setTotal((t) => Math.max(0, t - 1));
-    } catch (e) {
-      setErr(`Failed to delete ${p.id}: ${String(e)}`);
+      await deleteMutation.mutateAsync({ paper: p });
     } finally {
       setDeletingId(null);
     }
@@ -142,9 +180,8 @@ export default function Library() {
     const nextOffset = papers.length;
     if (nextOffset >= total) return;
     setLoadingMore(true);
-    setErr(null);
     try {
-      const { items, total: newTotal } = await listPapersPaged({
+      const { items } = await listPapersPaged({
         limit: PAGE_SIZE,
         offset: nextOffset,
         favorite: favOnly || undefined,
@@ -153,10 +190,7 @@ export default function Library() {
         topic: selectedTopics.length ? selectedTopics : undefined,
         sort,
       });
-      setPapers((prev) => [...prev, ...items]);
-      setTotal(newTotal);
-    } catch (e) {
-      setErr(String(e));
+      setAppended((prev) => [...prev, ...items]);
     } finally {
       setLoadingMore(false);
     }

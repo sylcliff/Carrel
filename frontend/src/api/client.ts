@@ -6,6 +6,39 @@ export class APIError extends Error {
   }
 }
 
+// ---- Layer 3 (React Query) ETag cache -------------------------------------
+//
+// Carrel's backend issues ETag + Cache-Control on every read endpoint and
+// short-circuits with 304 Not Modified when the client's If-None-Match
+// matches. We track per-URL ETags and the most recent body in two
+// module-scoped Maps; on 304 we resolve with the cached body without
+// touching JSON. This is the "ETag client" promised by the 3-layer cache
+// plan — it makes the browser round-trip free for unchanged resources.
+//
+// Note: these are intentionally module-scope (not React state). React Query
+// holds the *parsed* value as the source of truth; this map is just a
+// fast path for the wire protocol. Module scope means HMR can leak entries
+// across reloads in dev — that's fine, the keys are content-addressed by
+// URL and the body cache falls out of sync with the server on its own.
+
+const etagRegistry = new Map<string, string>();
+const bodyCache = new Map<string, unknown>();
+
+// For tests that need to reset the in-process L3 cache (e.g. after a
+// deliberate 200 that should have been a 304). Not exported on the
+// public API — callers should not normally clear it.
+export function __resetL3CacheForTests(): void {
+  etagRegistry.clear();
+  bodyCache.clear();
+}
+
+function cacheKey(path: string): string {
+  // The query string is part of the resource identity; two `?` only differ
+  // in limit/offset must hash to different ETag keys. We use the path+qs
+  // verbatim — duplicates collapse, which is what we want.
+  return `${API_BASE}${path}`;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -35,6 +68,101 @@ async function requestWithHeaders<T>(
   }
   if (res.status === 204) return { data: undefined as T, headers: res.headers };
   return { data: (await res.json()) as T, headers: res.headers };
+}
+
+// ETag-aware sibling of request(). On 304 we short-circuit with the
+// previously-parsed body; on 200 we refresh both registries. 304s that
+// arrive with no prior body (cold start) are surfaced as an error — the
+// server's ETag is meaningless if we have nothing to compare to.
+export async function requestCached<T>(path: string, init?: RequestInit): Promise<T> {
+  const key = cacheKey(path);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  const etag = etagRegistry.get(key);
+  if (etag !== undefined) headers["If-None-Match"] = etag;
+
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+
+  if (res.status === 304) {
+    const cached = bodyCache.get(key) as T | undefined;
+    if (cached === undefined) {
+      // Server claims nothing changed but we have no body — treat as a
+      // hard miss so the next call refreshes the registries.
+      throw new APIError(500, "304 without prior body in client cache");
+    }
+    return cached;
+  }
+
+  if (!res.ok) {
+    // Drop any stale body so a successful refresh starts from a clean slate.
+    bodyCache.delete(key);
+    etagRegistry.delete(key);
+    const text = await res.text().catch(() => res.statusText);
+    throw new APIError(res.status, text || res.statusText);
+  }
+  if (res.status === 204) {
+    bodyCache.set(key, undefined as unknown as T);
+    etagRegistry.delete(key);
+    return undefined as T;
+  }
+
+  const body = (await res.json()) as T;
+  bodyCache.set(key, body);
+  const newEtag = res.headers.get("etag");
+  if (newEtag !== null) etagRegistry.set(key, newEtag);
+  else etagRegistry.delete(key);
+  return body;
+}
+
+// ETag-aware variant of requestWithHeaders. Keeps a parallel
+// headersCache so a 304 can still surface X-Total-Count. 304 with no
+// prior entry is surfaced as an error (the same way requestCached handles
+// it) so React Query re-fetches the headers the next round.
+const headersCache = new Map<string, Headers>();
+
+async function requestWithHeadersCached<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; headers: Headers }> {
+  const key = cacheKey(path);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  const etag = etagRegistry.get(key);
+  if (etag !== undefined) headers["If-None-Match"] = etag;
+
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+
+  if (res.status === 304) {
+    const cachedBody = bodyCache.get(key) as T | undefined;
+    const cachedHeaders = headersCache.get(key);
+    if (cachedBody === undefined || cachedHeaders === undefined) {
+      throw new APIError(500, "304 without prior body/headers in client cache");
+    }
+    return { data: cachedBody, headers: cachedHeaders };
+  }
+
+  if (!res.ok) {
+    bodyCache.delete(key);
+    etagRegistry.delete(key);
+    headersCache.delete(key);
+    const text = await res.text().catch(() => res.statusText);
+    throw new APIError(res.status, text || res.statusText);
+  }
+  if (res.status === 204) {
+    return { data: undefined as T, headers: res.headers };
+  }
+
+  const body = (await res.json()) as T;
+  bodyCache.set(key, body);
+  const newEtag = res.headers.get("etag");
+  if (newEtag !== null) etagRegistry.set(key, newEtag);
+  else etagRegistry.delete(key);
+  headersCache.set(key, res.headers);
+  return { data: body, headers: res.headers };
 }
 
 // ---- Health ----
@@ -380,6 +508,42 @@ export const listPapersPaged = (params?: {
   if (params?.topic) for (const t of params.topic) q.append("topic", t);
   const qs = q.toString();
   return requestWithHeaders<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`).then(
+    ({ data, headers }) => {
+      const headerVal = headers.get("X-Total-Count");
+      const total = headerVal ? Number(headerVal) : data.length;
+      return { items: data, total: Number.isFinite(total) ? total : data.length };
+    },
+  );
+};
+
+// ETag-aware variant for the React-Query-migrated Library page. 304s
+// short-circuit through requestWithHeadersCached; a fresh 200 refreshes
+// both the body and the header registries.
+export const listPapersPagedCached = (params?: {
+  limit?: number;
+  offset?: number;
+  status?: string;
+  venue?: string;
+  in_library?: boolean;
+  favorite?: boolean;
+  tag?: string[];
+  topic?: string[];
+  q?: string;
+  sort?: string;
+}): Promise<{ items: PaperSummary[]; total: number }> => {
+  const q = new URLSearchParams();
+  if (params?.limit) q.set("limit", String(params.limit));
+  if (params?.offset) q.set("offset", String(params.offset));
+  if (params?.status) q.set("status", params.status);
+  if (params?.venue) q.set("venue", params.venue);
+  if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
+  if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
+  if (params?.q) q.set("q", params.q);
+  if (params?.sort) q.set("sort", params.sort);
+  if (params?.tag) for (const t of params.tag) q.append("tag", t);
+  if (params?.topic) for (const t of params.topic) q.append("topic", t);
+  const qs = q.toString();
+  return requestWithHeadersCached<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`).then(
     ({ data, headers }) => {
       const headerVal = headers.get("X-Total-Count");
       const total = headerVal ? Number(headerVal) : data.length;
@@ -854,7 +1018,7 @@ export const backfillAuthors = (
     body: JSON.stringify({
       paper_id: opts.paperId,
       limit: opts.limit ?? 100,
-      background: opts.background ?? false,
+      background: opts.background ?? true,
     }),
   });
 
@@ -1025,7 +1189,7 @@ export const classifyTopics = (
     body: JSON.stringify({
       paper_id: opts.paperId,
       limit: opts.limit ?? 20,
-      background: opts.background ?? false,
+      background: opts.background ?? true,
       force: opts.force ?? false,
     }),
   });

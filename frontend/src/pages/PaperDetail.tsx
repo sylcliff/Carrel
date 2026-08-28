@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useParams, Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -8,11 +8,9 @@ import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
 import { topicColorClass } from "@/lib/topicColor";
-
-// Chat pulls in assistant-ui + markdown plugins; load it only on the article page.
-const PaperChat = lazy(() =>
-  import("@/components/PaperChat").then((m) => ({ default: m.PaperChat })),
-);
+import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
+import { queryKeys } from "@/lib/queryKeys";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   addPaperTag,
   checkPublication,
@@ -31,10 +29,11 @@ import {
   type Tag,
 } from "@/api/client";
 
-type Props = {
-  onProcessed?: () => void;
-};
+const PaperChat = lazy(() =>
+  import("@/components/PaperChat").then((m) => ({ default: m.PaperChat })),
+);
 
+type Props = { onProcessed?: () => void };
 const TERMINAL = new Set(["done", "failed"]);
 
 function elapsed(startedAt: string | null, now: number): string {
@@ -48,56 +47,131 @@ function elapsed(startedAt: string | null, now: number): string {
 
 export default function PaperDetail({ onProcessed }: Props) {
   const { id } = useParams<{ id: string }>();
-  const [p, setP] = useState<PaperDetailT | null>(null);
-  const [md, setMd] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  // Local UI state (not server state) — stays in useState.
   const [processing, setProcessing] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [pdfOpen, setPdfOpen] = useState(false);
   const [textOpen, setTextOpen] = useState(true);
   const [now, setNow] = useState(() => Date.now());
-  const [favorite, setFavorite] = useState(false);
-  const [tags, setTags] = useState<Tag[]>([]);
-  const [tagInput, setTagInput] = useState("");
-  const [favBusy, setFavBusy] = useState(false);
-  const [remoteEnabled, setRemoteEnabled] = useState(false);
   const [pdfVariant, setPdfVariant] = useState<"journal" | "arxiv">("journal");
+  const [remoteEnabled, setRemoteEnabled] = useState(false);
+  const [tagInput, setTagInput] = useState("");
   const timer = useRef<number | null>(null);
 
-  // Probe whether the institutional SSH download server is configured (once).
+  // --- React Query: per-paper data (canonical) ----------------------------
+  // invalidateQueries(["paper", id]) cascades to every nested variant.
+  const paperQuery = useApiQueryWithFn<PaperDetailT>({
+    key: id ? queryKeys.paper(id) : ["paper", "_missing_"],
+    queryFn: () => getPaper(id!),
+    enabled: Boolean(id),
+  });
+  const p = paperQuery.data ?? null;
+
+  const markdownQuery = useApiQueryWithFn<{
+    id: string;
+    body: string | null;
+    md_path: string | null;
+  }>({
+    key: id ? queryKeys.paperMarkdown(id) : ["paper", "_missing_", "markdown"],
+    queryFn: () => getPaperMarkdown(id!),
+    staleTime: Infinity,
+    enabled: Boolean(id) && Boolean(p?.md_path),
+  });
+  const md = markdownQuery.data?.body ?? null;
+
+  const tagsQuery = useApiQueryWithFn<Tag[]>({
+    key: id ? queryKeys.paperTags(id) : ["paper", "_missing_", "tags"],
+    queryFn: () => listPaperTags(id!).catch(() => [] as Tag[]),
+    enabled: Boolean(id),
+  });
+  const tags = tagsQuery.data ?? [];
+
+  // --- Optimistic mutations ------------------------------------------------
+
+  const favoriteMutation = useApiMutation<
+    { next: boolean },
+    { id: string; favorite: boolean }
+  >({
+    mutate: ({ next }) => toggleFavorite(id!, next),
+    invalidate: [queryKeys.papersRoot()],
+    onOptimistic: ({ next }, qc) => {
+      if (!id) return;
+      qc.setQueryData<PaperDetailT>(queryKeys.paper(id), (prev) =>
+        prev ? { ...prev, favorite: next } : prev,
+      );
+    },
+    onRollback: (_input, _error, qc) => {
+      if (!id) return;
+      qc.setQueryData<PaperDetailT>(queryKeys.paper(id), (prev) => {
+        if (!prev) return prev;
+        return { ...prev, favorite: !prev.favorite };
+      });
+    },
+  });
+
+  const addTagMutation = useApiMutation<{ raw: string; provisional: Tag }, Tag>({
+    mutate: ({ raw }) => addPaperTag(id!, raw),
+    invalidate: [queryKeys.tags()],
+    onOptimistic: ({ provisional }, qc) => {
+      if (!id) return;
+      qc.setQueryData<Tag[]>(queryKeys.paperTags(id), (prev) =>
+        prev ? [...prev, provisional] : [provisional],
+      );
+    },
+    onRollback: ({ provisional }, _error, qc) => {
+      if (!id) return;
+      qc.setQueryData<Tag[]>(queryKeys.paperTags(id), (prev) =>
+        prev ? prev.filter((t) => t.id !== provisional.id) : prev,
+      );
+    },
+    mutationOptions: {
+      onSuccess: (saved, { provisional }) => {
+        if (!id) return;
+        // Replace the provisional tag with the server-confirmed one.
+        queryClient.setQueryData<Tag[]>(queryKeys.paperTags(id), (prev) =>
+          prev
+            ? prev.map((t) => (t.id === provisional.id ? saved : t))
+            : [saved],
+        );
+      },
+    },
+  });
+
+  const removeTagMutation = useApiMutation<
+    { tag: Tag },
+    { id: number; paper_id: string; detached: boolean }
+  >({
+    mutate: ({ tag }) => removePaperTag(id!, tag.id),
+    onOptimistic: ({ tag }, qc) => {
+      if (!id) return;
+      qc.setQueryData<Tag[]>(queryKeys.paperTags(id), (prev) =>
+        prev ? prev.filter((t) => t.id !== tag.id) : prev,
+      );
+    },
+    onRollback: ({ tag }, _error, qc) => {
+      if (!id) return;
+      qc.setQueryData<Tag[]>(queryKeys.paperTags(id), (prev) =>
+        prev ? [...prev, tag] : prev,
+      );
+    },
+  });
+
   useEffect(() => {
     getHealth()
       .then((h) => setRemoteEnabled(h.remote))
       .catch(() => setRemoteEnabled(false));
   }, []);
 
-  const load = useCallback(async () => {
-    if (!id) return;
-    const [paper, paperTags] = await Promise.all([
-      getPaper(id),
-      listPaperTags(id).catch(() => [] as Tag[]),
-    ]);
-    setP(paper);
-    setFavorite(paper.favorite);
-    setTags(paperTags);
-    if (paper.md_path) {
-      try {
-        const r = await getPaperMarkdown(id);
-        setMd(r.body);
-      } catch {
-        setMd(null);
-      }
-    } else {
-      setMd(null);
-    }
+  useEffect(() => {
+    setPdfOpen(false);
   }, [id]);
 
   useEffect(() => {
-    setPdfOpen(false);
-    load().catch((e) => setErr(String(e)));
-  }, [load]);
+    if (paperQuery.error) setErr(String(paperQuery.error));
+  }, [paperQuery.error]);
 
-  // Tick every second while processing so the elapsed counter updates.
   useEffect(() => {
     if (!processing) return;
     const id2 = window.setInterval(() => setNow(Date.now()), 1000);
@@ -116,7 +190,8 @@ export default function PaperDetail({ onProcessed }: Props) {
           if (j.status === "failed") {
             setErr(j.message || "Job failed");
           }
-          await load();
+          await paperQuery.refetch();
+          await markdownQuery.refetch();
           onProcessed?.();
         }
       } catch (e) {
@@ -193,21 +268,16 @@ export default function PaperDetail({ onProcessed }: Props) {
     () => () => {
       if (timer.current) window.clearInterval(timer.current);
     },
-    []
+    [],
   );
 
   async function onToggleFavorite() {
-    if (!id || favBusy) return;
-    const next = !favorite;
-    setFavorite(next);
-    setFavBusy(true);
+    if (!id) return;
+    const next = !(p?.favorite ?? false);
     try {
-      await toggleFavorite(id, next);
+      await favoriteMutation.mutateAsync({ next });
     } catch (e) {
-      setFavorite(!next);
       setErr(`Could not update favorite: ${String(e)}`);
-    } finally {
-      setFavBusy(false);
     }
   }
 
@@ -220,29 +290,20 @@ export default function PaperDetail({ onProcessed }: Props) {
       return;
     }
     setTagInput("");
-    // Optimistic append with a provisional negative id; replaced on success.
     const provisional: Tag = { id: -Date.now(), name: raw };
-    setTags((prev) => [...prev, provisional]);
-    try {
-      const saved = await addPaperTag(id, raw);
-      setTags((prev) => prev.map((t) => (t.id === provisional.id ? saved : t)));
-    } catch (errThrown) {
-      setTags((prev) => prev.filter((t) => t.id !== provisional.id));
-      setErr(`Could not add tag: ${String(errThrown)}`);
-    }
+    addTagMutation.mutate({ raw, provisional });
   }
 
   async function onRemoveTag(tag: Tag) {
     if (!id) return;
-    const previous = tags;
-    setTags((prev) => prev.filter((t) => t.id !== tag.id));
-    if (tag.id < 0) return; // provisional never saved
-    try {
-      await removePaperTag(id, tag.id);
-    } catch (e) {
-      setTags(previous);
-      setErr(`Could not remove tag: ${String(e)}`);
-    }
+    if (tag.id < 0) return;
+    removeTagMutation.mutate({ tag });
+  }
+
+  // A load() shim used by child cards (References / Citations) that want
+  // to refresh the parent detail after a write.
+  async function load() {
+    await Promise.all([paperQuery.refetch(), tagsQuery.refetch(), markdownQuery.refetch()]);
   }
 
   if (err && !p)
@@ -252,10 +313,6 @@ export default function PaperDetail({ onProcessed }: Props) {
       <main className="container py-8 text-sm text-muted-foreground">Loading…</main>
     );
 
-  // A downloadable PDF exists when the record carries a pdf_url, or when it
-  // has an arXiv id (the backend synthesizes the canonical arXiv PDF even if
-  // the source advertised no direct pdf_url). Closed papers with only a DOI
-  // can also be processed when the institutional SSH server is configured.
   const pdfHref = p.pdf_url || (p.arxiv_id ? `https://arxiv.org/pdf/${p.arxiv_id}.pdf` : "");
   const canParse =
     (Boolean(pdfHref) || (remoteEnabled && Boolean(p.doi || p.arxiv_id || p.journal_doi))) &&
@@ -271,18 +328,16 @@ export default function PaperDetail({ onProcessed }: Props) {
     : p.pdf_path;
   const showInstitutionalCard =
     !pdfHref && !p.pdf_path && remoteEnabled && Boolean(p.doi || p.arxiv_id || p.journal_doi);
-  // Embed is available when the paper is parsed/summarized but not yet ready,
-  // or when a previous embed failed.
   const canEmbed =
-    p.status === "parsed" || p.status === "summarized" ||
+    p.status === "parsed" ||
+    p.status === "summarized" ||
     (p.status === "failed" && Boolean(p.md_path));
-  // Summary regeneration is available once the paper has been parsed to
-  // Markdown (chained summarization runs automatically after parse).
   const canSummarize = Boolean(p.md_path);
   const hasSummary = Boolean(p.tldr_en || p.tldr_zh || p.summary_zh);
   const stage = (job?.stats?.stage as string | undefined) ?? "";
   const detail = (job?.stats?.detail as string | undefined) ?? job?.message ?? "";
   const running = Boolean(processing || (job && !TERMINAL.has(job.status)));
+  const favBusy = favoriteMutation.isPending;
 
   return (
     <main className="w-full space-y-6 px-6 py-8 xl:px-0">
@@ -387,12 +442,12 @@ export default function PaperDetail({ onProcessed }: Props) {
               size="icon"
               onClick={onToggleFavorite}
               disabled={favBusy}
-              aria-pressed={favorite}
-              title={favorite ? "Remove from favorites" : "Add to favorites"}
+              aria-pressed={p.favorite}
+              title={p.favorite ? "Remove from favorites" : "Add to favorites"}
             >
               <Star
                 className={
-                  favorite
+                  p.favorite
                     ? "h-4 w-4 fill-yellow-400 text-yellow-500"
                     : "h-4 w-4"
                 }
