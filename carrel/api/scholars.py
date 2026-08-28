@@ -33,10 +33,16 @@ import threading
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func, or_
 from sqlmodel import Session, col, select
 
+from carrel.api._app_cache import cached
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_updated_at,
+    if_none_match_matches,
+)
 from carrel.api.papers import _to_summary
 from carrel.cache import openalex_works as cache
 from carrel.db import get_session_dep
@@ -93,6 +99,17 @@ def _library_signature(session: Session) -> Any:
     return (row[0].isoformat() if row and row[0] else None, len(count))
 
 
+@cached("scholars_list", tags=("scholars_list", "papers_list"))
+def _aggregate_scholars(session: Session) -> list[ScholarSummary]:
+    """The underlying aggregation, memoized in the L2 cache.
+
+    The route handler wraps this with the in-process TTL cache
+    (:data:`_LIST_TTL`) for hot-path access. The L2 layer is the
+    long-lived fan-out target invalidated when papers change.
+    """
+    return aggregate(session)
+
+
 def _get_scholars(session: Session) -> list[ScholarSummary]:
     """Return cached aggregation, rebuilding when stale or changed."""
     now = time.monotonic()
@@ -109,7 +126,7 @@ def _get_scholars(session: Session) -> list[ScholarSummary]:
             and _list_cache["sig"] == sig
         ):
             return _list_cache["items"]
-        items = aggregate(session)
+        items = _aggregate_scholars(session)
         _list_cache.update(ts=now, sig=sig, items=items)
         return items
 
@@ -150,10 +167,32 @@ def _scholar_wiki_page(session: Session, key: str, name: str) -> WikiPage | None
 
 @router.get("", response_model=list[ScholarSummary])
 def list_scholars(
+    request: Request,
+    response: Response,
     q: str | None = Query(None, description="Case-insensitive substring match on name"),
     limit: int = Query(100, ge=1, le=500),
     session: Session = Depends(get_session_dep),
 ) -> list[ScholarSummary]:
+    """List scholars ranked by local paper count.
+
+    Layer 1: the underlying aggregation is cached in-process and
+    invalidated by ``_library_signature``; the signature is also a
+    stable ETag source. ETag includes the filter params so q+limit
+    combinations don't share a cache slot.
+    """
+    sig_ts, sig_count = _library_signature(session)
+    etag = etag_for_updated_at(
+        None if sig_ts is None else _parse_iso(sig_ts),
+        extra=("scholars_list", str(sig_count), q or "", str(limit)),
+    )
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
+
     items = _get_scholars(session)
     if q:
         needle = q.strip().lower()
@@ -162,11 +201,41 @@ def list_scholars(
     return items[:limit]
 
 
+def _parse_iso(s: str):
+    """Parse an ISO timestamp string into a datetime; tolerate trailing Z."""
+    from datetime import datetime, UTC
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(UTC)
+
+
 @router.get("/{key}", response_model=ScholarDetail)
 def get_scholar(
     key: str,
+    request: Request,
+    response: Response,
     session: Session = Depends(get_session_dep),
 ) -> ScholarDetail:
+    """One scholar: local papers + OpenAlex profile + compiled wiki page.
+
+    Layer 1: ETag is built from the library signature and the key. The
+    OpenAlex profile (h_index etc.) is fetched once and cached in
+    :func:`carrel.pipeline.wiki._scholars_agg.get_profile`, so a 304
+    here is safe even when the profile exists.
+    """
+    sig_ts, sig_count = _library_signature(session)
+    etag = etag_for_updated_at(
+        None if sig_ts is None else _parse_iso(sig_ts),
+        extra=("scholar", str(sig_count), key),
+    )
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
+
     # Locate the matching summary from the aggregated list (handles display
     # name, affiliation, counts consistently with the browse page).
     summary = next((s for s in _get_scholars(session) if s.key == key), None)

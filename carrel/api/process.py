@@ -18,6 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session
 
 from carrel.db import get_session_dep
+from carrel.api._invalidation import invalidate_paper_mutated
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.process import (
     ProcessError,
@@ -141,6 +142,9 @@ def _run_one(session: Session, job_id: int, paper_id: str, cfg) -> None:
             job.message = "Done"
             session.add(job)
             session.commit()
+        # L2: parser wrote a new markdown body and bumped status. The
+        # per-paper detail + the markdown body itself must be evicted.
+        invalidate_paper_mutated(paper_id, mutate={"status", "markdown"})
     except ProcessError as e:
         logger.info("process job %d failed: %s", job_id, e)
         if job is not None:

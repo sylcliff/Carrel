@@ -28,6 +28,7 @@ from sqlmodel import Session
 
 from carrel.api.search import _import_one_paper, _resolve_work_for_import
 from carrel.db import get_session_dep
+from carrel.api._invalidation import invalidate_bulk_import_done
 from carrel.models import Job, JobKind, JobStatus
 from carrel.schemas import (
     BulkImportIn,
@@ -304,6 +305,11 @@ def _drive_batch(
     )
     session.add(job)
     session.commit()
+    # L2: every list view that depends on library size or per-row facets
+    # must refresh. Invalidation is unconditional — even an empty bulk
+    # import (all failed) is cheap, and the next read will pick up any
+    # partially-imported rows.
+    invalidate_bulk_import_done()
     return results
 
 

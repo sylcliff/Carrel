@@ -16,9 +16,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 from sqlmodel import Session, select
 
+from carrel.api._app_cache import cached
+from carrel.api._invalidation import invalidate_wiki_recompiled
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_list,
+    etag_for_updated_at,
+    if_none_match_matches,
+)
 from carrel.config import CarrelYAML
 from carrel.db import get_session_dep
 from carrel.agent_recorder import run_with_recorder
@@ -175,6 +183,8 @@ def _page_detail(
 
 @router.get("/pages", response_model=list[WikiPageSummary])
 def list_pages(
+    request: Request,
+    response: Response,
     kind: str | None = Query(None, description="Filter by concept|scholar|question"),
     q: str | None = Query(None, description="Substring match on title/summary"),
     limit: int = Query(50, ge=1, le=200),
@@ -185,6 +195,12 @@ def list_pages(
     ),
     session: Session = Depends(get_session_dep),
 ) -> list[WikiPageSummary]:
+    """List wiki pages (one filtered page at a time).
+
+    Layer 1: ETag is built from the row set + max updated_at + filter
+    fingerprint so any compile / reconcile / redirect-prune pass
+    invalidates the cached page automatically.
+    """
     stmt = select(WikiPage)
     if kind:
         if kind not in {k.value for k in WikiKind}:
@@ -203,7 +219,25 @@ def list_pages(
                 or needle in (r.summary or "").lower()
             ]
     rows.sort(key=lambda r: (r.kind, -(r.evidence_count or 0), r.title.lower()))
-    return [_to_summary(r) for r in rows[offset : offset + limit]]
+    page = rows[offset : offset + limit]
+
+    etag = etag_for_list(
+        max_updated_at=max((r.updated_at for r in page), default=None),
+        row_ids=[str(r.id) for r in page],
+        count=len(rows),
+    )
+    if etag is not None and if_none_match_matches(
+        request,
+        etag,
+    ):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
+
+    return [_to_summary(r) for r in page]
 
 
 def _get_page_row(session: Session, page_id: int) -> WikiPage:
@@ -213,20 +247,45 @@ def _get_page_row(session: Session, page_id: int) -> WikiPage:
     return row
 
 
+@cached("wiki_page", key_params=("page_id",), tags=("wiki",))
+def _get_page_body(page_id: int, session: Session) -> WikiPageDetail:
+    """Cached wiki page detail. 404 on unknown id is not cached."""
+    row = _get_page_row(session, page_id)
+    return _page_detail(session, row)
+
+
 @router.get("/pages/{page_id}", response_model=WikiPageDetail)
 def get_page(
     page_id: int,
+    request: Request,
+    response: Response,
     session: Session = Depends(get_session_dep),
 ) -> WikiPageDetail:
-    return _page_detail(session, _get_page_row(session, page_id))
+    """One wiki page (with body, sources, backlinks).
+
+    Layer 1: ETag from the row's ``updated_at`` and id. A recompile
+    bumps the row's timestamp so the ETag flips automatically.
+    Layer 2: the body is memoized in-process; the route handler
+    re-reads the row once to build the ETag.
+    """
+    row = _get_page_row(session, page_id)
+    body = _get_page_body(page_id, session)
+    etag = etag_for_updated_at(row.updated_at, extra=("wiki_page", str(row.id)))
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
+    return body
 
 
-@router.get("/pages/by-kind-slug/{kind}/{slug}", response_model=WikiPageDetail)
-def get_page_by_kind_slug(
-    kind: str,
-    slug: str,
-    session: Session = Depends(get_session_dep),
+@cached("wiki_page_by_slug", key_params=("kind", "slug"), tags=("wiki",))
+def _get_page_by_kind_slug_body(
+    kind: str, slug: str, session: Session
 ) -> WikiPageDetail:
+    """Cached wiki page (with redirect-follow). 422/404 not cached."""
     if kind not in {k.value for k in WikiKind}:
         raise HTTPException(status_code=422, detail=f"unknown kind: {kind}")
     row = session.exec(
@@ -251,6 +310,36 @@ def get_page_by_kind_slug(
     return _page_detail_with_redirected_from(
         session, row, redirected_from=redirected_from
     )
+
+
+@router.get("/pages/by-kind-slug/{kind}/{slug}", response_model=WikiPageDetail)
+def get_page_by_kind_slug(
+    kind: str,
+    slug: str,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> WikiPageDetail:
+    body = _get_page_by_kind_slug_body(kind, slug, session)
+    # L1 ETag: a redirect-follow can change which row is canonical. The
+    # body is the source of truth for the timestamp; we just look up
+    # the row once more to get it.
+    if body.id is not None:
+        row = session.get(WikiPage, body.id)
+        if row is not None:
+            etag = etag_for_updated_at(
+                row.updated_at, extra=("wiki_page_by_slug", kind, slug)
+            )
+            if etag is not None and if_none_match_matches(request, etag):
+                return Response(  # type: ignore[return-value]
+                    status_code=304,
+                    headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
+                )
+            if etag is not None:
+                apply_etag_headers(
+                    response, etag, max_age=60, stale_while_revalidate=120
+                )
+    return body
 
 
 def _page_detail_with_redirected_from(
@@ -489,6 +578,9 @@ def _run_batch(
             job.message = "Done."
             session.add(job)
             session.commit()
+        # L2: every wiki page may have changed (recompile, prune, reindex).
+        # Drop all wiki entries; the next read rebuilds from the new rows.
+        invalidate_wiki_recompiled()
     except Exception as e:  # noqa: BLE001
         logger.exception("wiki compile job %d crashed", job_id)
         if job is not None:

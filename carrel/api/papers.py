@@ -6,7 +6,7 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import String, cast, func
 from sqlmodel import Session, col, or_, select
 
@@ -24,6 +24,14 @@ from carrel.models import (
 )
 from carrel.schemas import AuthorRef, PaperDetail, PaperSummary
 from carrel.sources.normalize import format_journal_citation
+from carrel.api._app_cache import cached
+from carrel.api._invalidation import invalidate_paper_mutated, invalidate_bulk_import_done
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_list,
+    etag_for_updated_at,
+    if_none_match_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +62,7 @@ def _to_summary(
         doi=p.doi,
         arxiv_id=p.arxiv_id,
         s2_paper_id=p.s2_paper_id,
+        updated_at=p.updated_at,
     )
 
 
@@ -144,35 +153,34 @@ def _load_topics_map(session: Session, paper_ids: list[str]) -> dict[str, list[s
     return out
 
 
-@router.get("", response_model=list[PaperSummary])
-def list_papers(
-    session: Session = Depends(get_session_dep),
-    limit: int = Query(50, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    status: str | None = Query(None, description="Filter by paper status"),
-    venue: str | None = Query(None, description="Case-insensitive substring match on venue name"),
-    in_library: bool | None = Query(
-        True,
-        description="True (default): library papers. False: inbox (discovered, not discarded). Null: all.",
+@cached(
+    "papers_list",
+    key_params=(
+        "status", "venue", "in_library", "favorite", "tag", "topic",
+        "q", "sort", "limit", "offset",
     ),
-    favorite: bool | None = Query(None, description="Filter by favorite state"),
-    tag: list[str] | None = Query(
-        None, description="Filter by tag name(s); repeat for ?tag=a&tag=b (match ANY)"
-    ),
-    topic: list[str] | None = Query(
-        None, description="Filter by topic name(s); repeat for ?topic=a&topic=b (match ANY)"
-    ),
-    q: str | None = Query(
-        None, description="Case-insensitive substring match on title or authors"
-    ),
-    sort: str = Query("added", description="Sort order"),
-    # FastAPI injects the live Response object when the parameter is annotated
-    # as `Response`; do NOT union with None (FastAPI rejects that as an
-    # invalid Pydantic field type). A default of `Response()` keeps Python
-    # happy — the previous parameters all have Query() defaults so this one
-    # must too. We use it to publish X-Total-Count.
-    response: Response = Response(),
-) -> list[PaperSummary]:
+    tags=("papers_list", "tags", "topics", "scholars_list"),
+    offset_invariant=True,
+)
+def _list_papers_body(
+    session: Session,
+    limit: int,
+    offset: int,
+    status: str | None,
+    venue: str | None,
+    in_library: bool | None,
+    favorite: bool | None,
+    tag: list[str] | None,
+    topic: list[str] | None,
+    q: str | None,
+    sort: str,
+) -> tuple[list[PaperSummary], int]:
+    """Cached (rows, total) tuple. Filter fingerprint is in the cache key.
+
+    The route handler sets X-Total-Count from ``total`` and computes the
+    ETag from the row set. L2 is the long-lived fan-out target; L1
+    is the short-lived per-request check.
+    """
     allowed_sorts = {
         "added",
         "updated",
@@ -240,7 +248,6 @@ def list_papers(
     total = session.exec(
         select(func.count()).select_from(Paper).where(*where_clauses)
     ).one()
-    response.headers["X-Total-Count"] = str(int(total))
 
     stmt = (
         select(Paper)
@@ -252,23 +259,118 @@ def list_papers(
     rows = session.exec(stmt).all()
     tags_map = _load_tags_map(session, [p.id for p in rows])
     topics_map = _load_topics_map(session, [p.id for p in rows])
-    return [
+    items = [
         _to_summary(p, tags_map.get(p.id, []), topics_map.get(p.id, []))
         for p in rows
     ]
+    return items, int(total)
 
 
-@router.get("/{paper_id}", response_model=PaperDetail)
-def get_paper(
-    paper_id: str,
+@router.get("", response_model=list[PaperSummary])
+def list_papers(
     session: Session = Depends(get_session_dep),
-) -> PaperDetail:
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    status: str | None = Query(None, description="Filter by paper status"),
+    venue: str | None = Query(None, description="Case-insensitive substring match on venue name"),
+    in_library: bool | None = Query(
+        True,
+        description="True (default): library papers. False: inbox (discovered, not discarded). Null: all.",
+    ),
+    favorite: bool | None = Query(None, description="Filter by favorite state"),
+    tag: list[str] | None = Query(
+        None, description="Filter by tag name(s); repeat for ?tag=a&tag=b (match ANY)"
+    ),
+    topic: list[str] | None = Query(
+        None, description="Filter by topic name(s); repeat for ?topic=a&topic=b (match ANY)"
+    ),
+    q: str | None = Query(
+        None, description="Case-insensitive substring match on title or authors"
+    ),
+    sort: str = Query("added", description="Sort order"),
+    # FastAPI injects the live Response object when the parameter is annotated
+    # as `Response`; do NOT union with None (FastAPI rejects that as an
+    # invalid Pydantic field type). A default of `Response()` keeps Python
+    # happy — the previous parameters all have Query() defaults so this one
+    # must too. We use it to publish X-Total-Count.
+    response: Response = Response(),
+) -> list[PaperSummary]:
+    items, total = _list_papers_body(
+        session, limit, offset, status, venue, in_library,
+        favorite, tag, topic, q, sort,
+    )
+    response.headers["X-Total-Count"] = str(total)
+
+    # Layer 1 ETag for the list. Embed the row set, the total count, and
+    # the filter fingerprint so a refresh after a write (which would
+    # change the row set or the total) produces a different ETag.
+    if items:
+        max_updated = max(
+            (p.updated_at for p in items if p.updated_at is not None),
+            default=None,
+        )
+        etag = etag_for_list(
+            max_updated_at=max_updated,
+            row_ids=[p.id for p in items],
+            count=total,
+        )
+    else:
+        # Empty list: still a valid ETag (count=0 is stable until a row
+        # is added or removed).
+        etag = etag_for_list(
+            max_updated_at=None,
+            row_ids=[],
+            count=total,
+        )
+    if etag is not None:
+        # Library list is short-lived — the same filter combination with
+        # new rows should revalidate fast.
+        apply_etag_headers(response, etag, max_age=15, stale_while_revalidate=30)
+    return items
+
+
+@cached("paper", key_params=("paper_id",), tags=("paper", "papers_list"))
+def _get_paper_body(paper_id: str, session: Session) -> PaperDetail:
+    """Cached paper body. Raises 404 when the id is unknown.
+
+    The 404 is *not* cached because the decorator only stores truthy return
+    values. A misspelled id will continue to hit the DB on every request,
+    which is the right behavior (no negative caching, no thundering herd).
+    """
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
     tags_map = _load_tags_map(session, [p.id])
     topics_map = _load_topics_map(session, [p.id])
     return _to_detail(p, tags_map.get(p.id, []), topics_map.get(p.id, []))
+
+
+@router.get("/{paper_id}", response_model=PaperDetail)
+def get_paper(
+    paper_id: str,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> PaperDetail:
+    # Layer 1 + 2: the body is memoized in-process; we build the ETag from
+    # the returned body so cache hits still serve correct 304s. The
+    # ``updated_at`` on the cached body reflects the row at the time of the
+    # last cache miss; an external write that calls
+    # ``invalidate_paper_mutated`` will drop the entry and the next
+    # request will see the new timestamp.
+    body = _get_paper_body(paper_id, session)
+    etag = etag_for_updated_at(body.updated_at, extra=(body.id,))
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=60, stale-while-revalidate=120",
+            },
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
+    return body
 
 
 @router.post("/{paper_id}/import")
@@ -289,6 +391,8 @@ def import_paper_to_library(
     p.updated_at = datetime.now(UTC)
     session.add(p)
     session.commit()
+    # L2: per-paper detail + library/inbox list fan-out.
+    invalidate_paper_mutated(paper_id, mutate={"inbox"})
     return {"id": p.id, "imported": True, "in_library": True}
 
 
@@ -315,6 +419,8 @@ def discard_paper(
     p.updated_at = datetime.now(UTC)
     session.add(p)
     session.commit()
+    # L2: per-paper detail + inbox list fan-out.
+    invalidate_paper_mutated(paper_id, mutate={"discarded"})
     return {"id": p.id, "discarded": True}
 
 
@@ -394,15 +500,23 @@ def delete_paper(
             shutil.rmtree(target, ignore_errors=True)
             removed_files = not target.exists()
 
+    # L2: full per-paper eviction + list fan-out.
+    invalidate_paper_mutated(paper_id, mutate={"deleted"})
     return {"id": paper_id, "deleted": True, "removed_files": removed_files}
 
 
-@router.get("/{paper_id}/markdown")
-def get_paper_markdown(
-    paper_id: str,
-    session: Session = Depends(get_session_dep),
-) -> dict[str, str | None]:
-    """Return the parsed markdown body if available, else null."""
+@cached("paper_markdown", key_params=("paper_id",), tags=("paper", "paper:markdown", "papers_list"))
+def _get_paper_markdown_body(
+    paper_id: str, session: Session
+) -> tuple[dict[str, str | None], datetime | None]:
+    """Cached (markdown body, paper row updated_at) tuple.
+
+    404 / 409 are not cached (decorator only stores truthy returns). The
+    body is immutable once parsed and large, so the L1 layer gives it a
+    10-minute ``max-age`` and a 24-hour stale-while-revalidate. The
+    pipeline / write paths invalidate this entry on re-parse via
+    ``invalidate_paper_mutated``.
+    """
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
@@ -419,7 +533,39 @@ def get_paper_markdown(
         full = Path(cfg_storage_root()) / p.md_path
         if full.exists():
             body = full.read_text(encoding="utf-8")
-    return {"id": p.id, "body": body, "md_path": p.md_path}
+    return {"id": p.id, "body": body, "md_path": p.md_path}, p.updated_at
+
+
+@router.get("/{paper_id}/markdown")
+def get_paper_markdown(
+    paper_id: str,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> dict[str, str | None]:
+    """Return the parsed markdown body if available, else null.
+
+    Layer 1: markdown is large and immutable once parsed, so we set a
+    long max-age (10 min) and a generous stale-while-revalidate
+    (24 hours). The ETag is built from the row's ``updated_at`` and
+    ``md_path``; an external write that calls
+    ``invalidate_paper_mutated`` drops the cached body and the next
+    request sees a new ETag.
+    """
+    body, updated_at = _get_paper_markdown_body(paper_id, session)
+    etag = etag_for_updated_at(
+        updated_at, extra=(body["id"], body.get("md_path") or "")
+    )
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=600, stale-while-revalidate=86400"},
+        )
+    if etag is not None:
+        apply_etag_headers(
+            response, etag, max_age=600, stale_while_revalidate=86400,
+        )
+    return body
 
 
 def cfg_storage_root() -> str:

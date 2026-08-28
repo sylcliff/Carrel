@@ -11,11 +11,18 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import func
 from sqlmodel import Session, select
 
 from carrel.db import get_session_dep
+from carrel.api._app_cache import cached, get_cache
+from carrel.api._invalidation import invalidate_paper_mutated
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_updated_at,
+    if_none_match_matches,
+)
 from carrel.models import Paper, PaperTag, Tag
 from carrel.schemas import (
     FavoriteIn,
@@ -48,6 +55,9 @@ def set_favorite(
     p.updated_at = datetime.now(UTC)
     session.add(p)
     session.commit()
+    # L2: fan out to the per-paper detail entry, the papers list, and the
+    # scholars aggregation (which surfaces favorite counts per author).
+    invalidate_paper_mutated(paper_id, mutate={"favorite"})
     return FavoriteOut(id=p.id, favorite=p.favorite)
 
 
@@ -68,11 +78,12 @@ def set_notes(
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
-    content = body.notes_markdown.strip()
-    p.notes_markdown = content or None
+    p.notes_markdown = body.notes_markdown.strip() or None
     p.updated_at = datetime.now(UTC)
     session.add(p)
     session.commit()
+    # L2: per-paper detail + list views.
+    invalidate_paper_mutated(paper_id, mutate={"notes"})
     return NotesOut(
         id=p.id, notes_markdown=p.notes_markdown, updated_at=p.updated_at
     )
@@ -104,11 +115,9 @@ def _get_or_create_tag(session: Session, name: str) -> Tag:
     return tag
 
 
-@router.get("/papers/{paper_id}/tags", response_model=list[TagOut])
-def list_paper_tags(
-    paper_id: str,
-    session: Session = Depends(get_session_dep),
-) -> list[TagOut]:
+@cached("paper_tags", key_params=("paper_id",), tags=("paper", "paper:tags", "tags"))
+def _list_paper_tags_body(paper_id: str, session: Session) -> list[TagOut]:
+    """Cached list of tags for one paper. Raises 404 when the paper is unknown."""
     p = session.get(Paper, paper_id)
     if p is None:
         raise HTTPException(status_code=404, detail="paper not found")
@@ -119,6 +128,38 @@ def list_paper_tags(
         .order_by(Tag.name)
     ).all()
     return [TagOut(id=t.id, name=t.name) for t in rows]  # type: ignore[arg-type]
+
+
+@router.get("/papers/{paper_id}/tags", response_model=list[TagOut])
+def list_paper_tags(
+    paper_id: str,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> list[TagOut]:
+    """Tags attached to one paper.
+
+    Layer 1: ETag is derived from the paper's ``updated_at`` because
+    every tag attach / detach mutates the paper row (the FK lives on
+    ``PaperTag`` but the API bumps ``papers.updated_at`` on
+    annotation changes too — see ``set_favorite`` / ``set_notes``).
+    Layer 2: the body is memoized in-process; the route handler
+    re-reads ``updated_at`` to build a stable ETag (a single
+    indexed lookup, not the join).
+    """
+    p = session.get(Paper, paper_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    tags = _list_paper_tags_body(paper_id, session)
+    etag = etag_for_updated_at(p.updated_at, extra=(p.id,))
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
+    return tags
 
 
 @router.post("/papers/{paper_id}/tags", response_model=TagOut)
@@ -138,6 +179,8 @@ def add_paper_tag(
     if existing is None:
         session.add(PaperTag(paper_id=paper_id, tag_id=tag.id))  # type: ignore[arg-type]
         session.commit()
+    # L2: per-paper tag list + global tag aggregation.
+    invalidate_paper_mutated(paper_id, mutate={"tags"})
     return TagOut(id=tag.id, name=tag.name)  # type: ignore[arg-type]
 
 
@@ -152,14 +195,23 @@ def remove_paper_tag(
         raise HTTPException(status_code=404, detail="tag not attached to paper")
     session.delete(link)
     session.commit()
+    # L2: per-paper tag list + global tag aggregation.
+    invalidate_paper_mutated(paper_id, mutate={"tags"})
     return {"id": tag_id, "paper_id": paper_id, "detached": True}
 
 
 @router.get("/tags", response_model=list[TagWithCount])
 def list_tags(
+    response: Response,
     session: Session = Depends(get_session_dep),
 ) -> list[TagWithCount]:
-    """All tags with the number of papers carrying each (zero counts included)."""
+    """All tags with the number of papers carrying each (zero counts included).
+
+    Layer 1: counts are a global aggregation, so a precise ETag would
+    require a per-row fingerprint. Use a short max-age instead and
+    rely on L2 invalidation in Phase 3 for precision after writes.
+    """
+    response.headers["Cache-Control"] = "private, max-age=10, stale-while-revalidate=30"
     rows = session.exec(
         select(Tag.id, Tag.name, func.count(PaperTag.paper_id))
         .outerjoin(PaperTag, PaperTag.tag_id == Tag.id)
@@ -181,10 +233,31 @@ def delete_tag(
     tag = session.get(Tag, tag_id)
     if tag is None:
         raise HTTPException(status_code=404, detail="tag not found")
+    # Collect the affected paper ids BEFORE we delete the links so the
+    # per-paper detail entries can be invalidated. The query is a scalar
+    # column select; on SQLModel+SQLite the result rows are 1-tuples, on
+    # Postgres they may come back as scalars. Coerce both to a flat list.
+    affected_paper_ids = [
+        pid
+        for pid in (
+            row[0] if isinstance(row, tuple) else row
+            for row in session.exec(
+                select(PaperTag.paper_id).where(PaperTag.tag_id == tag_id)
+            ).all()
+        )
+    ]
     links = session.exec(select(PaperTag).where(PaperTag.tag_id == tag_id)).all()
     detached = len(links)
     for link in links:
         session.delete(link)
     session.delete(tag)
     session.commit()
+    # L2: drop the global tag aggregation and per-paper tag lists for
+    # every paper that was carrying the tag. The per-id drop is precise
+    # because we collected the ids above.
+    cache = get_cache()
+    cache.invalidate_tags("tags", "papers_list")
+    for pid in affected_paper_ids:
+        cache.invalidate_exact(f"paper:{pid}:tags")
+        cache.invalidate_exact(f"paper:{pid}")
     return {"id": tag_id, "deleted": True, "detached": detached}

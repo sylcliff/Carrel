@@ -13,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session
 
 from carrel.db import get_session_dep
+from carrel.api._invalidation import invalidate_paper_mutated
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.embed import EmbedError, embed_paper
 from carrel.schemas import EmbedRequest, JobOut
@@ -140,6 +141,9 @@ def _run_one(session: Session, job_id: int, paper_id: str, cfg) -> None:
             session.add(job)
             session.commit()
         rec.finish(summary={"paper_id": paper_id})
+        # L2: embeddings changed; the per-paper detail entry is unaffected
+        # (no embedded field in PaperDetail) but we drop it to be safe.
+        invalidate_paper_mutated(paper_id, mutate={"embeddings"})
     except EmbedError as e:
         rec.finish(status="failed", error=str(e))
         if job is not None:

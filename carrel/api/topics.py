@@ -13,11 +13,13 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from sqlalchemy import func
 from sqlmodel import Session, select
 
 from carrel.db import get_session_dep
+from carrel.api._app_cache import cached
+from carrel.api._invalidation import invalidate_topics_recomputed, invalidate_paper_mutated
 from carrel.models import Job, JobKind, JobStatus, Paper, PaperTopic, Topic
 from carrel.pipeline.topics import TopicsError, topics_paper
 from carrel.schemas import JobOut, TopicWithCount, TopicsRequest
@@ -81,16 +83,9 @@ def trigger_topics(
     return [_to_out(j) for j in jobs]
 
 
-@router.get("", response_model=list[TopicWithCount])
-def list_topics(
-    session: Session = Depends(get_session_dep),
-) -> list[TopicWithCount]:
-    """All topics with the number of in-library papers carrying each.
-
-    Topics with zero papers are excluded (a topic only exists once the
-    classifier assigns it, but papers can be deleted afterward). Ordered by
-    descending paper count, then name.
-    """
+@cached("topics", tags=("topics", "papers_list"))
+def _list_topics_body(session: Session) -> list[TopicWithCount]:
+    """Cached topic counts. Invalidated on classifier commit / paper writes."""
     rows = session.exec(
         select(
             Topic.id,
@@ -110,6 +105,26 @@ def list_topics(
         )
         for t_id, name, description, count in rows
     ]
+
+
+@router.get("", response_model=list[TopicWithCount])
+def list_topics(
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> list[TopicWithCount]:
+    """All topics with the number of in-library papers carrying each.
+
+    Topics with zero papers are excluded (a topic only exists once the
+    classifier assigns it, but papers can be deleted afterward). Ordered by
+    descending paper count, then name.
+
+    Layer 1: counts are an aggregation over the library + topic
+    assignments. A precise ETag is not practical; use a short
+    max-age and rely on L2 invalidation (Phase 3) fired from
+    ``_run_one`` after the classifier commits.
+    """
+    response.headers["Cache-Control"] = "private, max-age=10, stale-while-revalidate=30"
+    return _list_topics_body(session)
 
 
 def _make_progress_cb(session: Session, job_id: int):
@@ -174,6 +189,12 @@ def _run_one(session: Session, job_id: int, paper_id: str, cfg, force: bool) -> 
             job.message = f"{type(e).__name__}: {e}"[:200]
             session.add(job)
             session.commit()
+    else:
+        # L2: classifier finished successfully — drop the global topics
+        # cache and the per-paper list. A failed run leaves the cache
+        # untouched (the existing topics are still valid).
+        invalidate_topics_recomputed()
+        invalidate_paper_mutated(paper_id, mutate={"status"})
 
 
 def _run_all_background(job_ids: list[int], paper_ids: list[str], force: bool) -> None:

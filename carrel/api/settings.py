@@ -19,11 +19,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 from carrel import scheduler as sched_mod
 from carrel.config import CarrelYAML, EnvSettings, load_settings
+from carrel.api._app_cache import cached
+from carrel.api._invalidation import invalidate_settings_changed
 from carrel.config_store import (
     ENV_OVERRIDE_FIELDS,
     RESTART_REQUIRED_SECTIONS,
@@ -206,10 +208,22 @@ def _build_response(
 # ---------------------------------------------------------------------------
 
 
-@router.get("", response_model=SettingsOut)
-def get_settings() -> SettingsOut:
+@cached("settings", tags=("settings",))
+def _get_settings_body() -> SettingsOut:
     cfg, env, path = _get_app_config()
     return _build_response(cfg, env, path)
+
+
+@router.get("", response_model=SettingsOut)
+def get_settings(response: Response) -> SettingsOut:
+    """Current effective config.
+
+    Layer 1: settings change rarely and the file's mtime is a stable
+    proxy, but env vars can change without a write. Use a short
+    max-age and rely on L2 invalidation (Phase 3) for the PATCH path.
+    """
+    response.headers["Cache-Control"] = "private, max-age=5, stale-while-revalidate=15"
+    return _get_settings_body()
 
 
 @router.patch("", response_model=SettingsOut)
@@ -287,4 +301,7 @@ def patch_settings(body: SettingsUpdate) -> SettingsOut:
         except Exception:  # pragma: no cover - defensive
             logger.exception("failed to restart scheduler after settings PATCH")
 
+    # L2: drop the cached settings response. The new env-merged values
+    # are now in ``cfg``; the next GET rebuilds the body from scratch.
+    invalidate_settings_changed()
     return _build_response(cfg, new_env, path)

@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 # Load .env into os.environ as early as possible. pydantic-settings reads
@@ -168,6 +169,23 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Belt-and-suspenders: any ``text/event-stream`` response is forced to
+    # ``Cache-Control: no-store`` regardless of what the route set. SSE
+    # streams (paper chat, wiki chat) must never be cached by the browser
+    # or by a reverse proxy. The middleware wraps the response so it
+    # fires after the route handler returns.
+    @app.middleware("http")
+    async def _no_store_sse(request: Request, call_next):
+        response = await call_next(request)
+        content_type = response.headers.get("content-type", "")
+        # ``StreamingResponse`` sets ``media_type`` after construction; the
+        # resulting response header is the source of truth at this point.
+        if content_type.startswith("text/event-stream") or isinstance(
+            response, StreamingResponse
+        ):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
     app.include_router(health.router)
     app.include_router(papers.router)

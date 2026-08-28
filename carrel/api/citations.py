@@ -14,10 +14,18 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlmodel import Session, or_, select
 
 from carrel.db import get_session_dep
+from carrel.api._app_cache import cached
+from carrel.api._invalidation import invalidate_citations_refreshed, invalidate_paper_mutated
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_list,
+    etag_for_updated_at,
+    if_none_match_matches,
+)
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.citations import enrich_paper
 from carrel.schemas import (
@@ -129,6 +137,8 @@ def _find_in_library(lib_map: dict[str, str], item: dict) -> str | None:
 @router.get("/{paper_id}/citations", response_model=CitationListOut)
 def list_citations(
     paper_id: str,
+    request: Request,
+    response: Response,
     sort: str | None = None,
     offset: int = 0,
     limit: int = 50,
@@ -203,6 +213,12 @@ def list_citations(
 
     from carrel.main import app_config
 
+    # Layer 1: list_citations can fall through to a live OpenAlex fetch
+    # past the cached slice, so a precise ETag isn't possible (the
+    # upstream page can change without our knowledge). Use a short
+    # max-age and rely on L2 invalidation in Phase 3 for the precision.
+    response.headers["Cache-Control"] = "private, max-age=30, stale-while-revalidate=60"
+
     return CitationListOut(
         paper_id=paper.id,
         citation_count=paper.citation_count,
@@ -222,32 +238,21 @@ def _norm_title(t: str | None) -> str:
     return re.sub(r"\s+", " ", (t or "").strip().lower())
 
 
-@router.get("/{paper_id}/references", response_model=ReferenceListOut)
-def list_references(
-    paper_id: str,
-    sort: str | None = None,
-    session: Session = Depends(get_session_dep),
-) -> ReferenceListOut:
-    """List the papers this paper cites (its bibliography).
-
-    Data comes from the cached `paper.references` populated by the citations
-    refresh job. `sort` ∈ {`year_asc`, `year_desc`}; default preserves the
-    Semantic Scholar order (roughly order of first appearance). Library
-    membership is resolved per item so the UI can link / offer Import.
-    """
+@cached("paper_references", key_params=("paper_id", "sort"), tags=("paper", "paper:references", "citations"))
+def _list_references_body(
+    paper_id: str, sort: str | None, session: Session
+) -> tuple[ReferenceListOut, datetime | None]:
+    """Cached (response, citations_updated_at) for the references list."""
     paper = session.get(Paper, paper_id)
     if paper is None:
         raise HTTPException(status_code=404, detail="paper not found")
-
     if sort not in (None, "", "year_asc", "year_desc"):
         raise HTTPException(status_code=400, detail=f"unknown sort: {sort}")
-
     refs = list(paper.references or [])
     if sort == "year_asc":
         refs.sort(key=lambda c: (c.get("year") or 9999, _norm_title(c.get("title"))))
     elif sort == "year_desc":
         refs.sort(key=lambda c: -(c.get("year") or -9999))
-
     lib_map = _resolve_library(session, refs)
     items: list[CitationItem] = []
     for c in refs:
@@ -263,13 +268,47 @@ def list_references(
             in_library=pid is not None,
             paper_id=pid,
         ))
-
-    return ReferenceListOut(
-        paper_id=paper.id,
-        reference_count=paper.reference_count,
-        updated_at=paper.citations_updated_at,
-        references=items,
+    return (
+        ReferenceListOut(
+            paper_id=paper.id,
+            reference_count=paper.reference_count,
+            updated_at=paper.citations_updated_at,
+            references=items,
+        ),
+        paper.citations_updated_at or paper.updated_at,
     )
+
+
+@router.get("/{paper_id}/references", response_model=ReferenceListOut)
+def list_references(
+    paper_id: str,
+    request: Request,
+    response: Response,
+    sort: str | None = None,
+    session: Session = Depends(get_session_dep),
+) -> ReferenceListOut:
+    """List the papers this paper cites (its bibliography).
+
+    Data comes from the cached `paper.references` populated by the citations
+    refresh job. `sort` ∈ {`year_asc`, `year_desc`}; default preserves the
+    Semantic Scholar order (roughly order of first appearance). Library
+    membership is resolved per item so the UI can link / offer Import.
+
+    Layer 1: ETag is derived from ``citations_updated_at`` (the source
+    of truth for the cached list) so a refresh of citations flips the
+    ETag. ``max-age=60`` mirrors the per-paper detail endpoint.
+    Layer 2: the body is memoized in-process keyed by (paper_id, sort).
+    """
+    body, etag_src = _list_references_body(paper_id, sort, session)
+    etag = etag_for_updated_at(etag_src, extra=(paper_id, sort or ""))
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
+        )
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
+    return body
 
 
 def _fetch_openalex_page(
@@ -432,6 +471,10 @@ def _run(session: Session, job_id: int, paper_id: str) -> None:
             session.add(job)
             session.commit()
         rec.finish(summary={"paper_id": paper_id})
+        # L2: drop the per-paper citations/references entries; bump the
+        # per-paper detail so the citations panel shows the new ETag.
+        invalidate_citations_refreshed(paper_id)
+        invalidate_paper_mutated(paper_id, mutate={"citations"})
     except Exception as e:  # noqa: BLE001
         logger.exception("citations job %d failed", job_id)
         rec.finish(status="failed", error=f"{type(e).__name__}: {e}")

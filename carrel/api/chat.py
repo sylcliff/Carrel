@@ -27,6 +27,7 @@ from carrel import embeddings as emb
 from carrel import llm, prompts_runtime, usage
 from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
+from carrel.api._invalidation import invalidate_paper_mutated
 from carrel.models import ChatMessage, Chunk, Paper
 from carrel.pipeline.summarize import _prepare_body
 from carrel.pipeline._llm_recorder import make_record_usage_callback
@@ -436,5 +437,8 @@ def put_chat_messages(
     paper.updated_at = now
     session.add(paper)
     session.commit()
+    # L2: chat transcript changed; the per-paper detail entry carries
+    # a chat-derived field, so we drop it for precision. No list impact.
+    invalidate_paper_mutated(paper_id, mutate={"chat"})
 
     return get_chat_messages(paper_id, session)

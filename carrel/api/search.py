@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import String, cast
 from sqlmodel import Session, col, or_, select
 
@@ -491,11 +491,15 @@ def _parse_filters(
 
 @router.get("/search/local", response_model=list[SearchResultItem])
 def search_local(
+    response: Response,
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=1000),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> list[SearchResultItem]:
+    # Search is by-design always-fresh: results reflect the live state of
+    # external sources and the library's ILIKE index. No ETag, no L2.
+    response.headers["Cache-Control"] = "no-store"
     q = q.strip()
     if not q:
         return []
@@ -507,6 +511,7 @@ def search_local(
 
 @router.get("/search/external", response_model=list[SearchResultItem])
 def search_external(
+    response: Response,
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=1000),
     year_from: int | None = Query(None, ge=1900, le=2100),
@@ -518,6 +523,7 @@ def search_external(
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> list[SearchResultItem]:
+    response.headers["Cache-Control"] = "no-store"
     q = q.strip()
     if not q:
         return []
@@ -535,6 +541,7 @@ def search_external(
 
 @router.get("/search", response_model=SearchResponse)
 def search_combined(
+    response: Response,
     q: str = Query("", min_length=1, max_length=200),
     limit: int = Query(20, ge=1, le=1000),
     year_from: int | None = Query(None, ge=1900, le=2100),
@@ -548,6 +555,7 @@ def search_combined(
     session: Session = Depends(get_session_dep),
 ) -> SearchResponse:
     """One-shot search: external sources merged with library results."""
+    response.headers["Cache-Control"] = "no-store"
     q = q.strip()
     if not q:
         return SearchResponse(query="", results=[], warnings=[])
@@ -762,12 +770,14 @@ def _excerpt(text: str, q: str, *, width: int = 280) -> str:
 
 @router.get("/search/semantic", response_model=SemanticSearchResponse)
 def search_semantic(
+    response: Response,
     q: str = Query("", min_length=0, max_length=500),
     limit: int = Query(10, ge=1, le=100),
     correct: bool = Query(True),
     session: Session = Depends(get_session_dep),
 ) -> SemanticSearchResponse:
     """Full-text semantic search over embedded chunks."""
+    response.headers["Cache-Control"] = "no-store"
     q = q.strip()
     if not q:
         return SemanticSearchResponse(query="", results=[])
