@@ -15,6 +15,10 @@ class HealthResponse(BaseModel):
     db: str
     mineru: str
     remote: bool = False  # institutional SSH download configured
+    # Optional cache telemetry. Populated only when the request includes
+    # ``?debug=1`` so the default probe stays cheap. The shape is the
+    # return of ``AppCache.stats()`` — see ``docs/caching.md``.
+    cache: dict | None = None
 
 
 # -------- Papers --------
@@ -55,6 +59,10 @@ class PaperSummary(BaseModel):
     doi: str | None = None
     arxiv_id: str | None = None
     s2_paper_id: str | None = None
+    # Layer 1 list ETag source. ``updated_at`` is bumped on every user
+    # mutation (favorite, notes, tag, etc.) and on the periodic sync, so
+    # the max across the page is a precise cache-busting fingerprint.
+    updated_at: datetime | None = None
 
 
 class PaperDetail(PaperSummary):
@@ -669,20 +677,32 @@ class TopicsRequest(BaseModel):
     If ``paper_id`` is given, only that paper is classified; otherwise up to
     ``limit`` in-library papers with no topics are processed. ``force=True``
     reclassifies, replacing that paper's existing topic assignments.
+
+    Default runs in the background (one Job/paper) so the request returns
+    immediately — each LLM call takes 5-15s and a batch can be up to 200
+    papers, which would otherwise hold the uvicorn worker for minutes and
+    trip upstream proxy timeouts. Set ``background=False`` to block inline
+    (useful for tests and one-off curl scripts that want a single
+    round-trip).
     """
 
     paper_id: str | None = None
     limit: int = 20
-    background: bool = False
+    background: bool = True
     force: bool = False
 
 
 class AuthorsBackfillRequest(BaseModel):
-    """Trigger OpenAlex author-ID resolution for one paper or a batch."""
+    """Trigger OpenAlex author-ID resolution for one paper or a batch.
+
+    Default runs in the background (one Job/paper) so the request returns
+    immediately. Set ``background=False`` to block inline until the
+    OpenAlex author lookup finishes — useful for tests and one-off curls.
+    """
 
     paper_id: str | None = None
     limit: int = 100
-    background: bool = False
+    background: bool = True
 
 
 class PaperExtractRequest(BaseModel):

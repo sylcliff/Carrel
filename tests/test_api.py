@@ -71,6 +71,90 @@ def test_paper_detail_404(client):
     assert client.get("/papers/nope").status_code == 404
 
 
+def test_paper_detail_etag_and_304(client, session):
+    """Layer 1: GET /papers/{id} returns ETag + Cache-Control; re-request with
+    If-None-Match returns 304 Not Modified with empty body."""
+    session.add(Paper(
+        id="W-Etag-Test", id_kind="openalex",
+        title="ETag test", venue=None, status="pending", oa_status="closed",
+        source="openalex",
+        authors=[{"name": "A", "openalex_author_id": "", "affiliation": None}],
+        in_library=True,
+        created_at=datetime(2026, 8, 28, tzinfo=UTC),
+        updated_at=datetime(2026, 8, 28, 0, 0, 0, tzinfo=UTC),
+    ))
+    session.commit()
+
+    # First request: 200 with ETag.
+    r1 = client.get("/papers/W-Etag-Test")
+    assert r1.status_code == 200
+    etag = r1.headers.get("etag")
+    assert etag is not None
+    assert etag.startswith('W/"')
+    assert "private" in r1.headers.get("cache-control", "")
+
+    # Same ETag re-requested: 304 Not Modified, empty body.
+    r2 = client.get("/papers/W-Etag-Test", headers={"If-None-Match": etag})
+    assert r2.status_code == 304
+    assert r2.headers.get("etag") == etag
+    assert r2.content == b""
+
+    # After row is mutated, the ETag must change and a stale request 200s.
+    # The test mutates the row directly (bypassing the L2 invalidation
+    # hooks), so we reset the L2 cache here. The production flow goes
+    # through a write endpoint that calls ``invalidate_paper_mutated``;
+    # this reset is the test-only equivalent.
+    from carrel.api._app_cache import reset_cache_for_tests
+
+    paper = session.get(Paper, "W-Etag-Test")
+    paper.updated_at = datetime(2026, 8, 28, 0, 0, 1, tzinfo=UTC)
+    session.add(paper)
+    session.commit()
+    reset_cache_for_tests()
+
+    r3 = client.get("/papers/W-Etag-Test", headers={"If-None-Match": etag})
+    assert r3.status_code == 200
+    new_etag = r3.headers.get("etag")
+    assert new_etag != etag
+
+
+def test_health_default_omits_cache_stats(client):
+    """The default /health probe must stay cheap — no cache stats."""
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert "cache" not in r.json() or r.json().get("cache") is None
+
+
+def test_health_debug_returns_cache_stats(client):
+    """?debug=1 surfaces AppCache.stats() so operators can inspect L2."""
+    from carrel.api._app_cache import get_cache
+
+    # Drive the L2 cache to ensure it has at least one entry.
+    client.get("/papers?limit=10&offset=0")
+    cache = get_cache()
+
+    r = client.get("/health?debug=1")
+    assert r.status_code == 200
+    body = r.json()
+    assert "cache" in body
+    stats = body["cache"]
+    # The exact keys come from AppCache.stats(); assert the shape.
+    assert set(stats.keys()) == {
+        "size",
+        "maxsize",
+        "tags",
+        "hits",
+        "misses",
+        "invalidations",
+        "last_status",
+    }
+    assert stats["maxsize"] == 512
+    assert stats["size"] >= 1
+    # The list_papers call above just landed, so the decorator should
+    # have flipped last_status to either HIT (re-read) or MISS (first).
+    assert stats["last_status"] in {"HIT", "MISS"}
+
+
 def test_sync_inline_runs_pipeline(client, session):
     from carrel.sources.arxiv import ArxivEntry
 
