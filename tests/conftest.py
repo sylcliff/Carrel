@@ -68,6 +68,14 @@ def client(session: Session):
 
     app.dependency_overrides[get_session_dep] = _override_session
     # lifespan creates tables (idempotent) and storage dirs.
+    # The L2 cache (AppCache) is a process-wide singleton; reset it
+    # between tests so the @cached helpers don't return stale results
+    # when a test mutates a row directly (bypassing the invalidation
+    # hooks). Phase 3 added this fixture.
+    from carrel.api._app_cache import reset_cache_for_tests
+
+    reset_cache_for_tests()
     with TestClient(app) as c:
         yield c
+    reset_cache_for_tests()
     app.dependency_overrides.clear()
