@@ -640,6 +640,87 @@ export const saveNotes = (id: string, notes_markdown: string) =>
     { method: "PUT", body: JSON.stringify({ notes_markdown }) },
   );
 
+// ---- Paper card (LLM-extracted structured summary) ----
+
+export type PaperType =
+  | "research"
+  | "survey"
+  | "benchmark"
+  | "system"
+  | "position"
+  | "case_study"
+  | "other";
+
+export interface ResultClaim {
+  claim: string;
+  value?: number | null;
+  unit?: string | null;
+  dataset?: string | null;
+  baseline_value?: number | null;
+  baseline_label?: string | null;
+}
+
+export interface PaperCard {
+  research_question?: string | null;
+  motivation?: string | null;
+  hypothesis?: string | null;
+  method_name?: string | null;
+  method_summary?: string | null;
+  key_techniques?: string[];
+  datasets?: string[];
+  baselines?: string[];
+  code_url?: string | null;
+  model_urls?: string[];
+  main_results?: ResultClaim[];
+  metrics?: string[];
+  conclusion?: string | null;
+  limitations?: string[];
+  future_work?: string[];
+  paper_type?: PaperType;
+  confidence?: number;
+}
+
+// ETag-aware fetch that distinguishes "no card yet" (204) from "card
+// present" (200). Returns null for 204 so the UI can render the empty
+// state without a separate "is this an error?" branch.
+export const getPaperCard = async (id: string): Promise<PaperCard | null> => {
+  const key = cacheKey(`/papers/${encodeURIComponent(id)}/card`);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const etag = etagRegistry.get(key);
+  if (etag !== undefined) headers["If-None-Match"] = etag;
+
+  const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(id)}/card`, {
+    headers,
+  });
+  if (res.status === 304) {
+    const cached = bodyCache.get(key) as PaperCard | null | undefined;
+    return cached ?? null;
+  }
+  if (res.status === 204) {
+    bodyCache.set(key, null);
+    etagRegistry.delete(key);
+    return null;
+  }
+  if (!res.ok) {
+    bodyCache.delete(key);
+    etagRegistry.delete(key);
+    const text = await res.text().catch(() => res.statusText);
+    throw new APIError(res.status, text || res.statusText);
+  }
+  const body = (await res.json()) as PaperCard;
+  bodyCache.set(key, body);
+  const newEtag = res.headers.get("etag");
+  if (newEtag !== null) etagRegistry.set(key, newEtag);
+  else etagRegistry.delete(key);
+  return body;
+};
+
+export const extractPaperCard = (id: string, force = false) =>
+  request<PaperCard>(
+    `/papers/${encodeURIComponent(id)}/card/extract`,
+    { method: "POST", body: JSON.stringify({ force }) },
+  );
+
 export const listPaperTags = (id: string) =>
   request<Tag[]>(`/papers/${encodeURIComponent(id)}/tags`);
 

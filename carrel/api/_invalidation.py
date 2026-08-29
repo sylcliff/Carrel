@@ -53,6 +53,8 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
       we fire the per-id invalidation to keep the detail page fresh.
     - ``"citations"`` — citations were refreshed; redundant with the
       targeted :func:`invalidate_citations_refreshed` but harmless.
+    - ``"card"`` — paper card (re-)extracted. Drops the per-paper card
+      cache entry and the global card tag so a re-read rebuilds.
 
     When ``paper_id`` is None or ``"*"``, only the list tags are
     invalidated (no per-id exact drop, because we don't know the id —
@@ -66,7 +68,7 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
         cache.invalidate_exact(f"paper:{paper_id}:citations")
         cache.invalidate_exact(f"paper:{paper_id}:references")
         cache.invalidate_exact(f"paper:{paper_id}:tags")
-    # List-style fan-out.
+    # Tag-based fan-out.
     tags = set(_PAPER_LIST_TAGS)
     if "tags" in mutate or "deleted" in mutate:
         tags.add("tags")
@@ -74,6 +76,12 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
         tags.add("topics")
     if "favorite" in mutate or "deleted" in mutate:
         tags.add("scholars_list")
+    if "card" in mutate:
+        # The per-paper card route tags itself with `paper:card`; fan
+        # out the tag (dropping every card entry) so the next read
+        # rebuilds. Cards are small and rarely read in bulk, so a tag
+        # sweep is cheaper than maintaining a per-id exact key.
+        tags.add("paper:card")
     if tags:
         cache.invalidate_tags(*tags)
 

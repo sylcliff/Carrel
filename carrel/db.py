@@ -79,6 +79,9 @@ def init_db(engine: Engine) -> None:
         "journal_doi": "VARCHAR(255)",
         "pdf_files": "JSON",
         "published_checked_at": "TIMESTAMP",
+        # Structured paper card (LLM extraction, optional).
+        "paper_card": "JSON",
+        "paper_card_extracted_at": "TIMESTAMP",
     })
     _ensure_columns(engine, "wiki_pages", {
         # Wiki identity decoupling (M-reconcile): see carrel/pipeline/wiki/_entities.py

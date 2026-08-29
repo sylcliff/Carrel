@@ -232,6 +232,15 @@ class Paper(SQLModel, table=True):
     summary_zh: str | None = None
     keywords: list[str] | None = Field(default=None, sa_column=Column(JSON))
 
+    # Structured paper card (LLM-extracted). Stored as JSON so the schema
+    # can evolve without further migrations. ``paper_card_extracted_at`` is
+    # the staleness signal — same role ``updated_at`` plays for the
+    # concepts/questions extraction (see carrel/pipeline/paper_extract).
+    paper_card: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+    paper_card_extracted_at: datetime | None = Field(
+        default=None, sa_column=Column(DateTime(timezone=True))
+    )
+
     # Raw OpenAlex JSON for debugging / future enrichment
     raw_meta: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
 

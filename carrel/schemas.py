@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -718,6 +719,86 @@ class PaperExtractRequest(BaseModel):
     background: bool = False
     force: bool = False
     deep: bool = False
+
+
+# -------- Paper card (M-style structured extraction) --------
+
+
+class PaperTypeEnum(str, Enum):
+    """One of the common paper archetypes. Drives how the card is rendered
+    and (eventually) which domain extension gets applied."""
+
+    research = "research"        # original empirical / theoretical work
+    survey = "survey"            # review of a field
+    benchmark = "benchmark"      # introduces a dataset or benchmark
+    system = "system"            # describes a software / hardware system
+    position = "position"        # opinion / commentary
+    case_study = "case_study"    # single-case deep dive
+    other = "other"
+
+
+class ResultClaim(BaseModel):
+    """One quantitative claim pulled from the paper.
+
+    All fields except ``claim`` are optional — the LLM doesn't always return
+    parseable numbers, and the display string is what matters most.
+    """
+
+    claim: str
+    value: float | None = None
+    unit: str | None = None
+    dataset: str | None = None
+    baseline_value: float | None = None
+    baseline_label: str | None = None
+
+
+class PaperCardOut(BaseModel):
+    """Structured extraction of a paper's core facts.
+
+    The full card is stored as JSON on ``papers.paper_card``; this schema is
+    the public-API shape. All fields except ``paper_type`` are nullable — the
+    LLM is asked to leave a field empty rather than invent. ``confidence``
+    is the model's self-rating of how grounded its output is (0..1).
+    """
+
+    # 1. Why this paper exists
+    research_question: str | None = None
+    motivation: str | None = None
+    hypothesis: str | None = None
+
+    # 2. What they did
+    method_name: str | None = None
+    method_summary: str | None = None
+    key_techniques: list[str] = Field(default_factory=list)
+
+    # 3. What they used
+    datasets: list[str] = Field(default_factory=list)
+    baselines: list[str] = Field(default_factory=list)
+    code_url: str | None = None
+    model_urls: list[str] = Field(default_factory=list)
+
+    # 4. What they found
+    main_results: list[ResultClaim] = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+
+    # 5. So what
+    conclusion: str | None = None
+    limitations: list[str] = Field(default_factory=list)
+    future_work: list[str] = Field(default_factory=list)
+
+    # 6. Provenance
+    paper_type: PaperTypeEnum = PaperTypeEnum.research
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class PaperCardExtractRequest(BaseModel):
+    """POST /papers/{id}/card/extract body. Single-paper only by design:
+    one LLM call per paper, 5-15s blocking, no batch endpoint."""
+
+    force: bool = Field(
+        default=False,
+        description="Re-run even if a card already exists for this paper.",
+    )
 
 
 # -------- Search (M5) full-text --------

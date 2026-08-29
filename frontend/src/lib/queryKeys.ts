@@ -44,6 +44,7 @@ export const queryKeys = {
   paperReferences: (id: string, sort: "year_asc" | "year_desc") =>
     ["paper", id, "references", sort] as const,
   paperTags: (id: string) => ["paper", id, "tags"] as const,
+  paperCard: (id: string) => ["paper", id, "card"] as const,
 
   // Aggregations — these rarely change; their mutations invalidate
   // explicitly so we can pin staleTime: Infinity on the consumer.

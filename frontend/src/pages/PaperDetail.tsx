@@ -7,6 +7,7 @@ import MarkdownReader from "@/components/MarkdownReader";
 import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
+import PaperCardView from "@/components/PaperCard";
 import { topicColorClass } from "@/lib/topicColor";
 import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
 import { queryKeys } from "@/lib/queryKeys";
@@ -342,7 +343,8 @@ export default function PaperDetail({ onProcessed }: Props) {
   return (
     <main className="w-full space-y-6 px-6 py-8 xl:px-0">
       <div className="grid gap-6 xl:gap-4 xl:grid-cols-[max(24rem,calc((100vw-98rem)/2))_minmax(0,1fr)_max(24rem,calc((100vw-98rem)/2))]">
-        <aside className="min-w-0 xl:col-start-1 xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto">
+        <aside className="min-w-0 xl:col-start-1 xl:sticky xl:top-4 xl:self-start xl:max-h-[calc(100vh-2rem)] xl:overflow-y-auto space-y-4">
+          <PaperCardView paperId={p.id} hasMarkdown={Boolean(p.md_path)} />
           <NotesCard paperId={p.id} initialMarkdown={p.notes_markdown} />
         </aside>
 
