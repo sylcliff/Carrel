@@ -29,8 +29,8 @@ from carrel.api.search import _cosine, _decode_embedding
 from carrel.db import get_session_dep
 from carrel.api._invalidation import invalidate_paper_mutated
 from carrel.models import ChatMessage, Chunk, Paper
-from carrel.pipeline.summarize import _prepare_body
 from carrel.pipeline._llm_recorder import make_record_usage_callback
+from carrel.pipeline._section_picker import prepare_picker_input
 from carrel.schemas import (
     ChatMessageOut,
     ChatMessagesIn as ChatHistoryIn,
@@ -99,15 +99,25 @@ def _retrieve_chunks(
                 block, sources = _format_chunks(hits)
                 return block, sources
 
-    # Fallback: truncated full text.
+    # Fallback: section-picker-sliced context.
+    # When the paper has no usable embeddings, we still want the chat LLM
+    # to see *some* paper content.  The picker drops references /
+    # acknowledgments / supplementary and fills the budget with the
+    # method / results / conclusion blocks (rendered with section
+    # labels) so the answer LLM can ground each fact to a specific
+    # section — same UX as the embedding path, just via a different
+    # retrieval mechanism.
     if not paper.md_path:
         raise HTTPException(status_code=409, detail="paper has no parsed markdown yet")
     full = Path(_storage_root()) / paper.md_path
     if not full.exists():
         raise HTTPException(status_code=409, detail=f"parsed markdown missing on disk: {full}")
-    body = _prepare_body(full.read_text(encoding="utf-8", errors="replace"), _chat_fulltext_chars())
+    body = prepare_picker_input(
+        full.read_text(encoding="utf-8", errors="replace"),
+        budget_chars=_chat_fulltext_chars(),
+    )
     header = f"Title: {paper.title}\nAuthors: {_authors(paper)}"
-    return f"{header}\n\n{body}", ["full text (truncated)"]
+    return f"{header}\n\n{body}", ["full text (section-picker)"]
 
 
 def _rank_postgres(

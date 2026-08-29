@@ -22,7 +22,14 @@ from carrel.models import (
     Tag,
     Topic,
 )
-from carrel.schemas import AuthorRef, PaperDetail, PaperSummary
+from carrel.chunking import split_by_heading
+from carrel.schemas import (
+    AuthorRef,
+    PaperDetail,
+    PaperSections,
+    PaperSummary,
+    SectionOut,
+)
 from carrel.sources.normalize import format_journal_citation
 from carrel.api._app_cache import cached
 from carrel.api._invalidation import invalidate_paper_mutated, invalidate_bulk_import_done
@@ -553,6 +560,85 @@ def get_paper_markdown(
     request sees a new ETag.
     """
     body, updated_at = _get_paper_markdown_body(paper_id, session)
+    etag = etag_for_updated_at(
+        updated_at, extra=(body["id"], body.get("md_path") or "")
+    )
+    if etag is not None and if_none_match_matches(request, etag):
+        return Response(  # type: ignore[return-value]
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, max-age=600, stale-while-revalidate=86400"},
+        )
+    if etag is not None:
+        apply_etag_headers(
+            response, etag, max_age=600, stale_while_revalidate=86400,
+        )
+    return body
+
+
+@cached("paper_sections", key_params=("paper_id",), tags=("paper", "paper:sections", "papers_list"))
+def _get_paper_sections_body(
+    paper_id: str, session: Session
+) -> tuple[dict[str, object], datetime | None]:
+    """Cached ((id, sections, md_path), updated_at) tuple.
+
+    Splits the parsed Markdown by ATX heading into ``(heading_path, body)``
+    pairs in document order (see :func:`carrel.chunking.split_by_heading`).
+    404 / 409 are not cached. Same cache contract as the markdown
+    endpoint: the body is large and immutable once parsed, so the L1
+    layer gives it a 10-minute ``max-age`` and 24-hour SWR. Re-parse
+    invalidates the per-id exact drop through
+    ``invalidate_paper_mutated(paper_id, mutate={"parse"})``.
+    """
+    p = session.get(Paper, paper_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="paper not found")
+    if p.md_path is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"paper not parsed yet (status={p.status})",
+        )
+
+    sections: list[SectionOut] = []
+    full = Path(cfg_storage_root()) / p.md_path
+    if full.exists():
+        md = full.read_text(encoding="utf-8")
+        for i, (heading, body) in enumerate(split_by_heading(md)):
+            leaf = heading.split(" / ")[-1] if heading else ""
+            sections.append(
+                SectionOut(
+                    index=i,
+                    heading=leaf,
+                    heading_path=heading,
+                    body=body,
+                    char_count=len(body),
+                )
+            )
+    return (
+        PaperSections(
+            id=p.id,
+            sections=sections,
+            md_path=p.md_path,
+        ).model_dump(mode="json"),
+        p.updated_at,
+    )
+
+
+@router.get("/{paper_id}/sections")
+def get_paper_sections(
+    paper_id: str,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session_dep),
+) -> dict[str, object]:
+    """Return the parsed paper split by heading, in document order.
+
+    Mirrors the cache contract of ``GET /{paper_id}/markdown``: L2
+    ``@cached`` (route id ``paper_sections``) and L1 ETag derived from
+    the paper row's ``updated_at`` plus ``md_path``. Body is large and
+    immutable once parsed, so we ship the same
+    ``max-age=600, stale-while-revalidate=86400`` headers.
+    """
+    body, updated_at = _get_paper_sections_body(paper_id, session)
     etag = etag_for_updated_at(
         updated_at, extra=(body["id"], body.get("md_path") or "")
     )

@@ -16,7 +16,7 @@
 | 幂等/去重状态 | `paper_agent/core/state.py` | `seen.json` 的 `filter_unseen`/`save_seen` 思路、`normalize_paper_id`(剥 arXiv 前缀) | 我们用数据库唯一约束替代文件,但思路保留 |
 | Pipeline 编排 | `paper_agent/pipeline.py` | **编排顺序就是我们要的**:fetch → lookback 过滤 → 去重 → 生成摘要 → 写本地 → 持久化 seen。日志字段设计也值得抄 | 它的 bandit/linucb/autotune 推荐策略**全部不要**(我们砍了推荐);它写 markdown 笔记文件,我们写数据库 + 调 MinerU |
 | 数据模型 | `paper_agent/core/models.py` | `Paper` dataclass 的字段取舍(id/title/summary/authors/categories/updated/link_abs/link_pdf) | 我们字段更多(OpenAlex ID、doi、venue、oa_status、状态机),用 SQLAlchemy/SQLModel |
-| LLM 摘要 | `paper_agent/core/summarize.py` | **prompt 模板的结构化思路**(分节、"信息不足就明说"防幻觉)、失败不阻塞主流程、`temperature=0.2` | 它只调 OpenAI,我们用 `litellm` 统一接 DeepSeek + 火山;它只生成英文研究总结,我们要中英 TL;DR + 中文摘要;它只基于摘要,我们 M4 先用摘要,M5 后可基于全文 |
+| LLM 摘要 | `paper_agent/core/summarize.py` | **prompt 模板的结构化思路**(分节、"信息不足就明说"防幻觉)、失败不阻塞主流程、`temperature=0.2` | 它只调 OpenAI,我们用 `litellm` 统一接 DeepSeek + 火山;它只生成英文研究总结,我们要中英 TL;DR + 中文摘要;我们用 section-picker 切片的 parsed md(见 `carrel/pipeline/_section_picker.py`)作为 LLM 输入,不是头 N 字符的简单截断 |
 | 配置 | `config.example.yaml` + `paper_agent/core/config.py` | YAML 单文件配置 + pydantic 校验的模式 | 我们的订阅结构更丰富(关键词/作者/期刊/arXiv 分类分开) |
 | BibTeX/RIS 导出 | `paper_agent/export/bibtex_ris.py` | 二期可抄,导出逻辑 | MVP 不做 |
 
@@ -254,7 +254,7 @@ stats JSONB               # {fetched, new, downloaded, parsed, summarized, faile
 4. 为每条 pending 入后台处理队列(进程内 BackgroundTasks / 简单 worker 循环):
    - `pdf_download`:按 `pdf_url`(OpenAlex best_oa_location → arXiv PDF)下载;无则标记 closed(停在 pending,仅题录可见)。
    - `mineru_client`:POST PDF 给 MinerU,拿回 md+图片,落盘,状态→parsed。
-   - `llm.summarize`:基于 abstract(M4)生成 tldr_en/tldr_zh/summary_zh/keywords;状态→summarized。
+   - `llm.summarize`:基于 section-picker 切片的 parsed md(见 `carrel/pipeline/_section_picker.py`)生成 tldr_en/tldr_zh/summary_zh/keywords;状态→summarized。
    - `chunking` + `embeddings`:读 paper.md 切块,调 Ark embedding,写 chunks;状态→ready。
 5. 更新 `jobs.stats`。
 

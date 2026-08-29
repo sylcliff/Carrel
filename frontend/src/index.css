@@ -128,3 +128,64 @@
     @apply my-4 overflow-x-auto;
   }
 }
+
+/* Sectioned Full-text view (one .paper-section per heading) */
+@layer components {
+  .paper-sectioned {
+    @apply space-y-8;
+  }
+
+  .paper-section {
+    /* Subtle separator so adjacent sections read as distinct even when
+       the document's own headings are sparse. */
+    @apply scroll-mt-24 border-t border-border/60 pt-6;
+  }
+  .paper-section:first-of-type {
+    @apply border-t-0 pt-0;
+  }
+
+  .paper-section__header {
+    @apply mb-4 flex flex-col gap-1;
+  }
+  .paper-section__eyebrow {
+    /* `§ N` badge — anchors the visual rhythm the TOC advertises. */
+    @apply font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground;
+  }
+  .paper-section__title {
+    @apply text-xl font-semibold leading-tight;
+  }
+  .paper-section__crumb {
+    @apply text-xs text-muted-foreground;
+  }
+
+  .paper-section-toc {
+    @apply mb-8 rounded-md border border-border/60 bg-muted/30 p-3;
+  }
+  .paper-section-toc__summary {
+    @apply cursor-pointer text-xs font-semibold uppercase tracking-wider text-muted-foreground;
+  }
+  .paper-section-toc__list {
+    @apply mt-2 space-y-1;
+  }
+  .paper-section-toc__item {
+    @apply list-none;
+  }
+  .paper-section-toc__item[data-depth="2"] .paper-section-toc__label {
+    @apply pl-3;
+  }
+  .paper-section-toc__item[data-depth="3"] .paper-section-toc__label {
+    @apply pl-6;
+  }
+  .paper-section-toc__item[data-depth="4"] .paper-section-toc__label {
+    @apply pl-9;
+  }
+  .paper-section-toc__link {
+    @apply flex items-baseline gap-2 rounded px-1 py-0.5 text-sm hover:bg-muted;
+  }
+  .paper-section-toc__num {
+    @apply shrink-0 font-mono text-[10px] text-muted-foreground;
+  }
+  .paper-section-toc__label {
+    @apply truncate;
+  }
+}

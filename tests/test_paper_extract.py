@@ -62,6 +62,20 @@ def app_storage_root(client, tmp_path):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _wire_app_engine(session, monkeypatch):
+    """Point ``carrel.db.app_engine`` at the test session's engine.
+
+    ``prompts_runtime.get_user_template`` / ``get_system`` open their
+    own :class:`Session` via :func:`carrel.db.get_app_engine` when no
+    session is passed in; we need that engine to be the test engine
+    so the resolver finds (or doesn't find) overrides consistently.
+    The conftest's ``session`` fixture is the source of truth.
+    """
+    import carrel.db as _db
+    _db.app_engine = session.get_bind()
+
+
 _DEFAULT_MD = (
     "# Introduction\n\n"
     "We study retrieval-augmented generation for grounded answers.\n\n"
@@ -315,34 +329,58 @@ def test_missing_md_raises(session, cfg, monkeypatch):
         pe.extract_paper(session, cfg, "W1")
 
 
-def test_deep_pick_widens_section_window(session, cfg, monkeypatch):
-    """``deep=True`` widens the head/tail slice; non-deep stops at 2/2."""
-    md = "\n\n".join(f"# Section {i}\n\nBody for section {i}." for i in range(8))
+def test_deep_doubles_budget(session, cfg, monkeypatch):
+    """``deep=True`` doubles the LLM-input budget so the picker keeps
+    more sections; non-deep uses ``cfg.llm.max_input_chars`` directly.
+
+    This is the migration from the old "5+5 head/tail vs 2+2" knob:
+    the picker no longer has a section count, so ``deep`` widens the
+    character budget instead, which the picker turns into more picked
+    sections.  Sections are large enough that the budget — not the
+    per-section cap — is the binding constraint, so any difference
+    between deep and shallow comes from the budget multiplier.
+    """
+    # 6 method-style sections, each ~600 chars of body.  Total ~3600.
+    # Picker priority is Method(1) → Results(2) → Conclusion(3) → Intro(4),
+    # so all 6 are priority 1 in document order.
+    section_body = "x" * 600
+    md = "\n\n".join(
+        f"# Methods {i}\n\n{section_body}" for i in range(6)
+    )
+    # Pin a small budget so the test exercises the cap, not the
+    # default cfg.llm.max_input_chars (12 000).
+    cfg.llm.max_input_chars = 1_500
     _write_paper(session, cfg.storage.root, md=md)
     captured: dict = {}
-
-    def _fake_split(md_text: str):
-        return [(f"Section {i}", f"Body for section {i}.") for i in range(8)]
 
     def _fake_chat(messages, **kw):
         for m in messages:
             if m["role"] == "user":
-                captured["body"] = m["content"]
+                captured.setdefault("bodies", []).append(m["content"])
         return _answer()
 
-    monkeypatch.setattr(pe.chunking, "split_by_heading", _fake_split)
     monkeypatch.setattr(pe.llm, "has_key_for", lambda model: True)
     monkeypatch.setattr(pe.llm, "chat_json", _fake_chat)
-    pe.extract_paper(session, cfg, "W1", deep=True)
-    deep_body = captured["body"]
-    assert "Section 0" in deep_body and "Section 7" in deep_body
-    assert "Section 4" in deep_body  # 5+5 reaches the middle for an 8-section paper
 
-    captured.clear()
+    pe.extract_paper(session, cfg, "W1", deep=True)
+    deep_body = captured["bodies"][-1]
+    # Count how many of the 6 Methods sections survived: a Methods
+    # block is "## [N] Method" so we just count "[N] Method" tokens.
+    deep_count = sum(1 for i in range(1, 50) if f"[{i}] Method" in deep_body)
+
+    captured["bodies"].clear()
     pe.extract_paper(session, cfg, "W1", force=True)
-    shallow_body = captured["body"]
-    assert "Section 0" in shallow_body and "Section 7" in shallow_body
-    assert "Section 4" not in shallow_body  # 2+2 only sees 0,1,6,7
+    shallow_body = captured["bodies"][-1]
+    shallow_count = sum(1 for i in range(1, 50) if f"[{i}] Method" in shallow_body)
+
+    # Deep budget is 2x shallow; per-section cap (4000) is the same,
+    # so deep must keep at least as many — and typically more —
+    # sections than shallow.
+    assert deep_count >= shallow_count >= 1
+    assert deep_count > shallow_count, (
+        f"deep should keep more sections than shallow; "
+        f"deep={deep_count} shallow={shallow_count}"
+    )
 
 
 def test_select_stale_picks_first_time_paper(session, cfg, monkeypatch):

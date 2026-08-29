@@ -580,6 +580,34 @@ export const getPaperMarkdown = (id: string) =>
     `/papers/${encodeURIComponent(id)}/markdown`
   );
 
+// One heading-delimited section of a parsed paper, returned in
+// document order by /papers/{id}/sections. `heading` is the leaf
+// segment (e.g. "Setup"); `heading_path` is the joined ancestor chain
+// (e.g. "Experiments / Setup"). `index` is the document-order index.
+export interface PaperSection {
+  index: number;
+  heading: string;
+  heading_path: string;
+  body: string;
+  char_count: number;
+}
+
+export interface PaperSectionsResponse {
+  id: string;
+  sections: PaperSection[];
+  md_path: string | null;
+}
+
+// ETag-aware fetch of the paper split into heading sections. Same
+// shape as /markdown but per-section so the frontend can render a TOC
+// and a stack of MarkdownReaders in document order. `requestCached`
+// keeps the L1 short-circuit so repeat reads don't pay a network
+// round-trip.
+export const getPaperSections = (id: string) =>
+  requestCached<PaperSectionsResponse>(
+    `/papers/${encodeURIComponent(id)}/sections`,
+  );
+
 // ---- Per-paper chat transcript (server-persisted) ----
 
 export interface ChatTurn {

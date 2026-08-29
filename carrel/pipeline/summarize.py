@@ -8,6 +8,15 @@ Reads the parsed Markdown at ``Paper.md_path``, asks an LLM for a bilingual
 one-line TL;DR, a 3-5 sentence Chinese abstract, and 5-8 keywords, then writes
 them to the ``tldr_en``/``tldr_zh``/``summary_zh``/``keywords`` columns.
 
+The body sent to the LLM is sliced by the section picker (see
+:mod:`carrel.pipeline._section_picker`): noise sections like references,
+acknowledgments, supplementary material, and appendices are dropped, and
+the budget is filled in priority order (Method → Results → Conclusion →
+Intro) so the summarizer has the actual method/result text in front of it,
+not the front matter.  The slice is rendered as numbered blocks
+(``## [1] Method``, ``## [2] Results``, …) so the model can attribute
+each fact to the right section.
+
 Design choices (see plan):
   * **Chained after parse** — :func:`carrel.pipeline.process.process_paper`
     calls :func:`summarize_paper` best-effort once MinerU succeeds.
@@ -37,6 +46,7 @@ from carrel import llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
 from carrel.pipeline._llm_recorder import make_record_usage_callback
+from carrel.pipeline._section_picker import prepare_picker_input
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +60,10 @@ ProgressCallback = Callable[[dict], None]
 
 # Fields this step is responsible for, in the order we apply them.
 _OUTPUT_FIELDS = ("tldr_en", "tldr_zh", "summary_zh", "keywords")
+
+# Hard cap per single section so a monster Results block can't eat the
+# whole summarizer budget.  Matches paper_card / paper_extract.
+_PER_SECTION_CAP = 4_000
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +86,10 @@ _SYSTEM_PROMPT = (
     "contribution, and conclusion.\n"
     "- keywords: 5-8 English technical keywords/phrases as a JSON array of "
     "strings, lowercase unless a proper noun.\n"
+    "- The paper text below is sliced by section type and numbered "
+    "(## [1] Method, ## [2] Results, …).  Prioritize the Method and "
+    "Results blocks when writing the summary; use the Conclusion block "
+    "to confirm the main claim.\n"
     "- Respond with ONLY a JSON object, no prose or markdown fences, of the "
     "form: "
     '{"tldr_en": "...", "tldr_zh": "...", "summary_zh": "...", '
@@ -84,8 +102,9 @@ _USER_TEMPLATE = (
     "Authors: {authors}\n"
     "Venue/date: {venue_date}\n\n"
     "Abstract:\n{abstract}\n\n"
-    "Paper text (parsed from PDF; may contain OCR noise; truncated):\n\n"
-    "{body}\n\n"
+    "Selected paper sections (parsed from PDF; may contain OCR noise; "
+    "references/acknowledgments/supplementary dropped):\n\n"
+    "{numbered_sections}\n\n"
     "Return the JSON object now, with no commentary."
 )
 
@@ -96,14 +115,14 @@ def _build_user_prompt(
     authors: str,
     venue_date: str,
     abstract: str,
-    body: str,
+    numbered_sections: str,
 ) -> str:
     return prompts_runtime.get_user_template("summarize", _USER_TEMPLATE).format(
         title=title,
         authors=authors or "unknown",
         venue_date=venue_date or "unknown",
         abstract=abstract or "",
-        body=body,
+        numbered_sections=numbered_sections,
     )
 
 
@@ -122,21 +141,21 @@ def _venue_date_string(paper: Paper) -> str:
 
 
 def _prepare_body(md: str, max_chars: int) -> str:
-    """Collapse image tags and trim the parsed Markdown before sending it.
+    """Slice the paper into a numbered, priority-budgeted block for the LLM.
 
-    MinerU output can contain many ``![]()`` image lines that waste tokens and
-    add no signal. We drop them, then take the first ``max_chars`` characters.
+    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
+    which drops references / acknowledgments / supplementary noise and
+    fills the budget with method → results → conclusion → intro.  The
+    result is rendered as ``## [N] <label>`` blocks in document order
+    so the summarizer can ground each fact to a specific section.
     """
-    kept: list[str] = []
-    for line in md.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("!"):
-            continue  # image markup
-        kept.append(line)
-    text = "\n".join(kept).strip()
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n…[truncated]"
-    return text
+    if not md or not md.strip():
+        return ""
+    return prepare_picker_input(
+        md,
+        budget_chars=max_chars,
+        per_section_cap=_PER_SECTION_CAP,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +225,7 @@ def summarize_paper(
                 authors=_authors_string(paper),
                 venue_date=_venue_date_string(paper),
                 abstract=paper.abstract or "",
-                body=body,
+                numbered_sections=body,
             ),
         },
     ]

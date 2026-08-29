@@ -278,7 +278,7 @@ def test_runtime_override_affects_llm_input(monkeypatch, session, tmp_path):
     session.add(PromptOverride(
         feature="summarize",
         system="OVERRIDE-SYS-MARKER",
-        user_template="OVERRIDE-USER {title}/{body}",
+        user_template="OVERRIDE-USER {title}/{numbered_sections}",
         updated_at=datetime.now(UTC),
     ))
     session.commit()

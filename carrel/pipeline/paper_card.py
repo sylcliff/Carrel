@@ -33,6 +33,7 @@ from carrel import llm, prompts_runtime
 from carrel.config import CarrelYAML
 from carrel.models import Paper
 from carrel.pipeline._llm_recorder import make_record_usage_callback
+from carrel.pipeline._section_picker import prepare_picker_input
 from carrel.schemas import PaperCardOut, PaperTypeEnum, ResultClaim
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,16 @@ class PaperCardError(Exception):
 
 ProgressCallback = Callable[[dict], None]
 
-# Cap on LLM input.  We send the first ~2 + last ~2 sections (≈ abstract +
-# intro + method + conclusion) — the same "head + tail" pick that
-# paper_extract uses, since the card fields all live in those bands.
+# Cap on LLM input.  The picker fills the budget with the highest-
+# priority sections (method → results → conclusion → intro) and drops
+# references / acknowledgments / supplementary / appendix / funding
+# boilerplate, so 8k is plenty when sections are short and tight enough
+# to fail gracefully on a paper with no recognisable headings.
 _MAX_INPUT_CHARS = 8_000
+# Hard cap per single section so a monster Results block can't eat the
+# whole budget.  The picker still gets the rest of the budget for the
+# next priority bucket.
+_PER_SECTION_CAP = 4_000
 _MIN_BODY_CHARS = 200
 
 
@@ -87,6 +94,12 @@ _SYSTEM_PROMPT = (
     "is (1.0 = every field directly stated; 0.3 = mostly inferred).\n"
     "- paper_type is one of: research | survey | benchmark | system | "
     "position | case_study | other. Default: research.\n"
+    "- The paper text below is sliced by section type and numbered "
+    "(## [1] Methods, ## [2] Results, …). Use the section label to "
+    "attribute each field to the right block: method_name / method_summary "
+    "/ key_techniques from the Method block, main_results / metrics from "
+    "the Results block, conclusion / limitations / future_work from the "
+    "Conclusion block.\n"
     "- Respond with ONLY the JSON object, no prose or markdown fences."
 )
 
@@ -96,8 +109,9 @@ _USER_TEMPLATE = (
     "Authors: {authors}\n"
     "Venue/date: {venue_date}\n\n"
     "Abstract:\n{abstract}\n\n"
-    "Paper text (parsed from PDF; may contain OCR noise; truncated):\n\n"
-    "{body}\n\n"
+    "Selected paper sections (parsed from PDF; may contain OCR noise; "
+    "references/acknowledgments/supplementary dropped):\n\n"
+    "{numbered_sections}\n\n"
     "Return the JSON object now."
 )
 
@@ -107,52 +121,22 @@ _USER_TEMPLATE = (
 # ---------------------------------------------------------------------------
 
 
-def _strip_image_lines(md: str) -> str:
-    """Drop lines that start with ``!`` (MinerU image markup)."""
-    return "\n".join(
-        line for line in md.splitlines() if not line.lstrip().startswith("!")
-    )
-
-
-def _pick_head_tail(md: str) -> str:
-    """Pick a head + tail window of the body for the LLM.
-
-    Mirrors :mod:`carrel.pipeline.paper_extract`: if the markdown has ATX
-    headings, take the first 2 + last 2 sections (with their headings so
-    the LLM sees the structure).  Otherwise fall back to first + last char
-    windows.
-    """
-    from carrel.chunking import split_by_heading
-
-    sections = split_by_heading(md)
-    if sections:
-        if len(sections) <= 4:
-            picked = sections
-        else:
-            picked = sections[:2] + sections[-2:]
-        parts: list[str] = []
-        for heading, body in picked:
-            if heading:
-                parts.append(f"## {heading}")
-            parts.append(body)
-        return "\n\n".join(parts).strip()
-
-    cleaned = md.strip()
-    if len(cleaned) <= 3_000:
-        return cleaned
-    head = cleaned[:1_500].rstrip()
-    tail = cleaned[-1_500:].lstrip()
-    return f"{head}\n\n…\n\n{tail}"
-
-
 def _prepare_body(md: str, max_chars: int) -> str:
+    """Slice the paper into a numbered, priority-budgeted block for the LLM.
+
+    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
+    which drops references / acknowledgments / supplementary noise and
+    fills the budget with method → results → conclusion → intro.  When
+    the picker finds no usable sections, the picker falls back to a
+    head+tail char window so the LLM still gets *some* context.
+    """
     if not md or not md.strip():
         return ""
-    md = _strip_image_lines(md)
-    body = _pick_head_tail(md)
-    if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n…[truncated]"
-    return body
+    return prepare_picker_input(
+        md,
+        budget_chars=max_chars,
+        per_section_cap=_PER_SECTION_CAP,
+    )
 
 
 def _authors_string(paper: Paper) -> str:
@@ -352,7 +336,7 @@ def extract_paper_card(
                 authors=_authors_string(paper) or "unknown",
                 venue_date=_venue_date_string(paper) or "unknown",
                 abstract=paper.abstract or "",
-                body=body,
+                numbered_sections=body,
             ),
         },
     ]

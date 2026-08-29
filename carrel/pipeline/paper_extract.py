@@ -5,10 +5,14 @@ concepts and open questions grounded in the paper's body.  The output is
 two flat tables — :class:`PaperConcept` and :class:`PaperQuestion` — that
 the concept/question wiki compilers aggregate and synthesize into pages.
 
-The extraction is intentionally narrow: 2+2 sections by default, 5+5 when
-``deep=True``.  The full body is not sent — the LLM call is the bottleneck
-and the gain from extra context is small once the abstract, introduction,
-and conclusion are included.
+The body is sliced by the section picker (see
+:mod:`carrel.pipeline._section_picker`): noise sections like references,
+acknowledgments, supplementary material, and appendices are dropped, the
+budget is filled in priority order (Method → Results → Conclusion →
+Intro), and the output is rendered in document order with each block
+labelled (## [1] Method, ## [2] Results, …) so the LLM can attribute
+each extraction to its source.  ``deep=True`` doubles the budget so a
+deeper scan reaches more sections; default uses ``cfg.llm.max_input_chars``.
 
 Design mirrors :mod:`carrel.pipeline.summarize` and :mod:`carrel.pipeline.topics`:
   * **Reuses** :func:`carrel.llm.chat_json` / same model config.
@@ -34,9 +38,10 @@ from typing import Any
 
 from sqlmodel import Session, func, select
 
-from carrel import chunking, llm, prompts_runtime, usage
+from carrel import llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperConcept, PaperQuestion, PaperStatus
+from carrel.pipeline._section_picker import prepare_picker_input
 
 logger = logging.getLogger(__name__)
 
@@ -47,18 +52,13 @@ class PaperExtractError(Exception):
 
 ProgressCallback = Callable[[dict], None]
 
-# Default section pick: first 2 + last 2.  MinerU preserves ATX headings
-# (see :func:`carrel.chunking.split_by_heading`); the abstract+intro+method
-#+conclusion sweep we want.
-_DEFAULT_HEAD = 2
-_DEFAULT_TAIL = 2
-_DEEP_HEAD = 5
-_DEEP_TAIL = 5
-# Fallback when the body has no headings: first/last chars windows.
-_FALLBACK_HEAD_CHARS = 1500
-_FALLBACK_TAIL_CHARS = 1500
-# Cap on LLM input (rough chars; not a token counter).
-_MAX_INPUT_CHARS = 8_000
+# ``deep=True`` widens the budget so the picker keeps more sections;
+# the default is whatever ``cfg.llm.max_input_chars`` is set to.
+_DEEP_BUDGET_MULTIPLIER = 2
+# Hard cap per single section so a monster Results block can't eat the
+# whole budget.  Matches paper_card's per-section cap.
+_PER_SECTION_CAP = 4_000
+# Don't waste an LLM call on near-empty bodies.
 _MIN_BODY_CHARS = 200
 
 
@@ -114,10 +114,25 @@ _SYSTEM_PROMPT = (
     "the paper says.\n"
     "- If the body is too short, corrupted, or not in English, still do "
     "your best from what is there.\n"
+    "- The paper text below is sliced by section type and numbered "
+    "(## [1] Methods, ## [2] Results, …). Use the section label to "
+    "attribute each extraction to the right block.\n"
     "- Respond with ONLY a JSON object, no prose or markdown fences, of "
     'the form: {"concepts": [{"term": "...", "category": "METHOD|THEORY|'
     'DATASET|DOMAIN|PHENOMENON", "aliases": ["..."], "quote": "..."}], '
     '"questions": [{"question": "...", "quote": "..."}]}'
+)
+
+
+_USER_TEMPLATE = (
+    "Title: {title}\n"
+    "Authors: {authors}\n"
+    "Venue/date: {venue_date}\n\n"
+    "Abstract:\n{abstract}\n\n"
+    "Selected paper sections (parsed from PDF; may contain OCR noise; "
+    "references/acknowledgments/supplementary dropped):\n\n"
+    "{numbered_sections}\n\n"
+    "Return the JSON object now."
 )
 
 
@@ -130,67 +145,34 @@ CONCEPT_CATEGORIES = frozenset({"METHOD", "THEORY", "DATASET", "DOMAIN", "PHENOM
 # ---------------------------------------------------------------------------
 
 
-def _strip_image_lines(md: str) -> str:
-    """Drop lines that start with ``!`` (MinerU image markup)."""
-    kept: list[str] = []
-    for line in md.splitlines():
-        if line.lstrip().startswith("!"):
-            continue
-        kept.append(line)
-    return "\n".join(kept)
+def _prepare_body(md: str, *, max_chars: int) -> str:
+    """Slice the paper into a numbered, priority-budgeted block for the LLM.
 
-
-def _pick_sections(md: str, *, head: int, tail: int) -> str:
-    """Pick ``head`` leading + ``tail`` trailing sections from a parsed paper.
-
-    Uses :func:`carrel.chunking.split_by_heading`; falls back to first/last
-    char windows when the body has no ATX headings. Each picked section
-    is rendered with its ``## heading`` prefix so the LLM can see the
-    structure (e.g. ``## Introduction`` before the introduction body).
-    Headings are always preserved — even when the body is short enough to
-    be returned whole — so the LLM knows which section each block came
-    from.
+    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
+    which drops references / acknowledgments / supplementary noise and
+    fills the budget with method → results → conclusion → intro.
     """
-    sections = chunking.split_by_heading(md)
-    if not sections:
-        return ""
-    if len(sections) <= head + tail:
-        picked = sections
-    else:
-        picked = sections[:head] + sections[-tail:]
-    parts: list[str] = []
-    for heading, body in picked:
-        if heading:
-            parts.append(f"## {heading}")
-        parts.append(body)
-    return "\n\n".join(parts).strip()
-
-
-def _pick_fallback(md: str) -> str:
-    """No headings at all: take first + last char windows of the body."""
-    cleaned = md.strip()
-    if len(cleaned) <= _FALLBACK_HEAD_CHARS + _FALLBACK_TAIL_CHARS:
-        return cleaned
-    head = cleaned[:_FALLBACK_HEAD_CHARS].rstrip()
-    tail = cleaned[-_FALLBACK_TAIL_CHARS:].lstrip()
-    return f"{head}\n\n…\n\n{tail}"
-
-
-def _prepare_body(md: str, *, head: int, tail: int, max_chars: int) -> str:
-    """Assemble the LLM input body.  Truncates with a marker."""
     if not md or not md.strip():
         return ""
-    md = _strip_image_lines(md)
-    has_headings = bool(chunking.split_by_heading(md)) and bool(
-        chunking.split_by_heading(md)[0][0]
+    return prepare_picker_input(
+        md,
+        budget_chars=max_chars,
+        per_section_cap=_PER_SECTION_CAP,
     )
-    if has_headings:
-        body = _pick_sections(md, head=head, tail=tail)
-    else:
-        body = _pick_fallback(md)
-    if len(body) > max_chars:
-        body = body[:max_chars].rstrip() + "\n…[truncated]"
-    return body
+
+
+def _authors_string(paper: Paper) -> str:
+    if not paper.authors:
+        return ""
+    names = [a.get("name", "") for a in paper.authors if isinstance(a, dict) and a.get("name")]
+    return ", ".join(names)
+
+
+def _venue_date_string(paper: Paper) -> str:
+    bits = [paper.venue or ""]
+    if paper.publication_date:
+        bits.append(str(paper.publication_date))
+    return " · ".join(b for b in bits if b)
 
 
 # ---------------------------------------------------------------------------
@@ -442,16 +424,26 @@ def extract_paper(
         _emit(detail="Body too short; skipping")
         return paper
 
-    head = _DEEP_HEAD if deep else _DEFAULT_HEAD
-    tail = _DEEP_TAIL if deep else _DEFAULT_TAIL
-    body = _prepare_body(md, head=head, tail=tail, max_chars=_MAX_INPUT_CHARS)
+    budget = cfg.llm.max_input_chars * (
+        _DEEP_BUDGET_MULTIPLIER if deep else 1
+    )
+    body = _prepare_body(md, max_chars=budget)
 
-    _emit(detail=f"Extracting concepts + questions (head={head}, tail={tail})…")
+    _emit(detail=f"Extracting concepts + questions (deep={deep}, budget={budget})…")
     try:
         data = llm.chat_json(
             [
                 {"role": "system", "content": prompts_runtime.get_system("extract", _SYSTEM_PROMPT)},
-                {"role": "user", "content": prompts_runtime.get_user_template("extract", "{body}").format(body=body)},
+                {
+                    "role": "user",
+                    "content": prompts_runtime.get_user_template("extract", _USER_TEMPLATE).format(
+                        title=paper.title,
+                        authors=_authors_string(paper) or "unknown",
+                        venue_date=_venue_date_string(paper) or "unknown",
+                        abstract=paper.abstract or "",
+                        numbered_sections=body,
+                    ),
+                },
             ],
             model=cfg.llm.summarize_model,
             fallback_model=cfg.llm.fallback_model,

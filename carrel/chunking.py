@@ -51,18 +51,22 @@ def split_by_heading(md: str) -> list[tuple[str, str]]:
     if preamble:
         out.append(("", [preamble]))
 
-    heading_stack: list[str] = []
+    # (level, title) so a new heading pops any siblings/cousins at the
+    # same or deeper level — the old positional-trim off-by-one
+    # produced bogus paths like "Experiments / Setup / Results" when
+    # two `###` siblings sat under the same `##`.
+    heading_stack: list[tuple[int, str]] = []
     for i, m in enumerate(matches):
         level = len(m.group(1))
         title = m.group(2).strip()
-        # Trim stack to this level
-        heading_stack = heading_stack[: level - 1]
-        heading_stack.append(title)
+        while heading_stack and heading_stack[-1][0] >= level:
+            heading_stack.pop()
+        heading_stack.append((level, title))
         body_start = m.end()
         body_end = matches[i + 1].start() if i + 1 < len(matches) else len(md)
         body = md[body_start:body_end].strip()
         if body:
-            out.append((" / ".join(heading_stack), [body]))
+            out.append((" / ".join(t for _, t in heading_stack), [body]))
 
     return [(h, "\n\n".join(parts)) for h, parts in out]
 

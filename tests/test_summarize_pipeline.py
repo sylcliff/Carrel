@@ -60,6 +60,20 @@ def _has_key(monkeypatch):
     monkeypatch.setattr(summ_pipe.llm, "has_key_for", lambda model: True)
 
 
+@pytest.fixture(autouse=True)
+def _wire_app_engine(session, monkeypatch):
+    """Point ``carrel.db.app_engine`` at the test session's engine.
+
+    ``prompts_runtime.get_system`` / ``get_user_template`` open their own
+    :class:`Session` via :func:`carrel.db.get_app_engine` when no session
+    is passed in; we need that engine to be the test engine so the
+    resolver finds (or doesn't find) overrides consistently.  Mirrors
+    the same fixture in ``test_paper_extract`` / ``test_paper_card``.
+    """
+    import carrel.db as _db
+    _db.app_engine = session.get_bind()
+
+
 def test_summarize_paper_happy_path(session, cfg: CarrelYAML, tmp_path, monkeypatch):
     cfg.storage.root = tmp_path / "data"
     p = _make_paper(session, md_path="papers/W1/paper.md")
@@ -247,3 +261,47 @@ def test_summarize_pending_batch_counts(session, cfg, tmp_path, monkeypatch):
     assert counts["candidates"] == 2
     assert counts["summarized"] == 2
     assert counts["failed"] == 0
+
+
+def test_summarize_uses_section_picker(session, cfg, tmp_path, monkeypatch):
+    """The body sent to the LLM is sliced by the section picker, not the
+    old ``text[:max_chars]`` head-only trim.
+
+    We give the paper a big Method section in the *middle* of the
+    document.  The head-only trim would have cut it off; the picker
+    recognises "## Methods" and keeps it under a small budget, so the
+    LLM sees ``## [1] Method`` instead of a leading References /
+    Acknowledgments block.
+    """
+    cfg.storage.root = tmp_path / "data"
+    cfg.llm.max_input_chars = 1_500
+    p = _make_paper(session, md_path="papers/W1/paper.md")
+    method = "We propose a new method. " * 80  # ~2_000 chars
+    md = (
+        "# References\n\n"
+        "[1] Foo, [2] Bar, [3] Baz. " * 100
+        + "\n\n# Methods\n\n"
+        + method
+        + "\n\n# Acknowledgments\n\n"
+        + "thanks " * 200
+    )
+    _write_md(cfg, p, md)
+
+    captured: dict = {}
+
+    def _chat(messages, **kwargs):
+        for m in messages:
+            if m["role"] == "user":
+                captured.setdefault("bodies", []).append(m["content"])
+        return _fake_llm()(messages, **kwargs)
+
+    monkeypatch.setattr(summ_pipe.llm, "chat_json", _chat)
+    summ_pipe.summarize_paper(session, cfg, p.id)
+
+    body = captured["bodies"][-1]
+    # The picker dropped References and Acknowledgments and emitted
+    # the Method block as a numbered section.  The old head-only
+    # trim would have shown the References / "[1] Foo" text first.
+    assert "## [1] Method" in body
+    assert "[1] Foo" not in body
+    assert "thanks" not in body

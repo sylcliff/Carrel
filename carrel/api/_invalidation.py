@@ -65,6 +65,7 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
     if paper_id and paper_id != "*":
         cache.invalidate_exact(f"paper:{paper_id}")
         cache.invalidate_exact(f"paper:{paper_id}:markdown")
+        cache.invalidate_exact(f"paper:{paper_id}:sections")
         cache.invalidate_exact(f"paper:{paper_id}:citations")
         cache.invalidate_exact(f"paper:{paper_id}:references")
         cache.invalidate_exact(f"paper:{paper_id}:tags")

@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
+import SectionedMarkdown from "@/components/SectionedMarkdown";
 import CitationsCard from "@/components/CitationsCard";
 import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
@@ -20,6 +21,7 @@ import {
   getJob,
   getPaper,
   getPaperMarkdown,
+  getPaperSections,
   listPaperTags,
   processPaper,
   removePaperTag,
@@ -27,6 +29,7 @@ import {
   toggleFavorite,
   type Job,
   type PaperDetail as PaperDetailT,
+  type PaperSectionsResponse,
   type Tag,
 } from "@/api/client";
 
@@ -81,6 +84,18 @@ export default function PaperDetail({ onProcessed }: Props) {
     enabled: Boolean(id) && Boolean(p?.md_path),
   });
   const md = markdownQuery.data?.body ?? null;
+
+  // Per-section split of the same markdown; surfaced in the Full-text
+  // card as a stack of one MarkdownReader per heading (in document
+  // order). Backend reuses the same ETag/L2 contract as /markdown, so
+  // staleTime: Infinity matches the flat fetch.
+  const sectionsQuery = useApiQueryWithFn<PaperSectionsResponse>({
+    key: id ? queryKeys.paperSections(id) : ["paper", "_missing_", "sections"],
+    queryFn: () => getPaperSections(id!),
+    staleTime: Infinity,
+    enabled: Boolean(id) && Boolean(p?.md_path),
+  });
+  const sections = sectionsQuery.data?.sections ?? null;
 
   const tagsQuery = useApiQueryWithFn<Tag[]>({
     key: id ? queryKeys.paperTags(id) : ["paper", "_missing_", "tags"],
@@ -193,6 +208,7 @@ export default function PaperDetail({ onProcessed }: Props) {
           }
           await paperQuery.refetch();
           await markdownQuery.refetch();
+          await sectionsQuery.refetch();
           onProcessed?.();
         }
       } catch (e) {
@@ -304,7 +320,12 @@ export default function PaperDetail({ onProcessed }: Props) {
   // A load() shim used by child cards (References / Citations) that want
   // to refresh the parent detail after a write.
   async function load() {
-    await Promise.all([paperQuery.refetch(), tagsQuery.refetch(), markdownQuery.refetch()]);
+    await Promise.all([
+      paperQuery.refetch(),
+      tagsQuery.refetch(),
+      markdownQuery.refetch(),
+      sectionsQuery.refetch(),
+    ]);
   }
 
   if (err && !p)
@@ -704,7 +725,11 @@ export default function PaperDetail({ onProcessed }: Props) {
               </CardHeader>
               {textOpen && (
                 <CardContent>
-                  <MarkdownReader body={md} mdPath={p.md_path} />
+                  {sections && sections.length > 0 ? (
+                    <SectionedMarkdown sections={sections} mdPath={p.md_path} />
+                  ) : (
+                    <MarkdownReader body={md} mdPath={p.md_path} />
+                  )}
                 </CardContent>
               )}
             </Card>

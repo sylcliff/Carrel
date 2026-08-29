@@ -94,6 +94,36 @@ class PaperDetail(PaperSummary):
     updated_at: datetime
 
 
+# -------- Parsed-paper sections (heading-split view) --------
+
+
+class SectionOut(BaseModel):
+    """One heading-delimited section of a parsed paper.
+
+    Returned in document order. ``heading`` is the leaf heading text;
+    ``heading_path`` is the full ancestor chain joined by " / " so the
+    UI can render breadcrumbs without re-parsing. ``body`` is the raw
+    Markdown under that heading (and any sub-headings, until the next
+    sibling of equal-or-higher level). For the preamble chunk (everything
+    before the first heading), both ``heading`` and ``heading_path`` are
+    the empty string and ``index`` is 0.
+    """
+
+    index: int
+    heading: str
+    heading_path: str
+    body: str
+    char_count: int
+
+
+class PaperSections(BaseModel):
+    """Sections payload for a parsed paper."""
+
+    id: str
+    sections: list[SectionOut]
+    md_path: str | None = None
+
+
 # -------- User annotations (favorites / notes / tags) --------
 
 

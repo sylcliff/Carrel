@@ -39,6 +39,7 @@ export const queryKeys = {
   // tag list. invalidateQueries({queryKey: ["paper", id]}) hits all of them.
   paper: (id: string) => ["paper", id] as const,
   paperMarkdown: (id: string) => ["paper", id, "markdown"] as const,
+  paperSections: (id: string) => ["paper", id, "sections"] as const,
   paperCitations: (id: string, p: CitationListParams) =>
     ["paper", id, "citations", p] as const,
   paperReferences: (id: string, sort: "year_asc" | "year_desc") =>
