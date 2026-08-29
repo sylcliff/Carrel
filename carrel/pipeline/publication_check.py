@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -436,41 +437,169 @@ def select_remote_candidates(session: Session, *, limit: int = 50) -> list[Paper
     return list(session.exec(stmt).all())
 
 
+def _has_remote_identifier(paper: Paper) -> bool:
+    """True if the paper has a usable identifier for the remote jump host.
+
+    The HTTP path can use ``pdf_url`` directly, but the institutional CLI needs
+    a DOI or arXiv id. We mirror :func:`carrel.pipeline.process._remote_identifier`
+    here so the batch layer can skip papers the remote can never serve (instead
+    of letting them churn through SSH and fail every time).
+    """
+    if paper.journal_doi and rd.normalize_doi(paper.journal_doi):
+        return True
+    if paper.doi and rd.normalize_doi(paper.doi):
+        return True
+    if paper.arxiv_id:
+        return True
+    return False
+
+
+def _classify_remote_failure(exc: BaseException) -> str:
+    """Bucket a download failure as 'permanent' or 'transient' for the retry pass.
+
+    The remote layer raises ``RemotePermanentError`` for bad identifiers /
+    malformed magic and ``RemoteTransientError`` for SSH/network/timeout. When
+    the failure is wrapped (e.g. the per-paper ``ProcessError`` raised from
+    ``_try_remote_download``), we follow ``__cause__`` to recover the original
+    classification.
+    """
+    if isinstance(exc, rd.RemotePermanentError):
+        return "permanent"
+    if isinstance(exc, rd.RemoteTransientError):
+        return "transient"
+    cause = getattr(exc, "__cause__", None)
+    if isinstance(cause, rd.RemotePermanentError):
+        return "permanent"
+    if isinstance(cause, rd.RemoteTransientError):
+        return "transient"
+    # Anything else (parse error, MinerU hiccup, generic ProcessError) — assume
+    # transient so the paper gets one more chance at the end of the batch.
+    return "transient"
+
+
 def fill_closed_papers(
     session: Session,
     cfg: CarrelYAML,
     *,
     limit: int = 50,
     on_progress: ProgressCallback | None = None,
+    retry_pass: bool = True,
+    retry_backoff_seconds: float = 3.0,
 ) -> dict[str, int]:
     """Try to download PDFs for closed papers (HTTP + institutional fallback).
 
     The remote fallback lives inside :func:`process_paper`; this just drives the
     batch. No-op (returns zeros) when the institutional host is not configured.
+
+    Robustness measures on top of the per-call retries inside
+    :mod:`carrel.sources.remote_downloader`:
+
+    * **Skip** — papers with no usable identifier for the remote host (e.g.
+      metadata-only rows with no DOI/arxiv_id) are *skipped*, not failed, so
+      they don't show up in the ``failed`` counter and don't waste an SSH
+      connection.
+    * **End-of-batch retry** — after the first sweep, papers that failed with
+      a *transient* error (SSH blip, jump host down, timeout, SFTP hiccup)
+      get one extra attempt. The whole batch sleeps ``retry_backoff_seconds``
+      first so the jump host has a moment to recover. Permanent errors
+      (rejected identifier, bad magic) are NOT retried; they would just fail
+      the same way and cost another connection.
+    * **Structured counts** — the returned dict now distinguishes
+      ``retried`` (attempts made in the second pass) and ``retried_ok``
+      (second-pass successes), in addition to the original
+      ``candidates/parsed/failed/skipped`` keys.
     """
     if not rd.is_configured():
-        return {"candidates": 0, "parsed": 0, "failed": 0, "skipped": 0, "reason": "remote not configured"}
+        return {
+            "candidates": 0, "parsed": 0, "failed": 0, "skipped": 0,
+            "retried": 0, "retried_ok": 0, "reason": "remote not configured",
+        }
 
     papers = select_remote_candidates(session, limit=limit)
-    counts = {"candidates": len(papers), "parsed": 0, "failed": 0, "skipped": 0}
+    counts: dict[str, int] = {
+        "candidates": len(papers), "parsed": 0, "failed": 0, "skipped": 0,
+        "retried": 0, "retried_ok": 0,
+    }
     total = len(papers)
 
-    for i, paper in enumerate(papers, start=1):
+    # Track the two failure buckets separately so the math is exact at the end
+    # and the retry pass only touches the transient ones.
+    transient_failures: list[Paper] = []
+    permanent_failures: list[Paper] = []
+
+    def _run_one(paper: Paper, idx: int, *, is_retry: bool) -> None:
+        """Try one paper. Records skip/failure into the shared buckets.
+
+        A successful call increments ``counts["parsed"]`` (and
+        ``counts["retried_ok"]`` if this was a retry attempt).
+        """
         title = paper.title
 
-        def _cb(progress: dict, idx: int = i) -> None:
+        def _cb(progress: dict) -> None:
             if on_progress is not None:
-                on_progress({**progress, "index": idx, "total": total, "title": title})
+                on_progress({
+                    **progress, "index": idx, "total": total,
+                    "title": title, "is_retry": is_retry,
+                })
+
+        # Defensive: the SQL filter already excluded these, but a race or a
+        # paper edited mid-batch could land here. Don't waste an SSH connection.
+        if not _has_remote_identifier(paper):
+            logger.info("remote fill skip %s: no remote identifier", paper.id)
+            counts["skipped"] += 1
+            return
 
         try:
             process_paper(session, cfg, paper.id, on_progress=_cb)
-            counts["parsed"] += 1
-        except Exception as e:  # noqa: BLE001 - recorded on paper.error
-            logger.info("remote fill failed for %s: %s", paper.id, e)
-            counts["failed"] += 1
+        except Exception as e:  # noqa: BLE001 - recorded on paper.error above
+            kind = _classify_remote_failure(e)
+            logger.info(
+                "remote fill %s failure for %s (%s): %s",
+                kind, paper.id, type(e).__name__, e,
+            )
+            if kind == "transient":
+                transient_failures.append(paper)
+            else:
+                permanent_failures.append(paper)
+            return
+
+        counts["parsed"] += 1
+        if is_retry:
+            counts["retried_ok"] += 1
+
+    # First pass — every candidate gets a fair shot.
+    for i, paper in enumerate(papers, start=1):
+        _run_one(paper, i, is_retry=False)
+
+    # End-of-batch retry pass: only the transient failures come back. A blanket
+    # jump-host hiccup usually clears in a few seconds, so we wait briefly
+    # before retrying. Capped at one round — if the second attempt also fails
+    # transiently, the jump host is genuinely down and another round just
+    # burns connections.
+    if retry_pass and transient_failures:
+        to_retry = transient_failures
+        transient_failures = []  # failures from the retry pass land in here fresh
+        counts["retried"] = len(to_retry)
+        if retry_backoff_seconds > 0:
+            logger.info(
+                "remote fill retry pass: %d papers after %.1fs backoff",
+                len(to_retry), retry_backoff_seconds,
+            )
+            time.sleep(retry_backoff_seconds)
+        for j, paper in enumerate(to_retry, start=1):
+            # Refresh so we see any state written by the failed first attempt
+            # (e.g. a partial download or a ``paper.error`` line).
+            session.refresh(paper)
+            _run_one(paper, total + j, is_retry=True)
+
+    # The invariant: every paper is in exactly one of {parsed, skipped, failed}
+    # where ``parsed`` includes the ``retried_ok`` subset.
+    counts["failed"] = len(transient_failures) + len(permanent_failures)
 
     logger.info(
-        "remote fill done: candidates=%d parsed=%d failed=%d",
+        "remote fill done: candidates=%d parsed=%d failed=%d skipped=%d "
+        "retried=%d retried_ok=%d",
         counts["candidates"], counts["parsed"], counts["failed"],
+        counts["skipped"], counts["retried"], counts["retried_ok"],
     )
     return counts

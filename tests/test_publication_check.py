@@ -310,3 +310,326 @@ def test_check_and_apply_idempotent_when_already_checked(
     out = pc.check_and_apply(session, cfg, p.id, force=False)
     assert out.journal_doi == "10.1/x"
     assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# fill_closed_papers: skip / end-of-batch retry
+# ---------------------------------------------------------------------------
+
+
+def _seed_remote_candidate(session, *, id: str, **kw) -> Paper:
+    """A paper that ``select_remote_candidates`` will pick up.
+
+    Defaults: in_library, no PDF, pending status, has a DOI. Override any of
+    these to test edge cases (e.g. pass ``doi=None, arxiv_id=None, journal_doi=None``
+    to get a paper that needs to be *skipped*).
+    """
+    base = dict(
+        id=id,
+        id_kind="doi",
+        title=f"Paper {id}",
+        status=PaperStatus.pending.value,
+        oa_status=None,
+        doi="10.1/test",
+        arxiv_id=None,
+        journal_doi=None,
+        pdf_url=None,
+        pdf_path=None,
+        in_library=True,
+        discarded=False,
+        created_at=NOW - timedelta(days=10),
+        updated_at=NOW,
+    )
+    base.update(kw)
+    p = Paper(**base)
+    session.add(p)
+    session.commit()
+    session.refresh(p)
+    return p
+
+
+def test_fill_closed_papers_returns_reason_when_not_configured(
+    session, cfg: CarrelYAML, monkeypatch
+):
+    from carrel.sources import remote_downloader as rd_mod
+
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: False)
+    out = pc.fill_closed_papers(session, cfg, limit=10)
+    assert out == {
+        "candidates": 0, "parsed": 0, "failed": 0, "skipped": 0,
+        "retried": 0, "retried_ok": 0, "reason": "remote not configured",
+    }
+
+
+def test_fill_closed_papers_skips_paper_with_no_remote_identifier(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """Papers with only ``pdf_url`` (no DOI/arxiv) can't go through the
+    institutional CLI; they should be skipped, not failed."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+    # A paper with pdf_url only — the SQL filter would already exclude this, but
+    # we patch the filter to include it, to exercise the defensive skip.
+    p = _seed_remote_candidate(
+        session, id="W-only-url",
+        doi=None, arxiv_id=None, journal_doi=None, pdf_url="https://example.com/x",
+    )
+
+    called = {"n": 0}
+
+    def _boom(*_a, **_k):  # pragma: no cover - must not be called
+        called["n"] += 1
+        raise AssertionError("process_paper must not be called for no-id paper")
+
+    monkeypatch.setattr(pc, "process_paper", _boom)
+
+    out = pc.fill_closed_papers(
+        session, cfg, limit=10, retry_backoff_seconds=0,
+    )
+    assert called["n"] == 0
+    assert out["candidates"] == 1
+    assert out["skipped"] == 1
+    assert out["parsed"] == 0
+    assert out["failed"] == 0
+    assert out["retried"] == 0
+
+
+def test_fill_closed_papers_retries_transient_failures_at_end_of_batch(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """Transient SSH errors should be retried at the end of the batch and
+    increment ``retried`` / ``retried_ok`` accordingly."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+    # Skip the actual backoff so the test is fast.
+    monkeypatch.setattr(pc.time, "sleep", lambda *_a, **_k: None)
+
+    # Three candidates: one already has a PDF on disk (no-op success), one
+    # fails transiently *then* succeeds on retry, one fails permanently. After
+    # the retry pass, the transient one should be retried and the permanent
+    # one should stay failed.
+    a = _seed_remote_candidate(session, id="W-ok")
+    b = _seed_remote_candidate(session, id="W-transient")
+    c = _seed_remote_candidate(session, id="W-perm")
+
+    # Track call order so we can verify the retry happens AFTER the first pass.
+    calls: list[str] = []
+    pass_counts = {"W-transient": 0, "W-perm": 0, "W-ok": 0}
+
+    def _fake_process(_session, _cfg, paper_id, **_kw):
+        calls.append(paper_id)
+        if paper_id == "W-ok":
+            return None  # success: nothing to update
+        if paper_id == "W-transient":
+            pass_counts[paper_id] += 1
+            if pass_counts[paper_id] == 1:
+                # First pass: transient SSH blip.
+                raise pc.ProcessError(
+                    f"institutional download failed: net blip (attempt 1)"
+                ) from rd_mod.RemoteTransientError("net blip")
+            # Retry pass: jump host recovered, success.
+            return None
+        if paper_id == "W-perm":
+            pass_counts[paper_id] += 1
+            raise pc.ProcessError("institutional download: DOI not found") from (
+                rd_mod.RemotePermanentError("DOI not found")
+            )
+        raise AssertionError(f"unexpected paper_id {paper_id}")
+
+    monkeypatch.setattr(pc, "process_paper", _fake_process)
+
+    out = pc.fill_closed_papers(
+        session, cfg, limit=10, retry_backoff_seconds=0,
+    )
+
+    # The transient paper was called twice (initial + retry), the permanent
+    # one only once.
+    assert pass_counts["W-transient"] == 2
+    assert pass_counts["W-perm"] == 1
+    # Calls order: first pass processes all three, then retry pass processes
+    # the transient one.
+    assert calls == ["W-ok", "W-transient", "W-perm", "W-transient"]
+
+    # Counters: ok parsed once (not retried), transient parsed on retry, perm
+    # failed (not retried).
+    assert out["candidates"] == 3
+    assert out["parsed"] == 2
+    assert out["failed"] == 1
+    assert out["skipped"] == 0
+    assert out["retried"] == 1
+    assert out["retried_ok"] == 1
+
+
+def test_fill_closed_papers_permanent_failure_not_retried(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """Permanent errors (rejected identifier) should NOT be retried — they
+    would just fail the same way and waste a connection."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+    monkeypatch.setattr(pc.time, "sleep", lambda *_a, **_k: None)
+
+    p = _seed_remote_candidate(session, id="W-bad")
+    call_count = {"n": 0}
+
+    def _fake_process(*_a, **_k):
+        call_count["n"] += 1
+        raise pc.ProcessError("institutional download: bad") from (
+            rd_mod.RemotePermanentError("bad")
+        )
+
+    monkeypatch.setattr(pc, "process_paper", _fake_process)
+
+    out = pc.fill_closed_papers(
+        session, cfg, limit=10, retry_backoff_seconds=0,
+    )
+
+    assert call_count["n"] == 1  # no retry attempted
+    assert out["candidates"] == 1
+    assert out["failed"] == 1
+    assert out["retried"] == 0
+    assert out["retried_ok"] == 0
+
+
+def test_fill_closed_papers_retry_pass_can_be_disabled(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """``retry_pass=False`` skips the second sweep — same as the legacy
+    behavior, kept for callers that want it (e.g. manual /diagnostic runs)."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+
+    p = _seed_remote_candidate(session, id="W-transient")
+    call_count = {"n": 0}
+
+    def _fake_process(*_a, **_k):
+        call_count["n"] += 1
+        raise pc.ProcessError("institutional download failed: x") from (
+            rd_mod.RemoteTransientError("x")
+        )
+
+    monkeypatch.setattr(pc, "process_paper", _fake_process)
+
+    out = pc.fill_closed_papers(
+        session, cfg, limit=10, retry_pass=False, retry_backoff_seconds=0,
+    )
+
+    assert call_count["n"] == 1
+    assert out["retried"] == 0
+    assert out["failed"] == 1
+
+
+def test_fill_closed_papers_retries_when_underlying_error_is_remote_transient(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """When ``process_paper`` raises a bare ``RemoteTransientError`` (not the
+    wrapped ``ProcessError``), the classifier should still recognize it."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+    monkeypatch.setattr(pc.time, "sleep", lambda *_a, **_k: None)
+
+    p = _seed_remote_candidate(session, id="W-raw-transient")
+    call_count = {"n": 0}
+
+    def _fake_process(*_a, **_k):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise rd_mod.RemoteTransientError("ssh down")
+        return None  # success on retry
+
+    monkeypatch.setattr(pc, "process_paper", _fake_process)
+
+    out = pc.fill_closed_papers(
+        session, cfg, limit=10, retry_backoff_seconds=0,
+    )
+
+    assert call_count["n"] == 2
+    assert out["parsed"] == 1
+    assert out["retried"] == 1
+    assert out["retried_ok"] == 1
+    assert out["failed"] == 0
+
+
+def test_fill_closed_papers_backoff_is_honoured(
+    session, cfg: CarrelYAML, tmp_path, monkeypatch
+):
+    """The end-of-batch retry pass must sleep before re-trying, so the jump
+    host has time to recover from a brief outage."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    cfg.storage.root = tmp_path / "data"
+    monkeypatch.setattr(rd_mod, "is_configured", lambda: True)
+
+    p = _seed_remote_candidate(session, id="W-sleep")
+    sleeps: list[float] = []
+
+    def _fake_sleep(secs: float) -> None:
+        sleeps.append(secs)
+
+    monkeypatch.setattr(pc.time, "sleep", _fake_sleep)
+
+    def _fake_process(*_a, **_k):
+        raise pc.ProcessError("institutional download failed: blip") from (
+            rd_mod.RemoteTransientError("blip")
+        )
+
+    monkeypatch.setattr(pc, "process_paper", _fake_process)
+
+    pc.fill_closed_papers(
+        session, cfg, limit=10, retry_backoff_seconds=2.5,
+    )
+
+    # Exactly one sleep, and it was the configured backoff.
+    assert sleeps == [2.5]
+
+
+def test_classify_remote_failure_direct_exceptions():
+    """The classifier should report the right bucket for both wrapped
+    ``ProcessError`` and bare ``Remote*Error`` raises."""
+    from carrel.sources import remote_downloader as rd_mod
+
+    assert pc._classify_remote_failure(rd_mod.RemotePermanentError("x")) == "permanent"
+    assert pc._classify_remote_failure(rd_mod.RemoteTransientError("x")) == "transient"
+
+    wrapped = pc.ProcessError("institutional download: x")
+    wrapped.__cause__ = rd_mod.RemotePermanentError("x")
+    assert pc._classify_remote_failure(wrapped) == "permanent"
+
+    wrapped2 = pc.ProcessError("institutional download failed: x")
+    wrapped2.__cause__ = rd_mod.RemoteTransientError("x")
+    assert pc._classify_remote_failure(wrapped2) == "transient"
+
+    # Unknown error → default to transient so the paper gets another shot.
+    assert pc._classify_remote_failure(ValueError("?")) == "transient"
+
+
+def test_has_remote_identifier_picks_up_each_known_field(session):
+    """Mirror of ``process._remote_identifier``; lock in the precedence."""
+    # journal_doi wins even if doi is also set
+    p = _make_paper(session, id="W-priority", journal_doi="10.1/j", doi="10.1/o", arxiv_id="1234")
+    assert pc._has_remote_identifier(p) is True
+
+    # arxiv_id alone is enough
+    p2 = _make_paper(session, id="W-arxiv-only", journal_doi=None, doi=None, arxiv_id="1234")
+    assert pc._has_remote_identifier(p2) is True
+
+    # pdf_url alone is NOT a remote identifier
+    p3 = _make_paper(session, id="W-url-only",
+                     journal_doi=None, doi=None, arxiv_id=None, pdf_url="https://example.com")
+    assert pc._has_remote_identifier(p3) is False
+
+    # Nothing → false
+    p4 = _make_paper(session, id="W-nothing",
+                     journal_doi=None, doi=None, arxiv_id=None, pdf_url=None)
+    assert pc._has_remote_identifier(p4) is False
+

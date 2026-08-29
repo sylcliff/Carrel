@@ -19,6 +19,8 @@ box processes one paper at a time, and MinerU itself is the bottleneck.
 from __future__ import annotations
 
 import logging
+import random
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -90,6 +92,17 @@ def _try_remote_download(
     when the remote is configured and attempted but fails. Returns False when
     the remote is not configured or the paper has no usable identifier (so the
     caller preserves its original error).
+
+    Robustness:
+      * Tiny random jitter (0–0.5s) before the SSH call so a 50-paper batch
+        doesn't open every connection in the same millisecond — the jump
+        host's connection rate-limiter is more likely to refuse a burst than
+        a steady trickle. The per-call retries inside ``download_paper``
+        already cover longer transient outages.
+      * Wraps ``RemotePermanentError`` and ``RemoteError`` (transient) into
+        ``ProcessError`` with the original cause preserved on ``__cause__``,
+        so :func:`carrel.pipeline.publication_check._classify_remote_failure`
+        can still tell the two apart and decide whether to retry.
     """
     from carrel.sources import remote_downloader as rd
 
@@ -98,6 +111,11 @@ def _try_remote_download(
     ident = _remote_identifier(paper)
     if not ident:
         return False
+
+    # Spread out the SSH connection peak across a batch. Cheap (sub-second) and
+    # capped — even at 0.5s/paper × 50 papers, this only adds 12.5s to a batch
+    # whose download calls already take minutes each.
+    time.sleep(random.uniform(0.0, 0.5))
 
     try:
         rd.download_paper(ident, work_dir, filename=PDF_FILENAME)
