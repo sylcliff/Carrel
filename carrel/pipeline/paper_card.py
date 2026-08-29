@@ -18,22 +18,31 @@ Design mirrors :mod:`carrel.pipeline.summarize` and
   * **Single-paper only** — a card requires ~5-15s of LLM time per paper.
     The endpoint runs inline (synchronous) rather than spawning a Job;
     re-running for many papers is a future concern (batch via Jobs).
+
+The shared LLM-call orchestration (paper lookup, md_path check,
+staleness gate, body prep, LLM call, LLMError catch, progress + usage
+recording) lives in :mod:`carrel.pipeline._llm_extract` so a bug fix
+or budget change only lands in one place.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from sqlmodel import Session
 
-from carrel import llm, prompts_runtime
+from carrel import llm  # re-exported for tests that monkey-patch pipe.llm
+from carrel import prompts_runtime
 from carrel.config import CarrelYAML
 from carrel.models import Paper
-from carrel.pipeline._llm_recorder import make_record_usage_callback
-from carrel.pipeline._section_picker import prepare_picker_input
+from carrel.pipeline._llm_extract import (
+    drive_paper_llm_extraction,
+    touch_paper_after_llm,
+)
+from carrel.pipeline._paper_meta import USER_PROMPT_TEMPLATE, authors_string, venue_date_string
+from carrel.prompts_language import language_directive
 from carrel.schemas import PaperCardOut, PaperTypeEnum, ResultClaim
 
 logger = logging.getLogger(__name__)
@@ -51,10 +60,7 @@ ProgressCallback = Callable[[dict], None]
 # boilerplate, so 8k is plenty when sections are short and tight enough
 # to fail gracefully on a paper with no recognisable headings.
 _MAX_INPUT_CHARS = 8_000
-# Hard cap per single section so a monster Results block can't eat the
-# whole budget.  The picker still gets the rest of the budget for the
-# next priority bucket.
-_PER_SECTION_CAP = 4_000
+# Don't waste an LLM call on near-empty bodies.
 _MIN_BODY_CHARS = 200
 
 
@@ -102,55 +108,6 @@ _SYSTEM_PROMPT = (
     "Conclusion block.\n"
     "- Respond with ONLY the JSON object, no prose or markdown fences."
 )
-
-
-_USER_TEMPLATE = (
-    "Title: {title}\n"
-    "Authors: {authors}\n"
-    "Venue/date: {venue_date}\n\n"
-    "Abstract:\n{abstract}\n\n"
-    "Selected paper sections (parsed from PDF; may contain OCR noise; "
-    "references/acknowledgments/supplementary dropped):\n\n"
-    "{numbered_sections}\n\n"
-    "Return the JSON object now."
-)
-
-
-# ---------------------------------------------------------------------------
-# Body preparation
-# ---------------------------------------------------------------------------
-
-
-def _prepare_body(md: str, max_chars: int) -> str:
-    """Slice the paper into a numbered, priority-budgeted block for the LLM.
-
-    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
-    which drops references / acknowledgments / supplementary noise and
-    fills the budget with method → results → conclusion → intro.  When
-    the picker finds no usable sections, the picker falls back to a
-    head+tail char window so the LLM still gets *some* context.
-    """
-    if not md or not md.strip():
-        return ""
-    return prepare_picker_input(
-        md,
-        budget_chars=max_chars,
-        per_section_cap=_PER_SECTION_CAP,
-    )
-
-
-def _authors_string(paper: Paper) -> str:
-    if not paper.authors:
-        return ""
-    names = [a.get("name", "") for a in paper.authors if isinstance(a, dict) and a.get("name")]
-    return ", ".join(names)
-
-
-def _venue_date_string(paper: Paper) -> str:
-    bits = [paper.venue or ""]
-    if paper.publication_date:
-        bits.append(str(paper.publication_date))
-    return " · ".join(b for b in bits if b)
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +226,7 @@ def _coerce_card(data: dict[str, Any]) -> PaperCardOut:
 # ---------------------------------------------------------------------------
 
 
-def _is_stale(paper: Paper) -> bool:
+def _is_stale(_session: Session, paper: Paper) -> bool:
     """A paper is stale if it has no card, or if it was updated after extract."""
     if paper.paper_card is None or paper.paper_card_extracted_at is None:
         return True
@@ -291,79 +248,48 @@ def extract_paper_card(
     Raises :class:`PaperCardError` on missing markdown, no LLM key, or a
     malformed response.  The paper row is updated in place; no status flip.
     """
-    paper = session.get(Paper, paper_id)
-    if paper is None:
-        raise PaperCardError(f"paper not found: {paper_id}")
+    def _build_messages(paper: Paper, body: str) -> list[dict]:
+        # ``cfg.llm.output_language`` is read fresh on every call so a
+        # PATCH to /api/settings is live on the next extraction without
+        # waiting for the prompts_runtime 60s TTL (which only caches
+        # override rows, not cfg-derived directives).
+        system = prompts_runtime.get_system("paper_card", _SYSTEM_PROMPT)
+        system = f"{system}\n\n{language_directive(cfg.llm.output_language)}"
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": prompts_runtime.get_user_template("paper_card", USER_PROMPT_TEMPLATE).format(
+                    title=paper.title,
+                    authors=authors_string(paper) or "unknown",
+                    venue_date=venue_date_string(paper) or "unknown",
+                    abstract=paper.abstract or "",
+                    numbered_sections=body,
+                ),
+            },
+        ]
 
-    def _emit(**progress: Any) -> None:
-        if on_progress is not None:
-            on_progress({
-                "paper_id": paper.id,
-                "paper_title": paper.title,
-                "stage": "paper_card",
-                **progress,
-            })
-
-    if not paper.md_path:
-        raise PaperCardError("paper has no md_path; parse it first")
-    md_path = Path(cfg.storage.root) / paper.md_path
-    if not md_path.exists():
-        raise PaperCardError(f"parsed markdown missing on disk: {md_path}")
-
-    if not force and not _is_stale(paper):
-        _emit(detail="Card already up to date")
-        return paper
-
-    if not (
-        llm.has_key_for(cfg.llm.summarize_model)
-        or llm.has_key_for(cfg.llm.fallback_model)
-    ):
-        raise PaperCardError(
-            "no LLM API key configured (set DEEPSEEK_API_KEY or VOLCANO_API_KEY)"
-        )
-
-    md = md_path.read_text(encoding="utf-8", errors="replace")
-    if len(md.strip()) < _MIN_BODY_CHARS:
-        raise PaperCardError("paper body too short to extract a card")
-
-    body = _prepare_body(md, _MAX_INPUT_CHARS)
-    messages = [
-        {"role": "system", "content": prompts_runtime.get_system("paper_card", _SYSTEM_PROMPT)},
-        {
-            "role": "user",
-            "content": prompts_runtime.get_user_template("paper_card", _USER_TEMPLATE).format(
-                title=paper.title,
-                authors=_authors_string(paper) or "unknown",
-                venue_date=_venue_date_string(paper) or "unknown",
-                abstract=paper.abstract or "",
-                numbered_sections=body,
-            ),
-        },
-    ]
-
-    _emit(detail="Generating paper card…")
-    try:
-        data = llm.chat_json(
-            messages,
-            model=cfg.llm.summarize_model,
-            fallback_model=cfg.llm.fallback_model,
-            temperature=cfg.llm.temperature,
-            timeout=cfg.llm.request_timeout_seconds,
-            feature="paper_card",
-            on_usage=make_record_usage_callback(
-                session, paper_id=paper.id, feature="paper_card"
-            ),
-        )
-    except llm.LLMError as e:
-        raise PaperCardError(str(e)) from e
+    paper, data, _body = drive_paper_llm_extraction(
+        session, cfg, paper_id,
+        feature="paper_card",
+        progress_stage="paper_card",
+        error_class=PaperCardError,
+        is_stale=_is_stale,
+        build_messages=_build_messages,
+        budget_chars=_MAX_INPUT_CHARS,
+        force=force,
+        min_body_chars=_MIN_BODY_CHARS,
+        on_progress=on_progress,
+    )
+    if data is None:
+        return paper  # not stale — driver already emitted the "up to date" signal
 
     card = _coerce_card(data)
     paper.paper_card = card.model_dump()
     paper.paper_card_extracted_at = datetime.now(UTC)
-    paper.updated_at = datetime.now(UTC)
-    session.add(paper)
-    session.commit()
-    session.refresh(paper)
-    _emit(detail="Card generated")
-    logger.info("paper card %s: type=%s confidence=%.2f", paper.id, card.paper_type.value, card.confidence)
+    touch_paper_after_llm(paper, session)
+    logger.info(
+        "paper card %s: type=%s confidence=%.2f",
+        paper.id, card.paper_type.value, card.confidence,
+    )
     return paper

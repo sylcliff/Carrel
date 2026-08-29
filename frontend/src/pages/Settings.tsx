@@ -22,12 +22,18 @@ import { humanizeCron } from "@/lib/cron";
 
 // -------- Field rendering --------
 
-type FieldKind = "text" | "int" | "float" | "bool" | "list-str" | "cron";
+type FieldKind = "text" | "int" | "float" | "bool" | "list-str" | "cron" | "select";
+
+interface SelectOption {
+  value: string;
+  label: string;
+}
 
 interface FieldSpec {
   label: string;
   kind: FieldKind;
   hint?: string;
+  options?: SelectOption[]; // only used when kind === "select"
 }
 
 type SectionSpec = {
@@ -47,6 +53,15 @@ const SECTION_SPECS: Record<string, SectionSpec> = {
       fallback_model:            { label: "Fallback model",           kind: "text" },
       temperature:               { label: "Temperature",              kind: "float" },
       request_timeout_seconds:   { label: "Request timeout (s)",      kind: "int" },
+      output_language: {
+        label: "Output language (LLM)",
+        kind: "select",
+        options: [
+          { value: "zh", label: "中文 (zh)" },
+          { value: "en", label: "English (en)" },
+        ],
+        hint: "Language for LLM-generated paper card and summary fields. Default 中文.",
+      },
       max_input_chars:           { label: "Max input chars",          kind: "int" },
       chat_model:                { label: "Chat model",               kind: "text" },
       chat_fallback_model:       { label: "Chat fallback model",      kind: "text" },
@@ -227,6 +242,7 @@ function parseFieldDraft(kind: FieldKind, raw: string): unknown {
         .split(",")
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
+    case "select":
     case "cron":
     case "text":
     default:
@@ -458,6 +474,20 @@ function SectionCard({ name, data, onSaved }: SectionCardProps) {
                   >
                     <option value="true">true</option>
                     <option value="false">false</option>
+                  </select>
+                ) : fieldSpec.kind === "select" ? (
+                  <select
+                    id={inputId}
+                    className="w-full rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+                    value={editing ? (draft[field] ?? "") : asString(data.values[field] ?? "")}
+                    onChange={(e) => setDraft((d) => ({ ...d, [field]: e.target.value }))}
+                    disabled={disabled}
+                  >
+                    {(fieldSpec.options ?? []).map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
                   </select>
                 ) : fieldSpec.kind === "cron" ? (
                   <div className="space-y-1">

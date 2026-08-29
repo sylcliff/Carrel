@@ -31,22 +31,50 @@ Design choices (see plan):
 
 Like :mod:`carrel.pipeline.embed`, this module is synchronous (single-user box;
 the LLM call is the bottleneck and runs one paper at a time).
+
+The shared LLM-call orchestration (paper lookup, md_path check, body
+prep, LLM call, LLMError catch, progress + usage recording) lives in
+:mod:`carrel.pipeline._llm_extract` so a bug fix or budget change only
+lands in one place.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from sqlmodel import Session, select
 
-from carrel import llm, prompts_runtime, usage
+from carrel import llm  # re-exported for tests that monkey-patch pipe.llm
+from carrel import prompts_runtime
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperStatus
-from carrel.pipeline._llm_recorder import make_record_usage_callback
-from carrel.pipeline._section_picker import prepare_picker_input
+from carrel.pipeline._llm_extract import (
+    drive_paper_llm_extraction,
+    touch_paper_after_llm,
+)
+from carrel.pipeline._paper_meta import USER_PROMPT_TEMPLATE, authors_string, venue_date_string
+
+# Summarize's output schema is bilingual (tldr_en / tldr_zh / summary_zh),
+# so a single "respond in X" directive would leave the wrong field
+# feeling primary. Build a per-language suffix that names which field is
+# the primary one and which is the gloss. Keeping the schema stable
+# (no migration) — see plan "summarize schema 怎么处理".
+_SUMMARIZE_LANGUAGE_SUFFIX = {
+    "zh": (
+        "Output language: Simplified Chinese (简体中文). The 'tldr_zh' and "
+        "'summary_zh' fields are the primary output; populate them with "
+        "high-quality Simplified Chinese. If you also fill 'tldr_en', it "
+        "is a brief English gloss, not the primary summary."
+    ),
+    "en": (
+        "Output language: English. The 'tldr_en' field is the primary "
+        "output; populate it with a high-quality English sentence. "
+        "'tldr_zh' and 'summary_zh' (if filled) are translations / glosses, "
+        "not the primary output."
+    ),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +88,6 @@ ProgressCallback = Callable[[dict], None]
 
 # Fields this step is responsible for, in the order we apply them.
 _OUTPUT_FIELDS = ("tldr_en", "tldr_zh", "summary_zh", "keywords")
-
-# Hard cap per single section so a monster Results block can't eat the
-# whole summarizer budget.  Matches paper_card / paper_extract.
-_PER_SECTION_CAP = 4_000
-
 
 # ---------------------------------------------------------------------------
 # Prompt construction
@@ -97,73 +120,12 @@ _SYSTEM_PROMPT = (
 )
 
 
-_USER_TEMPLATE = (
-    "Title: {title}\n"
-    "Authors: {authors}\n"
-    "Venue/date: {venue_date}\n\n"
-    "Abstract:\n{abstract}\n\n"
-    "Selected paper sections (parsed from PDF; may contain OCR noise; "
-    "references/acknowledgments/supplementary dropped):\n\n"
-    "{numbered_sections}\n\n"
-    "Return the JSON object now, with no commentary."
-)
-
-
-def _build_user_prompt(
-    *,
-    title: str,
-    authors: str,
-    venue_date: str,
-    abstract: str,
-    numbered_sections: str,
-) -> str:
-    return prompts_runtime.get_user_template("summarize", _USER_TEMPLATE).format(
-        title=title,
-        authors=authors or "unknown",
-        venue_date=venue_date or "unknown",
-        abstract=abstract or "",
-        numbered_sections=numbered_sections,
-    )
-
-
-def _authors_string(paper: Paper) -> str:
-    if not paper.authors:
-        return ""
-    names = [a.get("name", "") for a in paper.authors if isinstance(a, dict) and a.get("name")]
-    return ", ".join(names)
-
-
-def _venue_date_string(paper: Paper) -> str:
-    bits = [paper.venue or ""]
-    if paper.publication_date:
-        bits.append(str(paper.publication_date))
-    return " · ".join(b for b in bits if b)
-
-
-def _prepare_body(md: str, max_chars: int) -> str:
-    """Slice the paper into a numbered, priority-budgeted block for the LLM.
-
-    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
-    which drops references / acknowledgments / supplementary noise and
-    fills the budget with method → results → conclusion → intro.  The
-    result is rendered as ``## [N] <label>`` blocks in document order
-    so the summarizer can ground each fact to a specific section.
-    """
-    if not md or not md.strip():
-        return ""
-    return prepare_picker_input(
-        md,
-        budget_chars=max_chars,
-        per_section_cap=_PER_SECTION_CAP,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Per-paper summarization
 # ---------------------------------------------------------------------------
 
 
-def _all_fields_present(paper: Paper) -> bool:
+def _all_fields_present(_session: Session, paper: Paper) -> bool:
     return all(getattr(paper, f) for f in _OUTPUT_FIELDS)
 
 
@@ -181,81 +143,58 @@ def summarize_paper(
     not called. Existing values are preserved (fill-missing); ``force=True``
     overwrites all of them.
     """
-    paper = session.get(Paper, paper_id)
-    if paper is None:
-        raise SummarizeError(f"paper not found: {paper_id}")
-
-    def _emit(**progress: Any) -> None:
-        if on_progress is not None:
-            on_progress({
-                "paper_id": paper.id,
-                "paper_title": paper.title,
-                "stage": "summarize",
-                **progress,
-            })
-
-    if not paper.md_path:
-        raise SummarizeError("paper has no md_path; parse it first")
-
-    md_path = Path(cfg.storage.root) / paper.md_path
-    if not md_path.exists():
-        raise SummarizeError(f"parsed markdown missing on disk: {md_path}")
-
-    if _all_fields_present(paper) and not force:
-        _emit(detail="Already summarized")
-        return paper
-
-    # Fast no-key check: avoid a noisy stack trace when chaining after parse.
-    if not (
-        llm.has_key_for(cfg.llm.summarize_model)
-        or llm.has_key_for(cfg.llm.fallback_model)
-    ):
-        raise SummarizeError(
-            "no LLM API key configured (set DEEPSEEK_API_KEY or VOLCANO_API_KEY)"
+    def _build_messages(paper: Paper, body: str) -> list[dict]:
+        # Read cfg.llm.output_language fresh each call so a settings
+        # PATCH is live on the next summarise (the 60s prompts_runtime
+        # TTL caches override rows only, not cfg-derived directives).
+        # Unknown values fall back to the English suffix to mirror
+        # ``carrel.prompts_language.language_directive``'s safety net.
+        suffix = _SUMMARIZE_LANGUAGE_SUFFIX.get(
+            cfg.llm.output_language, _SUMMARIZE_LANGUAGE_SUFFIX["en"]
         )
+        system = prompts_runtime.get_system("summarize", _SYSTEM_PROMPT)
+        system = f"{system}\n\n{suffix}"
+        return [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": prompts_runtime.get_user_template("summarize", USER_PROMPT_TEMPLATE).format(
+                    title=paper.title,
+                    authors=authors_string(paper) or "unknown",
+                    venue_date=venue_date_string(paper) or "unknown",
+                    abstract=paper.abstract or "",
+                    numbered_sections=body,
+                ),
+            },
+        ]
 
-    md = md_path.read_text(encoding="utf-8", errors="replace")
-    body = _prepare_body(md, cfg.llm.max_input_chars)
-    messages = [
-        {"role": "system", "content": prompts_runtime.get_system("summarize", _SYSTEM_PROMPT)},
-        {
-            "role": "user",
-            "content": _build_user_prompt(
-                title=paper.title,
-                authors=_authors_string(paper),
-                venue_date=_venue_date_string(paper),
-                abstract=paper.abstract or "",
-                numbered_sections=body,
-            ),
-        },
-    ]
-
-    _emit(detail="Generating summary…")
-    try:
-        data = llm.chat_json(
-            messages,
-            model=cfg.llm.summarize_model,
-            fallback_model=cfg.llm.fallback_model,
-            temperature=cfg.llm.temperature,
-            timeout=cfg.llm.request_timeout_seconds,
-            feature="summarize",
-            on_usage=make_record_usage_callback(
-                session, paper_id=paper.id, feature="summarize"
-            ),
-        )
-    except llm.LLMError as e:
-        raise SummarizeError(str(e)) from e
+    paper, data, _body = drive_paper_llm_extraction(
+        session, cfg, paper_id,
+        feature="summarize",
+        progress_stage="summarize",
+        error_class=SummarizeError,
+        is_stale=lambda s, p: not _all_fields_present(s, p),
+        build_messages=_build_messages,
+        budget_chars=cfg.llm.max_input_chars,
+        force=force,
+        on_progress=on_progress,
+    )
+    if data is None:
+        return paper  # not stale — driver already emitted the "up to date" signal
 
     _apply_fields(paper, data, force=force)
 
     # Advance parsed -> summarized, but never regress an already-ready paper.
     if paper.status == PaperStatus.parsed.value:
         paper.status = PaperStatus.summarized.value
-    paper.updated_at = datetime.now(UTC)
-    session.add(paper)
-    session.commit()
-    session.refresh(paper)
-    _emit(detail="Summary generated")
+    touch_paper_after_llm(paper, session)
+    if on_progress is not None:
+        on_progress({
+            "paper_id": paper.id,
+            "paper_title": paper.title,
+            "stage": "summarize",
+            "detail": "Summary generated",
+        })
     logger.info("summarized %s", paper.id)
     return paper
 

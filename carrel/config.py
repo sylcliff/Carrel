@@ -157,6 +157,19 @@ class LLMConfig(BaseModel):
     # calls in one run_dedup; remaining pairs are left as suggestions.
     paper_dedup_judge_max_calls_per_run: int = 200
 
+    # ---- LLM output language (paper_card + summarize) ----
+    # Controls the language of free-form text the LLM produces for
+    # paper_card fields (research_question, method_summary, …) and
+    # which of the bilingual tldr_en/tldr_zh/summary_zh fields is the
+    # primary output for summarize. Does NOT change the user-facing
+    # UI language (the app has no i18n). Switching the value is live:
+    # the next LLM call picks up the new value because the call sites
+    # read cfg.llm.output_language per invocation. Already-stored
+    # paper_card / summary rows are NOT retroactively regenerated;
+    # the user re-runs Extract / summarize for those papers to get
+    # the new language.
+    output_language: Literal["zh", "en"] = "zh"
+
 
 class EmbeddingsConfig(BaseModel):
     provider: str = "volcengine"

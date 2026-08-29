@@ -246,6 +246,9 @@ def test_runtime_override_affects_llm_input(monkeypatch, session, tmp_path):
             temperature=0.0,
             request_timeout_seconds=30,
             max_input_chars=4000,
+            # summarize now reads cfg.llm.output_language to choose
+            # which field is the primary one in the bilingual schema.
+            output_language="zh",
         ),
     )
     # The call site reads the prompt via prompts_runtime, which falls back
@@ -268,10 +271,13 @@ def test_runtime_override_affects_llm_input(monkeypatch, session, tmp_path):
     ))
     session.commit()
 
-    # 1) Default — call site uses module constant for system.
+    # 1) Default — call site uses module constant for system, then
+    # appends the language directive (which itself depends on
+    # cfg.llm.output_language, defaulted to zh here).
     summarize.summarize_paper(session, cfg, "p1")
     default_messages = captured[-1]
-    assert default_messages[0]["content"] == summarize._SYSTEM_PROMPT
+    assert default_messages[0]["content"].startswith(summarize._SYSTEM_PROMPT)
+    assert "Output language: Simplified Chinese" in default_messages[0]["content"]
     assert "Title: Test" in default_messages[1]["content"]
 
     # 2) Save an override, then re-run. The next call must use it.
@@ -286,5 +292,6 @@ def test_runtime_override_affects_llm_input(monkeypatch, session, tmp_path):
 
     summarize.summarize_paper(session, cfg, "p1", force=True)
     override_messages = captured[-1]
-    assert override_messages[0]["content"] == "OVERRIDE-SYS-MARKER"
+    assert override_messages[0]["content"].startswith("OVERRIDE-SYS-MARKER")
+    assert "Output language: Simplified Chinese" in override_messages[0]["content"]
     assert "OVERRIDE-USER" in override_messages[1]["content"]

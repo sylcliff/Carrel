@@ -239,6 +239,55 @@ class TestExtractPaperCard:
         assert p.paper_card is None
         assert p.paper_card_extracted_at is None
 
+    def test_default_zh_appends_chinese_directive(self, session, cfg, tmp_path, monkeypatch):
+        """cfg.llm.output_language defaults to zh; the LLM system
+        prompt must carry a Simplified-Chinese directive so the
+        extracted card text is in Chinese unless the user opted
+        otherwise."""
+        cfg.storage.root = tmp_path / "data"
+        p = _make_paper(session, md_path="papers/W1/paper.md")
+        _write_md(cfg, p, "# Intro\n\nLoRA enables cheap fine-tuning. " * 20)
+
+        captured: dict = {}
+        real_chat = _fake_llm()
+
+        def _capture(messages, **kwargs):
+            for m in messages:
+                if m["role"] == "system":
+                    captured["system"] = m["content"]
+            return real_chat(messages, **kwargs)
+
+        monkeypatch.setattr(pipe.llm, "chat_json", _capture)
+        pipe.extract_paper_card(session, cfg, p.id)
+
+        assert "Simplified Chinese" in captured["system"]
+        # Base system prompt is still there (we only append, not replace).
+        assert "expert research assistant" in captured["system"]
+
+    def test_english_cfg_appends_english_directive(self, session, cfg, tmp_path, monkeypatch):
+        """PATCH /api/settings to output_language='en' is live on the
+        very next LLM call (no restart, no cache invalidation needed)."""
+        cfg.llm.output_language = "en"
+        cfg.storage.root = tmp_path / "data"
+        p = _make_paper(session, md_path="papers/W1/paper.md")
+        _write_md(cfg, p, "# Intro\n\nLoRA enables cheap fine-tuning. " * 20)
+
+        captured: dict = {}
+
+        def _capture(messages, **kwargs):
+            for m in messages:
+                if m["role"] == "system":
+                    captured["system"] = m["content"]
+            return _fake_llm()(messages, **kwargs)
+
+        monkeypatch.setattr(pipe.llm, "chat_json", _capture)
+        pipe.extract_paper_card(session, cfg, p.id)
+
+        assert "Output language: English" in captured["system"]
+        # Sanity: the zh-specific token is absent so we know the
+        # directive switched rather than just appended both.
+        assert "简体中文" not in captured["system"]
+
 
 @pytest.fixture()
 def _patch_app_config(monkeypatch, tmp_path):

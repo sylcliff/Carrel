@@ -90,6 +90,55 @@ def test_summarize_paper_happy_path(session, cfg: CarrelYAML, tmp_path, monkeypa
     assert out.keywords and "method" in out.keywords
 
 
+def test_summarize_default_zh_marks_zh_fields_primary(session, cfg, tmp_path, monkeypatch):
+    """cfg.llm.output_language defaults to zh; the directive must
+    tell the LLM that 'tldr_zh' / 'summary_zh' are the primary
+    output and 'tldr_en' is a gloss."""
+    cfg.storage.root = tmp_path / "data"
+    p = _make_paper(session, md_path="papers/W1/paper.md")
+    _write_md(cfg, p, "# Intro\n\nThis is the paper body. " * 20)
+
+    captured: dict = {}
+
+    def _capture(messages, **kwargs):
+        for m in messages:
+            if m["role"] == "system":
+                captured["system"] = m["content"]
+        return _fake_llm()(messages, **kwargs)
+
+    monkeypatch.setattr(summ_pipe.llm, "chat_json", _capture)
+    summ_pipe.summarize_paper(session, cfg, p.id)
+
+    assert "tldr_zh" in captured["system"]
+    assert "summary_zh" in captured["system"]
+    assert "primary" in captured["system"]
+    # The en-specific phrasing is absent so the directive switched.
+    assert "primary output; populate it" not in captured["system"]
+
+
+def test_summarize_english_marks_tldr_en_primary(session, cfg, tmp_path, monkeypatch):
+    """Switching cfg.llm.output_language to 'en' is live on the next
+    call: the directive names 'tldr_en' as the primary output."""
+    cfg.llm.output_language = "en"
+    cfg.storage.root = tmp_path / "data"
+    p = _make_paper(session, md_path="papers/W1/paper.md")
+    _write_md(cfg, p, "# Intro\n\nThis is the paper body. " * 20)
+
+    captured: dict = {}
+
+    def _capture(messages, **kwargs):
+        for m in messages:
+            if m["role"] == "system":
+                captured["system"] = m["content"]
+        return _fake_llm()(messages, **kwargs)
+
+    monkeypatch.setattr(summ_pipe.llm, "chat_json", _capture)
+    summ_pipe.summarize_paper(session, cfg, p.id)
+
+    assert "tldr_en" in captured["system"]
+    assert "primary" in captured["system"]
+
+
 def test_summarize_preserves_existing_s2_tldr(session, cfg, tmp_path, monkeypatch):
     cfg.storage.root = tmp_path / "data"
     p = _make_paper(

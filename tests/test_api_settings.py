@@ -304,3 +304,42 @@ def test_schedule_patches_still_work(client, tmp_config: Path):
         json={"enabled": True, "sync_cron": "not a cron"},
     )
     assert r.status_code == 400
+
+
+# -------- LLM output_language round-trip --------
+
+
+def test_patch_settings_output_language_persists(client, tmp_config: Path):
+    """The LLM card's output_language field is read by paper_card and
+    summarize at call time. Round-trip it through PATCH /settings so
+    a typo in the frontend selector would fail validation here
+    instead of silently producing the wrong-language LLM output."""
+    r = client.patch(
+        "/settings",
+        json={"sections": {"llm": {"output_language": "en"}}},
+    )
+    assert r.status_code == 200, r.text
+    llm_block = r.json()["sections"]["llm"]["values"]
+    assert llm_block["output_language"] == "en"
+
+    # Persisted to disk.
+    on_disk = tmp_config.read_text(encoding="utf-8")
+    assert "output_language: en" in on_disk
+
+    # And reflected in the live in-memory config — this is the path
+    # the LLM call sites read, so a missing in-memory write would
+    # be the silent failure mode we're guarding against.
+    from carrel import main as main_mod
+    assert main_mod.app_config.llm.output_language == "en"
+
+
+def test_patch_settings_output_language_rejects_unknown_value(client, tmp_config: Path):
+    r = client.patch(
+        "/settings",
+        json={"sections": {"llm": {"output_language": "fr"}}},
+    )
+    # Literal["zh","en"] in the Pydantic model → 400.
+    assert r.status_code == 400, r.text
+    on_disk = tmp_config.read_text(encoding="utf-8")
+    # The bad value must NOT have been written.
+    assert "output_language: fr" not in on_disk
