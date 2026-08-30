@@ -79,3 +79,17 @@ def client(session: Session):
         yield c
     reset_cache_for_tests()
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_throttle_singleton():
+    """Reset the OpenAlex throttle singleton between tests so a recorded
+    latch in test_throttle.py doesn't bleed into other tests' pipeline
+    code (which has top-of-loop ``openalex_throttle.is_open()`` checks that
+    would short-circuit if the singleton were open).
+    """
+    from carrel.sources.throttle import openalex_throttle
+
+    openalex_throttle.clear()
+    yield
+    openalex_throttle.clear()

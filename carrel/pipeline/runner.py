@@ -154,6 +154,18 @@ def fetch_candidates(
 
     # --- OpenAlex: author subscriptions -----------------------------------------
     for s in authors:
+        # Cheap abort: when OpenAlex is currently throttled, skip the
+        # remaining author subscriptions instead of paying ~17 s of
+        # retry-wait per remaining call. Each fetch_recent_* function
+        # already short-circuits to [] on the latch; this is a faster
+        # outer check that avoids even entering the try block.
+        if oa.openalex_throttle.is_open():
+            logger.warning(
+                "openalex author fetch skipped (%s) — %s",
+                s.value,
+                oa.openalex_throttle.message(),
+            )
+            break
         with agent_step(
             "fetch_oa_author",
             label=f"Fetch OpenAlex author {s.value}",
@@ -175,6 +187,13 @@ def fetch_candidates(
 
     # --- OpenAlex: venue subscriptions ------------------------------------------
     for s in venues:
+        if oa.openalex_throttle.is_open():
+            logger.warning(
+                "openalex venue fetch skipped (%s) — %s",
+                s.value,
+                oa.openalex_throttle.message(),
+            )
+            break
         with agent_step(
             "fetch_oa_venue",
             label=f"Fetch OpenAlex venue {s.value}",
@@ -197,6 +216,13 @@ def fetch_candidates(
     # --- OpenAlex: keyword subscriptions (in addition to arXiv) ---------------
     keyword_strs = {s.value for s in keywords}
     for q in keyword_strs:
+        if oa.openalex_throttle.is_open():
+            logger.warning(
+                "openalex keyword fetch skipped (%s) — %s",
+                q,
+                oa.openalex_throttle.message(),
+            )
+            break
         with agent_step(
             "fetch_oa_keyword",
             label=f"Fetch OpenAlex keyword {q}",

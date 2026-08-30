@@ -14,6 +14,19 @@ metadata spine, not a content source.
 
 Configuration: OpenAlex is free without an API key. Pass `mailto` to enter
 the politeness pool (faster, more reliable). We read it from the YAML config.
+
+429 backoff: OpenAlex returns ``HTTP 429`` with ``Retry-After`` measured in
+seconds when the IP / mailto exhausts its daily credit pool (free tier =
+1000 calls / IP-day; the polite pool lifts the rate, not the daily budget).
+When the budget is gone the Retry-After can be tens of thousands of seconds
+(until next UTC midnight). Without sharing state across requests, every
+search in that window pays the full ~17 s of ``max_retries * 5 s`` capped
+wait before pyalex gives up — and every other user-visible fan-out search
+sits behind the same wall. We expose a process-wide throttle latch so the
+*first* 429 records the cooldown, and every subsequent OA call within the
+window short-circuits to a "throttled" signal that the search endpoint
+surfaces in its ``warnings`` array. The user still gets a merged result
+from S2 + arXiv immediately.
 """
 from __future__ import annotations
 
@@ -27,9 +40,14 @@ import pyalex
 import pyalex.api as _pyalex_api
 import requests
 from pyalex import Authors, Sources, Works, invert_abstract
-from urllib3.util import Retry
 
 from carrel.config import CarrelYAML
+from carrel.sources.throttle import (
+    ThrottledError,
+    ThrottleAwareRetry,
+    openalex_throttle,
+    throttle_aware,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +58,21 @@ logger = logging.getLogger(__name__)
 # fast — fetch_citing_works already treats exceptions as "no extras".
 _MAX_RETRY_AFTER_SECONDS = 5.0
 
+# --- Back-compat aliases ----------------------------------------------------
+# The 429 throttle machinery now lives in :mod:`carrel.sources.throttle`. The
+# original names are kept as module-level aliases so the 2 already-aware
+# consumers (api/search.py, api/authors_backfill.py) keep working without
+# edits. New code should import from ``carrel.sources.throttle`` directly.
+_OpenAlexThrottled = ThrottledError  # `is` matches in api/search.py:326
 
-class _CappedRetry(Retry):
-    """urllib3 Retry that clamps a long Retry-After to a few seconds."""
 
-    def get_retry_after(self, response: Any) -> float | None:  # type: ignore[override]
-        val = super().get_retry_after(response)
-        if val is None:
-            return None
-        return min(float(val), _MAX_RETRY_AFTER_SECONDS)
+def is_oa_throttled() -> tuple[bool, str]:
+    """Return ``(True, message)`` if we are still inside a recorded cooldown."""
+    return openalex_throttle.is_open(), openalex_throttle.message()
+
+
+_record_oa_throttle = openalex_throttle.record
+_clear_oa_throttle = openalex_throttle.clear
 
 
 # Saved once so repeated configure() calls don't re-wrap an already wrapped
@@ -76,8 +100,10 @@ def configure(cfg: CarrelYAML) -> None:
     def _timed_session() -> Any:
         session = _ORIG_SESSION_FACTORY()
         # Replace pyalex's default adapter so a budget-exhausted 429 doesn't
-        # block for minutes on its Retry-After header (see _CappedRetry).
-        retries = _CappedRetry(
+        # block for minutes on its Retry-After header (see ThrottleAwareRetry).
+        retries = ThrottleAwareRetry(
+            openalex_throttle,
+            max_sleep_seconds=_MAX_RETRY_AFTER_SECONDS,
             total=cfg.openalex.max_retries,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 503],
@@ -88,11 +114,20 @@ def configure(cfg: CarrelYAML) -> None:
         session.mount("http://", adapter)
         original_get = session.get
 
-        def get_with_timeout(url: str, **kwargs: Any) -> Any:
+        def get_with_throttle(url: str, **kwargs: Any) -> Any:
+            # Layer 1 chokepoint: every pyalex HTTP GET passes through here.
+            # If a previous call recorded a 429 cooldown, raise
+            # ThrottledError so pyalex's _get_from_url propagates the error
+            # and our public functions' ``except Exception`` blocks translate
+            # it into the function-shaped empty sentinel. This is what
+            # protects the 12th direct-pyalex call site
+            # (api/citations.py:341) without needing a per-function check.
+            if openalex_throttle.is_open():
+                raise ThrottledError(openalex_throttle.message())
             kwargs.setdefault("timeout", (connect_timeout, timeout))
             return original_get(url, **kwargs)
 
-        session.get = get_with_timeout
+        session.get = get_with_throttle
         return session
 
     _pyalex_api._get_requests_session = _timed_session
@@ -117,6 +152,7 @@ def _title_similarity(a: str | None, b: str | None) -> float:
 _ARXIV_TITLE_MATCH_THRESHOLD = 0.85
 
 
+@throttle_aware(openalex_throttle, sentinel=None)
 def lookup_by_arxiv_id(
     arxiv_id: str,
     *,
@@ -184,6 +220,7 @@ def lookup_by_arxiv_id(
     return None
 
 
+@throttle_aware(openalex_throttle, sentinel=None)
 def lookup_by_doi(doi: str) -> dict[str, Any] | None:
     doi = (doi or "").strip()
     if not doi:
@@ -196,6 +233,7 @@ def lookup_by_doi(doi: str) -> dict[str, Any] | None:
     return dict(w) if w else None
 
 
+@throttle_aware(openalex_throttle, sentinel=None)
 def fetch_work_authors(
     doi: str | None,
     arxiv_id: str | None,
@@ -211,6 +249,10 @@ def fetch_work_authors(
 
     The ``doi:`` URL form is required — the ``/works/https://doi.org/...`` form
     costs substantially more budget and quickly returns 429.
+
+    Honours the process-wide 429 latch: when OpenAlex is currently throttled,
+    short-circuits to None immediately so a 500-paper backfill doesn't pay
+    17 s × N retry-waits inside a budget reset window.
     """
 
     def _by_doi(ident: str) -> dict[str, Any] | None:
@@ -237,6 +279,7 @@ def fetch_work_authors(
     return work_authors(work)
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def fetch_citing_works(
     identifier: str,
     *,
@@ -264,6 +307,7 @@ def fetch_citing_works(
 # ---------------------------------------------------------------------------
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def fetch_recent_by_author(
     author_id: str,
     *,
@@ -285,6 +329,7 @@ def fetch_recent_by_author(
     return [dict(w) for w in results]
 
 
+@throttle_aware(openalex_throttle, sentinel=([], None, None))
 def fetch_author_works(
     author_id: str,
     *,
@@ -339,6 +384,7 @@ def fetch_author_works(
     return items, next_cursor, total
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def fetch_recent_by_venue(
     source_id: str,
     *,
@@ -360,6 +406,7 @@ def fetch_recent_by_venue(
     return [dict(w) for w in results]
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def fetch_recent_by_keyword(
     query: str,
     *,
@@ -380,6 +427,7 @@ def fetch_recent_by_keyword(
     return [dict(w) for w in results]
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def fetch_recent_by_arxiv_category(
     category: str,
     *,
@@ -430,6 +478,14 @@ def search_work(
     if not query:
         return []
 
+    # Short-circuit if a previous request already recorded a 429 cooldown.
+    # The full Retry-After is often tens of thousands of seconds; without
+    # this latch every search in the window pays the same ~17 s wait. We
+    # raise (not return []) so the search endpoint's ``except _OpenAlexThrottled``
+    # handler in api/search.py can surface the rate-limit warning.
+    if openalex_throttle.is_open():
+        raise ThrottledError(openalex_throttle.message())
+
     filters: dict[str, Any] = {}
     if year_from is not None:
         filters["from_publication_date"] = f"{year_from}-01-01"
@@ -452,9 +508,23 @@ def search_work(
         if filters:
             q = q.filter(**filters)
         results = q.sort(**sort_kwargs).get(per_page=min(max(limit, 1), 100))
+    except ThrottledError:
+        # Already raised by the Layer 1 session wrapper; re-raise so the
+        # search endpoint can surface a warning.
+        raise
     except Exception as e:
+        # pyalex wraps the final 429 in a RetryError whose message contains
+        # "429". We can't read the response anymore (it was eaten by
+        # urllib3), so we use a 5-minute floor for the latch and translate
+        # the failure into our own throttled signal.
+        if "429" in str(e) or "too many 429" in str(e).lower():
+            msg = openalex_throttle.record(300.0)
+            raise ThrottledError(msg) from e
         logger.warning("OpenAlex search failed for %r: %s", query, e)
         return []
+    # Success — clear any stale latch from earlier in the day. search_work is
+    # the canary call: if a request here succeeds, the daily budget is back.
+    openalex_throttle.clear()
     return [dict(w) for w in results]
 
 
@@ -463,6 +533,7 @@ def search_work(
 # ---------------------------------------------------------------------------
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def search_authors(name: str, limit: int = 5) -> list[dict[str, Any]]:
     name = (name or "").strip()
     if not name:
@@ -488,6 +559,7 @@ def search_authors(name: str, limit: int = 5) -> list[dict[str, Any]]:
     return out
 
 
+@throttle_aware(openalex_throttle, sentinel=None)
 def fetch_author(author_id: str) -> dict[str, Any] | None:
     """Fetch one OpenAlex Author by bare ID (e.g. 'A5013214678').
 
@@ -523,6 +595,7 @@ def fetch_author(author_id: str) -> dict[str, Any] | None:
     }
 
 
+@throttle_aware(openalex_throttle, sentinel=[])
 def search_venues(name: str, limit: int = 5) -> list[dict[str, Any]]:
     name = (name or "").strip()
     if not name:

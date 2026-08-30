@@ -18,9 +18,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session
 
 from carrel.db import get_session_dep
+from carrel.api._job_io import job_to_out
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.authors import backfill_paper, select_pending
 from carrel.schemas import AuthorsBackfillRequest, JobOut
+from carrel.sources.throttle import abort_if_throttled, openalex_throttle
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,7 @@ def trigger_backfill(
         _run_all(session, [j.id for j in jobs if j.id is not None], paper_ids)
         for j in jobs:
             session.refresh(j)
-    return [_to_out(j) for j in jobs]
+    return [job_to_out(j) for j in jobs]
 
 
 def _make_progress_cb(session: Session, job_id: int):
@@ -100,7 +102,52 @@ def _make_progress_cb(session: Session, job_id: int):
 def _run_all(session: Session, job_ids: list[int], paper_ids: list[str]) -> None:
     assert len(job_ids) == len(paper_ids)
     for job_id, paper_id in zip(job_ids, paper_ids, strict=True):
+        # Bail out of the whole batch if OpenAlex is currently throttled —
+        # 500 back-to-back calls would each pay 17 s of retry-wait for a
+        # guarantee of failure. We mark the remaining queued jobs as failed
+        # with a clear "throttled" result so the UI can render a different
+        # banner than "data not in OpenAlex".
+        msg = abort_if_throttled(
+            openalex_throttle,
+            on_abort=lambda m: _abort_remaining(
+                session, job_ids, reason=f"throttled: {m}"
+            ),
+        )
+        if msg is not None:
+            return
         _run_one(session, job_id, paper_id)
+
+
+def _abort_remaining(
+    session: Session, job_ids: list[int], *, reason: str
+) -> None:
+    """Mark every still-pending job in this batch as failed/throttled.
+
+    A 429 cooldown on OpenAlex means the rest of the batch cannot succeed
+    until the budget resets, so we stop the loop early and surface a
+    distinct ``result='throttled'`` so the Scholars page can show a
+    rate-limit banner instead of "data not in OpenAlex".
+    """
+    now = datetime.now(UTC)
+    for jid in job_ids:
+        job = session.get(Job, jid)
+        if job is None or job.status in (
+            JobStatus.done.value,
+            JobStatus.failed.value,
+        ):
+            continue
+        job.status = JobStatus.failed.value
+        job.finished_at = now
+        job.message = f"Aborted: {reason}"
+        stats = {**(job.stats or {}), "stage": "aborted", "result": "throttled"}
+        job.stats = stats
+        session.add(job)
+    session.commit()
+    logger.warning(
+        "authors-backfill batch aborted: %d jobs marked throttled (%s)",
+        len(job_ids),
+        reason,
+    )
 
 
 def _run_one(session: Session, job_id: int, paper_id: str) -> None:
@@ -144,15 +191,3 @@ def _run_all_background(job_ids: list[int], paper_ids: list[str]) -> None:
     with SqlSession(engine) as session:
         _run_all(session, job_ids, paper_ids)
 
-
-def _to_out(r: Job) -> JobOut:
-    return JobOut(
-        id=r.id or 0,
-        kind=r.kind,
-        status=r.status,
-        message=r.message,
-        stats=r.stats,
-        started_at=r.started_at,
-        finished_at=r.finished_at,
-        created_at=r.created_at,
-    )

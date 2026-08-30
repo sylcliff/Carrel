@@ -56,6 +56,16 @@ def _select_works(
     cursor: str | None = None
     total: int | None = None
     while True:
+        # Cheap abort: when OpenAlex is currently throttled, stop the cursor
+        # walk instead of paying ~17 s of retry-wait per remaining page. The
+        # partial counts we have so far are still useful for the next sync.
+        if oa.openalex_throttle.is_open():
+            logger.warning(
+                "scholar_works_sync: aborting cursor walk for %s — %s",
+                author_id,
+                oa.openalex_throttle.message(),
+            )
+            break
         items, next_cursor, page_total = oa.fetch_author_works(
             author_id, cursor=cursor, limit=_PAGE_SIZE
         )

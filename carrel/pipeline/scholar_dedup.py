@@ -455,6 +455,18 @@ def run_dedup(
         on_progress({"stage": "profiles", "detail": f"Fetching {len(all_aids)} OpenAlex profiles…"})
     profiles: dict[str, Profile] = {}
     for i, aid in enumerate(sorted(all_aids), start=1):
+        # Cheap abort: when OpenAlex is currently throttled, stop the
+        # profile-fetch loop instead of paying ~17 s of retry-wait per
+        # remaining AID. The partial profile dict is still useful for
+        # the pairwise scoring on what we have.
+        if oa.openalex_throttle.is_open():
+            logger.warning(
+                "scholar_dedup: aborting profile fetch at %d/%d — %s",
+                i,
+                len(all_aids),
+                oa.openalex_throttle.message(),
+            )
+            break
         profiles[aid] = _fetch_profile(aid)
         if on_progress and i % 10 == 0:
             on_progress({"stage": "profiles", "detail": f"Fetched {i}/{len(all_aids)} profiles"})
