@@ -35,6 +35,7 @@ const SOURCE_LABELS: Record<SearchSource, string> = {
   openalex: "OA",
   semantic_scholar: "S2",
   arxiv: "arXiv",
+  crossref: "Crossref",
 };
 
 const SOURCE_BADGE_STYLES: Record<SearchSource, string> = {
@@ -42,6 +43,7 @@ const SOURCE_BADGE_STYLES: Record<SearchSource, string> = {
   openalex: "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200",
   semantic_scholar: "bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200",
   arxiv: "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200",
+  crossref: "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-200",
 };
 
 type SortKey = "relevance" | "citations" | "date";
@@ -388,11 +390,14 @@ export default function Search() {
       // always carry an OA id alongside an arxiv id.
       const oa = r.ids.openalex ?? undefined;
       const s2 = r.ids.s2 ?? undefined;
+      // Crossref-only hits have no "crossref" fast-path in BulkImportItem
+      // (deferred to v2); the DOI carried in `r.ids.doi` below drives the
+      // backend's resolver path instead.
       const source: BulkImportItem["source"] = oa
         ? "openalex"
         : s2
           ? "semantic_scholar"
-          : r.sources[0] ?? null;
+          : (r.sources.find((s) => s !== "crossref") ?? null);
       return {
         openalex_id: oa,
         doi: r.ids.doi ?? undefined,
@@ -546,6 +551,7 @@ export default function Search() {
       openalex: 0,
       semantic_scholar: 0,
       arxiv: 0,
+      crossref: 0,
     };
     for (const r of results) {
       for (const s of r.sources) c[s] += 1;
@@ -566,7 +572,7 @@ export default function Search() {
           Search
         </h1>
         <p className="text-sm text-muted-foreground">
-          Search your library, OpenAlex, Semantic Scholar, and arXiv together.
+          Search your library, OpenAlex, Semantic Scholar, arXiv, and Crossref together.
           Results are merged and deduplicated by DOI / arXiv id.
         </p>
       </header>
@@ -741,7 +747,7 @@ export default function Search() {
 
           {/* Source chip filter + bulk-select-all toggle */}
           <div className="flex flex-wrap items-center gap-1.5">
-            {(["all", "library", "openalex", "semantic_scholar", "arxiv"] as ChipFilter[]).map((s) => (
+            {(["all", "library", "openalex", "semantic_scholar", "arxiv", "crossref"] as ChipFilter[]).map((s) => (
               <button
                 key={s}
                 type="button"

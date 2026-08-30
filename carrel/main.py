@@ -53,6 +53,7 @@ from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.db import init_app_engine, init_db
 from carrel.mcp import start_mcp, stop_mcp
 from carrel.scheduler import start_scheduler, stop_scheduler
+from carrel.sources import crossref_client as cr
 from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
 
@@ -118,6 +119,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # pyalex is configured lazily by the sync pipeline; configure it here too
     # so /search gets the polite-pool mailto and the connect/read timeout.
     oa.configure(cfg)
+    cr.configure(cfg.crossref)
 
     app_config = cfg
     app_env = env

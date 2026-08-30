@@ -95,6 +95,8 @@
 | 迁移 | alembic | |
 | OpenAlex | **pyalex** | 直接依赖 |
 | arXiv | 自己写(参照 paper-agent `sources/arxiv.py`) | arXiv Atom API |
+| Semantic Scholar | 自己写(`sources/semanticscholar_client.py`) | S2 Graph API |
+| Crossref | 自己写(`sources/crossref_client.py`) | Crossref REST API,polite-pool `mailto:` UA 提升速率 |
 | LLM 统一层 | **litellm** | DeepSeek + 火山 Ark 一家一个配置,换模型不改业务代码 |
 | Embedding | 火山 Ark `doubao-embedding-large`(经 litellm) | |
 | PDF 解析 | **MinerU**(独立 Docker,HTTP 调用) | AGPL 但独立进程不传染 |

@@ -63,8 +63,37 @@ def _arxiv_entry(arxiv_id="2401.00001", title="Paper A", summary="abstract"):
     )
 
 
+def _crossref_row(doi="10.1/a", title="Paper A", year="2024-05-12", venue="Nature",
+                  type_="journal-article", arxiv=None, pdf=True):
+    """A raw Crossref message-item dict shaped like the API returns it."""
+    from_published = [int(year[:4])]
+    if len(year) >= 7:
+        from_published.append(int(year[5:7]))
+    if len(year) >= 10:
+        from_published.append(int(year[8:10]))
+    link = []
+    if pdf:
+        link.append({
+            "URL": f"https://example.com/{doi.replace('/', '_')}.pdf",
+            "content-version": "vor",
+            "content-type": "application/pdf",
+        })
+    doi_value = arxiv if arxiv else doi
+    return {
+        "DOI": doi_value,
+        "title": [title],
+        "author": [{"given": "Ada", "family": "Lovelace"}],
+        "container-title": [venue],
+        "type": type_,
+        "abstract": "<jats:p>An abstract.</jats:p>",
+        "published-print": {"date-parts": [from_published]},
+        "link": link,
+    }
+
+
 def _patch_sources(monkeypatch, *, oa_rows=None, s2_rows=None, arxiv_entries=None,
-                   oa_raises=None, s2_raises=None, arxiv_raises=None):
+                   cr_rows=None,
+                   oa_raises=None, s2_raises=None, arxiv_raises=None, cr_raises=None):
     import carrel.api.search as search_mod
 
     def fake_oa_search(*a, **kw):
@@ -82,9 +111,15 @@ def _patch_sources(monkeypatch, *, oa_rows=None, s2_rows=None, arxiv_entries=Non
             raise arxiv_raises
         return list(arxiv_entries or [])
 
+    def fake_cr_search(*a, **kw):
+        if cr_raises:
+            raise cr_raises
+        return list(cr_rows or [])
+
     monkeypatch.setattr(search_mod.oa, "search_work", fake_oa_search)
     monkeypatch.setattr(search_mod.s2, "search_papers", fake_s2_search)
     monkeypatch.setattr(search_mod.arxiv_src, "search", fake_arxiv_search)
+    monkeypatch.setattr(search_mod.cr, "search_papers", fake_cr_search)
 
 
 def test_combined_search_merges_oa_and_s2_by_doi(session, client: TestClient, monkeypatch):
@@ -134,6 +169,108 @@ def test_partial_source_failure_returns_other_results(session, client: TestClien
     body = r.json()
     assert len(body["results"]) == 2
     assert any("semantic_scholar" in w for w in body["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# Crossref
+# ---------------------------------------------------------------------------
+
+
+def test_crossref_only_hit_returns_one_result(session, client: TestClient, monkeypatch):
+    _patch_sources(
+        monkeypatch,
+        cr_rows=[_crossref_row(doi="10.99/c", title="Crossref only", year="2024-05-12")],
+    )
+    r = client.get("/search", params={"q": "x"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["warnings"] == []
+    assert len(body["results"]) == 1
+    item = body["results"][0]
+    assert item["sources"] == ["crossref"]
+    assert item["ids"]["doi"] == "10.99/c"
+    assert item["venue"] == "Nature"
+    assert item["venue_type"] == "journal"
+    # PDF URL picked from the Crossref link[].url.
+    assert item["pdf_url"] == "https://example.com/10.99_c.pdf"
+
+
+def test_crossref_merges_with_oa_on_same_doi(session, client: TestClient, monkeypatch):
+    _patch_sources(
+        monkeypatch,
+        oa_rows=[_oa_work(doi="10.1/a", title="Shared")],
+        cr_rows=[_crossref_row(doi="10.1/a", title="Shared", year="2024-05-12")],
+    )
+    r = client.get("/search", params={"q": "x"})
+    body = r.json()
+    assert len(body["results"]) == 1
+    item = body["results"][0]
+    assert set(item["sources"]) == {"openalex", "crossref"}
+    # DOI is the merge key.
+    assert item["ids"]["doi"] == "10.1/a"
+    assert item["ids"]["openalex"] == "W1"
+
+
+def test_crossref_failure_returns_other_results_with_warning(
+    session, client: TestClient, monkeypatch
+):
+    _patch_sources(
+        monkeypatch,
+        oa_rows=[_oa_work()],
+        cr_raises=RuntimeError("crossref 5xx"),
+    )
+    r = client.get("/search", params={"q": "x"})
+    body = r.json()
+    assert len(body["results"]) == 1
+    assert any("crossref" in w for w in body["warnings"])
+
+
+def test_crossref_zenodo_doi_is_filtered(session, client: TestClient, monkeypatch):
+    """Zenodo deposits are software/datasets, not papers; they should be
+    excluded by the endpoint's is_zenodo() check.
+    """
+    _patch_sources(
+        monkeypatch,
+        cr_rows=[_crossref_row(doi="10.5281/zenodo.12345", title="Zenodo dep", pdf=False)],
+    )
+    r = client.get("/search", params={"q": "x"})
+    body = r.json()
+    assert body["results"] == []
+
+
+def test_crossref_year_filter_post_filtered(session, client: TestClient, monkeypatch):
+    """Defense in depth: the year filter is applied post-fetch too, in case
+    a Crossref row has no published-print block.
+    """
+    _patch_sources(
+        monkeypatch,
+        cr_rows=[
+            _crossref_row(doi="10.99/old", title="Old", year="2015-01-01"),
+            _crossref_row(doi="10.99/new", title="New", year="2024-01-01"),
+        ],
+    )
+    r = client.get("/search", params={"q": "x", "year_from": 2020})
+    body = r.json()
+    assert len(body["results"]) == 1
+    assert body["results"][0]["ids"]["doi"] == "10.99/new"
+
+
+def test_crossref_arxiv_doi_merges_with_arxiv_id(session, client: TestClient, monkeypatch):
+    """A Crossref hit with a 10.48550/arXiv.* DOI should carry the bare
+    arXiv id so the merge layer can collide it with the arXiv source.
+    """
+    _patch_sources(
+        monkeypatch,
+        arxiv_entries=[_arxiv_entry(arxiv_id="2401.00001", title="arXiv version")],
+        cr_rows=[_crossref_row(arxiv="10.48550/arXiv.2401.00001v2",
+                                title="arXiv version", pdf=False)],
+    )
+    r = client.get("/search", params={"q": "x"})
+    body = r.json()
+    assert len(body["results"]) == 1
+    item = body["results"][0]
+    assert set(item["sources"]) == {"arxiv", "crossref"}
+    assert item["ids"]["arxiv"] == "2401.00001"
 
 
 def test_facets_propagate_to_sources(session, client: TestClient, monkeypatch):

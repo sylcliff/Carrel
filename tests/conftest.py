@@ -83,13 +83,15 @@ def client(session: Session):
 
 @pytest.fixture(autouse=True)
 def _reset_throttle_singleton():
-    """Reset the OpenAlex throttle singleton between tests so a recorded
-    latch in test_throttle.py doesn't bleed into other tests' pipeline
-    code (which has top-of-loop ``openalex_throttle.is_open()`` checks that
-    would short-circuit if the singleton were open).
+    """Reset source throttle singletons between tests so a recorded latch in
+    test_throttle.py / test_crossref_client.py doesn't bleed into other
+    tests' pipeline code (which has top-of-loop ``throttle.is_open()`` checks
+    that would short-circuit if the singleton were open).
     """
-    from carrel.sources.throttle import openalex_throttle
+    from carrel.sources.throttle import crossref_throttle, openalex_throttle
 
     openalex_throttle.clear()
+    crossref_throttle.clear()
     yield
     openalex_throttle.clear()
+    crossref_throttle.clear()

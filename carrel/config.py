@@ -94,6 +94,22 @@ class SemanticScholarConfig(BaseModel):
     search_per_page: int = 20
 
 
+class CrossrefConfig(BaseModel):
+    """Crossref REST API client config (https://api.crossref.org).
+
+    Crossref is the DOI registration authority; a "polite pool" (User-Agent
+    containing a ``mailto:``) bumps the rate limit from ~10 to ~50 req/s.
+    No API key required.
+    """
+
+    base_url: str = "https://api.crossref.org"
+    mailto: str | None = None  # polite-pool contact; recommended
+    request_timeout_seconds: int = 30
+    max_retries: int = 3
+    search_enabled: bool = True
+    search_per_page: int = 20
+
+
 class LLMConfig(BaseModel):
     summarize_provider: str = "deepseek"
     summarize_model: str = "deepseek/deepseek-chat"
@@ -276,6 +292,7 @@ class CarrelYAML(BaseModel):
     openalex: OpenAlexConfig = Field(default_factory=OpenAlexConfig)
     arxiv: ArxivConfig = Field(default_factory=ArxivConfig)
     semantic_scholar: SemanticScholarConfig = Field(default_factory=SemanticScholarConfig)
+    crossref: CrossrefConfig = Field(default_factory=CrossrefConfig)
     download: DownloadConfig = Field(default_factory=DownloadConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)

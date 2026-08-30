@@ -25,6 +25,7 @@ from carrel.config import (
     CarrelYAML,
     ChunkingConfig,
     CorsConfig,
+    CrossrefConfig,
     DownloadConfig,
     EmbeddingsConfig,
     HttpConfig,
@@ -49,6 +50,7 @@ SECTION_MODELS: dict[str, type[BaseModel]] = {
     "cors":             CorsConfig,
     "openalex":         OpenAlexConfig,
     "arxiv":            ArxivConfig,
+    "crossref":         CrossrefConfig,
     "semantic_scholar": SemanticScholarConfig,
     "llm":              LLMConfig,
     "embeddings":       EmbeddingsConfig,
@@ -72,6 +74,7 @@ RESTART_REQUIRED_SECTIONS: set[str] = {"storage", "http", "cors", "mcp"}
 ENV_OVERRIDE_FIELDS: dict[str, dict[str, str]] = {
     "openalex":         {"mailto": "OPENALEX_MAILTO",
                          "api_key": "OPENALEX_API_KEY"},
+    "crossref":         {"mailto": "CROSSREF_MAILTO"},
     "semantic_scholar": {"api_key": "S2_API_KEY"},
     "llm":              {"summarize_model": "SUMMARIZE_MODEL",
                          "fallback_model":  "FALLBACK_MODEL"},

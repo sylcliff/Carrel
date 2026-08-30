@@ -1,6 +1,6 @@
 """Search endpoints.
 
-Three sources are fanned out in parallel and merged into one result list:
+Four sources are fanned out in parallel and merged into one result list:
 
   * **library** — SQL ILIKE on title/abstract/authors/identifiers of the
     ``papers`` table.
@@ -10,6 +10,9 @@ Three sources are fanned out in parallel and merged into one result list:
     via the bulk endpoint), contributing citation counts, venue type, and TLDR.
   * **arXiv** — Atom API relevance search, contributing the canonical PDF link
     and the freshest preprint metadata.
+  * **Crossref** — REST API search, contributing DOI-anchored metadata,
+    authors with ORCID + affiliation, and publisher PDF links from the
+    ``link[]`` array (filtered for ``content-version=vor|am`` and ``.pdf``).
 
 Results are deduplicated by DOI → arXiv id → S2 id → OpenAlex id → normalized
 title, merged with field-authority rules in :mod:`carrel.sources.merge`, and
@@ -50,6 +53,7 @@ from carrel.schemas import (
     SemanticSearchResult,
 )
 from carrel.sources import arxiv as arxiv_src
+from carrel.sources import crossref_client as cr
 from carrel.sources import merge as merge_mod
 from carrel.sources import openalex_client as oa
 from carrel.sources import semanticscholar_client as s2
@@ -144,6 +148,7 @@ _ALLOWED_SOURCES = {
     merge_mod.SOURCE_OPENALEX,
     merge_mod.SOURCE_SEMANTIC_SCHOLAR,
     merge_mod.SOURCE_ARXIV,
+    merge_mod.SOURCE_CROSSREF,
 }
 
 
@@ -287,6 +292,48 @@ def _search_arxiv(
     return out
 
 
+def _search_crossref(
+    q: str, filters: SearchFilters, limit: int
+) -> list[merge_mod.MutableSearchHit]:
+    rows = cr.search_papers(
+        q,
+        limit=limit,
+        year_from=filters.year_from,
+        year_to=filters.year_to,
+        sort=filters.sort,
+    )
+    out: list[merge_mod.MutableSearchHit] = []
+    for i, row in enumerate(rows):
+        # Zenodo filter: software/dataset deposits, not papers.
+        if is_zenodo(cr.work_doi(row), cr.work_venue(row)):
+            continue
+        hit = merge_mod.from_crossref_row(row)
+        if hit is None:
+            continue
+        # Defense in depth: Crossref's `from-pub-date` / `until-pub-date`
+        # server filter is precise but doesn't reject malformed records
+        # (e.g. no `published-print` block); post-filter by year so a bad
+        # row can't slip through.
+        if filters.year_from and hit.publication_date:
+            try:
+                year = int(hit.publication_date[:4])
+            except ValueError:
+                year = None
+            if year is not None and year < filters.year_from:
+                continue
+        if filters.year_to and hit.publication_date:
+            try:
+                year = int(hit.publication_date[:4])
+            except ValueError:
+                year = None
+            if year is not None and year > filters.year_to:
+                continue
+        hit.ranks[merge_mod.SOURCE_CROSSREF] = i + 1
+        hit.snippet = _abstract_excerpt(hit.abstract, q)
+        out.append(hit)
+    return out
+
+
 def _multi_source_search(
     q: str, filters: SearchFilters, per_source_limit: int
 ) -> tuple[list[merge_mod.MutableSearchHit], list[str]]:
@@ -310,6 +357,11 @@ def _multi_source_search(
             _search_arxiv,
             (q, filters, per_source_limit),
         )
+    if merge_mod.SOURCE_CROSSREF in enabled:
+        jobs[merge_mod.SOURCE_CROSSREF] = (
+            _search_crossref,
+            (q, filters, per_source_limit),
+        )
 
     results: dict[str, list[merge_mod.MutableSearchHit]] = {}
     warnings: list[str] = []
@@ -323,6 +375,16 @@ def _multi_source_search(
         for name, fut in futures.items():
             try:
                 results[name] = fut.result()
+            except oa._OpenAlexThrottled as e:
+                # Only OpenAlex has a dedicated long-lived latch surfaced as
+                # an exception; the Crossref / S2 / arXiv throttles return
+                # their empty sentinel in-band and reach the generic
+                # except-Exception branch below as empty results, so the
+                # user sees the source missing but no noisy warning.
+                msg = e.message or "rate-limited"
+                logger.info("search source %s throttled for %r: %s", name, q, msg)
+                warnings.append(f"{name}: {msg}")
+                results[name] = []
             except Exception as e:  # noqa: BLE001 - per-source soft failure
                 logger.warning("search source %s failed for %r: %s", name, q, e)
                 warnings.append(f"{name}: {e}")
@@ -1000,7 +1062,18 @@ def import_external_paper(
             detail="Zenodo deposits are not papers and cannot be imported into the library",
         )
 
-    return _import_one_paper(session, work, source)
+    out = _import_one_paper(session, work, source)
+
+    # /scholars keys off `Paper.authors` on in-library papers, so any
+    # successful import — whether a brand-new record (created=True) or an
+    # existing one whose `in_library` flag just flipped — changes the
+    # aggregated author set. The /papers list also needs to refresh.
+    # Bulk imports handle their own invalidation in import_bulk._drive_batch
+    # (one fan-out at job end, not per item), so we only invalidate here.
+    from carrel.api._invalidation import invalidate_paper_mutated
+    invalidate_paper_mutated(out.id, mutate={"inbox"})
+
+    return out
 
 
 def _import_one_paper(

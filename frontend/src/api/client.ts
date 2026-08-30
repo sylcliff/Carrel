@@ -981,7 +981,7 @@ export const updateSettings = (
 
 // -------- Search (M5) --------
 
-export type SearchSource = "library" | "openalex" | "semantic_scholar" | "arxiv";
+export type SearchSource = "library" | "openalex" | "semantic_scholar" | "arxiv" | "crossref";
 
 export interface SearchResultIds {
   openalex: string | null;

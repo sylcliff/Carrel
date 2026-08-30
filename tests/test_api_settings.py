@@ -52,9 +52,9 @@ def test_get_settings_returns_all_sections(client, tmp_config: Path):
     data = r.json()
 
     expected_sections = {
-        "storage", "http", "cors", "openalex", "arxiv", "semantic_scholar",
-        "llm", "embeddings", "mineru", "chunking", "download", "schedule",
-        "mcp",
+        "storage", "http", "cors", "openalex", "arxiv", "crossref",
+        "semantic_scholar", "llm", "embeddings", "mineru", "chunking",
+        "download", "schedule", "mcp",
     }
     assert set(data["sections"]) == expected_sections
     assert data["yaml_path"] == str(tmp_config)

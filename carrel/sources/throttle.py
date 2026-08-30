@@ -152,11 +152,18 @@ class Throttle:
 
 
 # ---------------------------------------------------------------------------
-# Singleton for the only source we currently throttle: OpenAlex.
-# Future sources (S2, arXiv) get their own ``Throttle("name", ...)`` here.
+# Singletons: one per source we throttle.
+# Future sources (S2, arXiv, Crossref, …) get their own ``Throttle("name", …)``
+# here.
 # ---------------------------------------------------------------------------
 openalex_throttle = Throttle(
     "openalex",
+    default_cooldown=300.0,
+    max_cooldown=86400.0,
+)
+
+crossref_throttle = Throttle(
+    "crossref",
     default_cooldown=300.0,
     max_cooldown=86400.0,
 )

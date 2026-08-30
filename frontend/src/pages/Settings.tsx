@@ -140,6 +140,21 @@ const SECTION_SPECS: Record<string, SectionSpec> = {
       search_per_page:               { label: "Search per page",     kind: "int" },
     },
   },
+  crossref: {
+    title: "Crossref",
+    description:
+      "Crossref REST API client. The polite-pool contact (mailto) is sent " +
+      "in the User-Agent and bumps the free-tier rate limit from ~10 to " +
+      "~50 req/s. Restart required for changes to take effect.",
+    fields: {
+      base_url:                { label: "Base URL",            kind: "text" },
+      mailto:                  { label: "Polite-pool email",   kind: "text", hint: "User-Agent mailto; required for the polite pool" },
+      request_timeout_seconds: { label: "Request timeout (s)", kind: "int" },
+      max_retries:             { label: "Max retries",         kind: "int" },
+      search_enabled:          { label: "Search enabled",      kind: "bool" },
+      search_per_page:         { label: "Search per page",     kind: "int" },
+    },
+  },
   download: {
     title: "PDF download",
     description: "Network limits for the PDF downloader.",
@@ -203,7 +218,7 @@ const SECTION_SPECS: Record<string, SectionSpec> = {
 // sees the safe-to-edit sections first.
 const SECTION_ORDER = [
   "llm", "embeddings", "mineru", "openalex", "semantic_scholar",
-  "arxiv", "download", "chunking", "schedule",
+  "arxiv", "crossref", "download", "chunking", "schedule",
   "storage", "http", "cors",
 ];
 

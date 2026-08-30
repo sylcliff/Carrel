@@ -1,20 +1,21 @@
 """Merge search hits from multiple metadata sources into one deduplicated list.
 
-The search endpoint fans out to OpenAlex, Semantic Scholar, and arXiv. Each
-source returns the same paper under slightly different ids, fields, and
-quality signals. This module collapses them:
+The search endpoint fans out to OpenAlex, Semantic Scholar, arXiv, and
+Crossref. Each source returns the same paper under slightly different ids,
+fields, and quality signals. This module collapses them:
 
   * dedup keys tried in order — DOI, arXiv id, S2 paper id, OpenAlex W id,
     then a normalized title as a last resort;
   * field authority on collision:
       - citation_count: max across sources (S2 is freshest but we don't trust
         one source blindly);
-      - venue / venue_type: S2's publicationVenue wins, else OA, else arXiv
-        (arXiv contributes nothing for venue);
-      - authors: first non-empty, preferring OpenAlex (it has ids + affiliation);
+      - venue / venue_type: S2 wins (clean publicationVenue split), then
+        Crossref (raw container-title), then OA, then arXiv;
+      - authors: first non-empty, preferring OpenAlex (it has ids + affiliation),
+        then S2, then Crossref;
       - abstract: first non-empty;
       - pdf_url: arXiv PDF wins (canonical, never a landing page), then OA,
-        then S2;
+        then Crossref, then S2;
       - tldr: S2 only;
       - ids: union — never drop an id a source contributed.
 
@@ -32,6 +33,7 @@ from typing import Any
 SOURCE_OPENALEX = "openalex"
 SOURCE_SEMANTIC_SCHOLAR = "semantic_scholar"
 SOURCE_ARXIV = "arxiv"
+SOURCE_CROSSREF = "crossref"
 SOURCE_LIBRARY = "library"
 
 
@@ -160,6 +162,42 @@ def from_arxiv_entry(entry: Any) -> MutableSearchHit | None:
         pdf_url=getattr(entry, "pdf_url", None),
         arxiv_id=arxiv_id,
         sources={SOURCE_ARXIV},
+    )
+
+
+def from_crossref_row(row: dict[str, Any]) -> MutableSearchHit | None:
+    """Build a hit from a raw Crossref ``message.items[*]`` dict.
+
+    Identity is the DOI (Crossref IS the DOI registry). No separate
+    ``crossref_paper_id`` — a Crossref hit with no DOI falls through to
+    title-only dedup, same as any other source without an id.
+
+    Crossref's ``is-referenced-by-count`` is unreliable for newly registered
+    DOIs, so we deliberately leave ``citation_count`` empty and let the
+    other sources fill it in via the merge's max rule.
+    """
+    # Lazy import: crossref_client configures its httpx client at import time
+    # and we don't want a circular import at module load.
+    from carrel.sources import crossref_client as cr
+
+    title = cr.work_title(row).strip()
+    if not title or title == "(untitled)":
+        return None
+    doi = _clean_doi(cr.work_doi(row))
+    arxiv_id = cr.work_arxiv_id(row)
+    return MutableSearchHit(
+        title=title,
+        authors=[a["name"] for a in cr.work_authors(row) if a.get("name")],
+        abstract=cr.work_abstract(row),
+        venue=cr.work_venue(row),
+        venue_type=cr.work_venue_type(row),
+        publication_date=cr.work_publication_date(row),
+        # Citation count left None; see docstring.
+        citation_count=None,
+        pdf_url=cr.work_pdf_url(row),
+        doi=doi,
+        arxiv_id=arxiv_id,
+        sources={SOURCE_CROSSREF},
     )
 
 
@@ -325,20 +363,24 @@ def _merge_into(dst: MutableSearchHit, src: MutableSearchHit) -> None:
 
 
 # Venue authority: library (already normalized/imported) > S2 (cleanest
-# journal/conference split) > OA > arXiv (no venue). Higher = more authoritative.
+# journal/conference split) > Crossref (raw container-title) > OA > arXiv
+# (no venue). Higher = more authoritative.
 _VENUE_PRIORITY = {
-    SOURCE_LIBRARY: 4,
-    SOURCE_SEMANTIC_SCHOLAR: 3,
+    SOURCE_LIBRARY: 5,
+    SOURCE_SEMANTIC_SCHOLAR: 4,
+    SOURCE_CROSSREF: 3,
     SOURCE_OPENALEX: 2,
     SOURCE_ARXIV: 1,
 }
 
 # Author authority: library wins (it's the user's copy, originally normalized
-# from OA during import); then OpenAlex (IDs + affiliations), S2, arXiv.
+# from OA during import); then OpenAlex (IDs + affiliations), S2, Crossref
+# (raw "Given Family", no affiliations), arXiv.
 _AUTHOR_PRIORITY = {
-    SOURCE_LIBRARY: 4,
-    SOURCE_OPENALEX: 3,
-    SOURCE_SEMANTIC_SCHOLAR: 2,
+    SOURCE_LIBRARY: 5,
+    SOURCE_OPENALEX: 4,
+    SOURCE_SEMANTIC_SCHOLAR: 3,
+    SOURCE_CROSSREF: 2,
     SOURCE_ARXIV: 1,
 }
 
@@ -371,8 +413,8 @@ def _pick_by_priority(
 
 
 def _pick_pdf(dst: MutableSearchHit, src: MutableSearchHit) -> str | None:
-    """arXiv PDF > OA PDF > S2 PDF. First non-empty in priority order."""
-    order = [SOURCE_ARXIV, SOURCE_OPENALEX, SOURCE_SEMANTIC_SCHOLAR]
+    """arXiv PDF > OA PDF > Crossref PDF > S2 PDF. First non-empty in priority order."""
+    order = [SOURCE_ARXIV, SOURCE_OPENALEX, SOURCE_CROSSREF, SOURCE_SEMANTIC_SCHOLAR]
     candidates = {s: None for s in order}
     # Attribute each side's pdf_url to whichever source it came from. If a hit
     # has multiple sources, we don't know per-field, so attribute to its

@@ -41,6 +41,12 @@ semantic_scholar:
   citations_limit: 500                # cap stored "cited by" list per paper
   fetch_on_sync: true                 # look up citations for newly synced papers
 
+crossref:
+  base_url: https://api.crossref.org
+  mailto: you@example.com             # polite-pool contact; raises rate limit ~10 → ~50 req/s
+  request_timeout_seconds: 30
+  max_retries: 3
+
 download:
   request_timeout_seconds: 60
   max_bytes: 83886080                  # 80 MiB; larger PDFs are skipped
