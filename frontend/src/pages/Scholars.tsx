@@ -51,6 +51,17 @@ export default function Scholars() {
     suggested: number;
     skipped_rejected: number;
   } | null>(null);
+  // Same idea for backfill: the batch is N per-paper jobs, and a
+  // summary helps the user tell apart "ran but OpenAlex had no record
+  // for these" from "actually filled the gaps".
+  const [backfillResult, setBackfillResult] = useState<{
+    total: number;
+    filled: number;
+    skipped: number;
+    failed: number;
+    throttled: number;
+    pending: number;
+  } | null>(null);
   const pollRef = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
@@ -139,6 +150,35 @@ export default function Scholars() {
           backfillJobs.some((j) => ["queued", "running"].includes(j.status))
         ) {
           setBackfillRunning(true);
+        } else {
+          // Resurrect the most recent backfill summary so navigating
+          // away and back doesn't lose it. The window matches the
+          // dedup one: 10 minutes — old Job rows report stale counts.
+          const last = backfillJobs.find((j) => j.status === "done");
+          const recent =
+            last?.finished_at &&
+            Date.now() - new Date(last.finished_at).getTime() < 10 * 60 * 1000;
+          if (recent) {
+            const summary = backfillJobs.reduce(
+              (acc, j) => {
+                if (j.status === "failed") {
+                  const result = (j.stats as { result?: string } | null)?.result;
+                  if (result === "throttled") acc.throttled += 1;
+                  else acc.failed += 1;
+                } else if (j.status === "done") {
+                  const result = (j.stats as { result?: string } | null)
+                    ?.result;
+                  if (result === "filled") acc.filled += 1;
+                  else if (result === "throttled") acc.throttled += 1;
+                  else if (result === "failed") acc.failed += 1;
+                  else acc.skipped += 1;
+                }
+                return acc;
+              },
+              { total: backfillJobs.length, filled: 0, skipped: 0, failed: 0, throttled: 0, pending: 0 },
+            );
+            setBackfillResult(summary);
+          }
         }
       } catch {
         // Non-fatal: the user can still click scan manually.
@@ -159,7 +199,9 @@ export default function Scholars() {
       try {
         const [dedupJobs, backfillJobs] = await Promise.all([
           listJobs({ kind: "scholar_dedup", limit: 5 }),
-          listJobs({ kind: "authors_backfill", limit: 5 }),
+          // Backfill creates one Job per paper (up to `limit`), so 5 is
+          // too small — bump to cover the full batch we typically queue.
+          listJobs({ kind: "authors_backfill", limit: 500 }),
         ]);
         if (cancelled) return;
 
@@ -181,13 +223,53 @@ export default function Scholars() {
         } else if (dedupRunning) {
           parts.push("Finishing dedup…");
         }
-        if (backfillActive.length > 0) {
-          const detail =
-            (backfillJobs[0]?.stats as { detail?: string } | null)?.detail ??
-            null;
-          parts.push(
-            `Resolving authors${detail ? ` — ${detail}` : ""}`,
+        if (backfillActive.length > 0 || backfillRunning) {
+          // Aggregate by status + by per-job result (filled/skipped/failed)
+          // so the user sees real progress, not just a per-paper "looking
+          // up" hint that doesn't change visibly.
+          const stats = backfillJobs.reduce(
+            (acc, j) => {
+              if (j.status === "queued" || j.status === "running") {
+                acc.pending += 1;
+                if (j.status === "running") acc.running += 1;
+              } else if (j.status === "failed") {
+                // Throttled jobs live in status='failed' (see _abort_remaining
+                // in the backend); we have to peek at stats.result to
+                // distinguish them from real lookup failures.
+                const result = (j.stats as { result?: string } | null)?.result;
+                if (result === "throttled") acc.throttled += 1;
+                else acc.failed += 1;
+              } else if (j.status === "done") {
+                const result = (j.stats as { result?: string } | null)
+                  ?.result;
+                if (result === "filled") acc.filled += 1;
+                else if (result === "skipped") acc.skipped += 1;
+                else if (result === "throttled") acc.throttled += 1;
+                else if (result === "failed") acc.failed += 1;
+                else acc.done += 1;
+              }
+              return acc;
+            },
+            { filled: 0, skipped: 0, failed: 0, throttled: 0, done: 0, running: 0, pending: 0 },
           );
+          const total = backfillJobs.length;
+          const finished = total - stats.pending;
+          const head = `Resolving authors — ${finished}/${total} done`;
+          const counts: string[] = [];
+          if (stats.filled) counts.push(`${stats.filled} filled`);
+          if (stats.skipped) counts.push(`${stats.skipped} skipped`);
+          if (stats.failed) counts.push(`${stats.failed} failed`);
+          if (stats.throttled)
+            counts.push(`${stats.throttled} throttled (rate-limited)`);
+          const tail = counts.length ? ` (${counts.join(", ")})` : "";
+          const runningDetail =
+            stats.running > 0
+              ? (backfillJobs.find((j) => j.status === "running")?.stats as
+                  | { detail?: string }
+                  | null)?.detail
+              : null;
+          const suffix = runningDetail ? ` · current: ${runningDetail}` : "";
+          parts.push(`${head}${tail}${suffix}`);
         }
         setProgress(parts.length ? parts.join(" · ") : null);
 
@@ -214,6 +296,35 @@ export default function Scholars() {
         }
         if (backfillRunning && backfillActive.length === 0) {
           setBackfillRunning(false);
+          // Capture the final per-paper outcome so the user can tell a
+          // "300 looked up, 12 filled, 288 OA-had-no-record" run from a
+          // successful one. Cleared on the next click of Resolve authors.
+          const summary = backfillJobs.reduce(
+            (acc, j) => {
+              if (j.status === "queued" || j.status === "running") {
+                acc.pending += 1;
+              } else if (j.status === "failed") {
+                // _abort_remaining writes status='failed' + result='throttled'
+                // together; without peeking at the result stat, the
+                // 500 throttled jobs from a rate-limited batch would
+                // all show as plain failures.
+                const result = (j.stats as { result?: string } | null)?.result;
+                if (result === "throttled") acc.throttled += 1;
+                else acc.failed += 1;
+              } else if (j.status === "done") {
+                const result = (j.stats as { result?: string } | null)
+                  ?.result;
+                if (result === "filled") acc.filled += 1;
+                else if (result === "skipped") acc.skipped += 1;
+                else if (result === "throttled") acc.throttled += 1;
+                else if (result === "failed") acc.failed += 1;
+                else acc.skipped += 1;  // legacy jobs without result
+              }
+              return acc;
+            },
+            { total: backfillJobs.length, filled: 0, skipped: 0, failed: 0, throttled: 0, pending: 0 },
+          );
+          setBackfillResult(summary);
         }
         if (dedupActive.length === 0 && backfillActive.length === 0) {
           setProgress(null);
@@ -232,6 +343,9 @@ export default function Scholars() {
   }, [anyRunning, dedupRunning, backfillRunning, refresh, loadSnapshot, showDedup]);
 
   async function resolveAll() {
+    // Clear any prior summary so a new batch doesn't briefly show
+    // the old fill/skip counts while the new one is still queueing.
+    setBackfillResult(null);
     setBackfillRunning(true);
     setProgress("Starting…");
     try {
@@ -429,6 +543,82 @@ export default function Scholars() {
             type="button"
             onClick={() => setDedupResult(null)}
             className="text-emerald-700/70 hover:text-emerald-700 dark:text-emerald-400/70 dark:hover:text-emerald-300"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+      {backfillResult && !backfillRunning && backfillResult.throttled > 0 && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-2 rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-800 dark:text-rose-300"
+        >
+          <span>
+            <strong>OpenAlex is rate-limiting us.</strong>{" "}
+            {backfillResult.throttled} of {backfillResult.total} paper
+            {backfillResult.total === 1 ? "" : "s"} were aborted because the
+            free-tier budget (1000 calls/IP-day) is exhausted. Free tier
+            resets at next UTC midnight — re-run <em>Resolve authors</em>{" "}
+            after that.
+            {backfillResult.filled > 0 && (
+              <>
+                {" "}
+                <strong>{backfillResult.filled}</strong> were filled before
+                the cap was hit.
+              </>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={() => setBackfillResult(null)}
+            className="text-rose-700/70 hover:text-rose-700 dark:text-rose-400/70 dark:hover:text-rose-300"
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+      {backfillResult && !backfillRunning && backfillResult.throttled === 0 && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-2 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-800 dark:text-sky-300"
+        >
+          <span>
+            <strong>Resolve authors finished.</strong>{" "}
+            Looked up {backfillResult.total} paper
+            {backfillResult.total === 1 ? "" : "s"}.
+            {backfillResult.filled > 0 && (
+              <>
+                {" "}
+                Filled OpenAlex IDs on{" "}
+                <strong>{backfillResult.filled}</strong>.
+              </>
+            )}
+            {backfillResult.skipped > 0 && (
+              <>
+                {" "}
+                {backfillResult.skipped} had no record in OpenAlex (skipped).
+              </>
+            )}
+            {backfillResult.failed > 0 && (
+              <>
+                {" "}
+                <span className="text-rose-700 dark:text-rose-400">
+                  {backfillResult.failed} failed
+                </span>
+                .
+              </>
+            )}
+            {backfillResult.filled === 0 &&
+              backfillResult.failed === 0 && (
+                <> Nothing to update.</>
+              )}
+          </span>
+          <button
+            type="button"
+            onClick={() => setBackfillResult(null)}
+            className="text-sky-700/70 hover:text-sky-700 dark:text-sky-400/70 dark:hover:text-sky-300"
             aria-label="Dismiss"
           >
             ×

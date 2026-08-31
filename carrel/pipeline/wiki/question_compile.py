@@ -31,7 +31,7 @@ from sqlmodel import Session, select
 from carrel import embeddings, llm, prompts_runtime, usage
 from carrel.config import CarrelYAML
 from carrel.models import WikiKind, WikiPage, WikiSource
-from carrel.pipeline.summarize import _prepare_body
+from carrel.pipeline._section_picker import prepare_picker_input
 from carrel.pipeline.wiki import _frontmatter, _merge, _reindex, _slug
 from carrel.pipeline.wiki._questions_agg import (
     EVIDENCE_THRESHOLD,
@@ -105,7 +105,7 @@ def _paper_snippet(idx: int, paper: Any) -> str:
     bits.append(f"    Venue/year: {venue} · {year}")
     body = paper.tldr_en or paper.abstract or ""
     if body:
-        bits.append(f"    Abstract: {_prepare_body(body, 1000)}")
+        bits.append(f"    Abstract: {prepare_picker_input(body, budget_chars=1000)}")
     return "\n".join(bits)
 
 
@@ -118,7 +118,7 @@ def _build_user_prompt(*, question_display, papers, old_body):
     if old_body:
         parts.append(
             "Previous version of this page (revise and update):\n"
-            + _prepare_body(old_body, 2500)
+            + prepare_picker_input(old_body, budget_chars=2500)
         )
     return prompts_runtime.get_user_template(
         "wiki_question", _USER_TEMPLATE

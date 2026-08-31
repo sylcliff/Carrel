@@ -17,6 +17,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlmodel import Session
 
 from carrel.db import get_session_dep
+from carrel.api._job_io import job_to_out
 from carrel.models import AuthorWorksSync, Job, JobKind, JobStatus
 from carrel.pipeline.scholar_works_sync import sync_scholar_works
 from carrel.pipeline.wiki._scholars_agg import NAME_KEY_PREFIX
@@ -27,18 +28,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scholars", tags=["scholars"])
 
-
-def _to_out(r: Job) -> JobOut:
-    return JobOut(
-        id=r.id or 0,
-        kind=r.kind,
-        status=r.status,
-        message=r.message,
-        stats=r.stats,
-        started_at=r.started_at,
-        finished_at=r.finished_at,
-        created_at=r.created_at,
-    )
 
 
 def _resolve_aid(session: Session, key: str) -> str:
@@ -174,7 +163,7 @@ def refresh_scholar_works(
         _run_refresh_job(job_id, aid)
         session.refresh(job)
 
-    return _to_out(job)
+    return job_to_out(job)
 
 
 @router.get("/{key}/sync_status", response_model=ScholarSyncStatusOut)

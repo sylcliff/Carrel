@@ -71,16 +71,34 @@ def etag_for_list(
     The fingerprint is the SHA-1 of the sorted row ids, so a list with the same
     max timestamp but a different row set gets a different ETag. The
     ``count`` is mixed in as a final safety belt.
+
+    For the empty list (``max_updated_at is None and count == 0``) a fixed
+    ETag is returned so a fresh-install /library response can still 304
+    on subsequent visits. The first row added produces a different
+    ``(count, ids, timestamp)`` triple and therefore a different ETag,
+    so the transition is naturally visible.
     """
     if max_updated_at is None and count == 0:
-        # Empty list, never touched — caller can skip ETag or use a fixed
-        # empty-list ETag. We return None so the caller decides.
-        return None
+        return f'{_WEAK_PREFIX}0:empty:empty"'
     ids_digest = hashlib.sha1(
         "".join(sorted(row_ids)).encode("utf-8"),
     ).hexdigest()[:12]
     iso = max_updated_at.isoformat() if max_updated_at else "empty"
     return f'{_WEAK_PREFIX}{count}:{ids_digest}:{iso}"'
+
+
+def _cache_control_value(*, max_age: int, stale_while_revalidate: int) -> str:
+    """Build the ``Cache-Control`` literal. Single source of truth — both
+    the 200 path (:func:`apply_etag_headers`) and the 304 path
+    (:func:`maybe_return_304`) route through here so a future change to
+    the literal (e.g. adding ``must-revalidate``) can never drift
+    between the two responses."""
+    if stale_while_revalidate > 0:
+        return (
+            f"private, max-age={max_age}, "
+            f"stale-while-revalidate={stale_while_revalidate}"
+        )
+    return f"private, max-age={max_age}"
 
 
 def apply_etag_headers(
@@ -98,15 +116,45 @@ def apply_etag_headers(
     changed). The ``private`` directive prevents shared caches (and any
     forward proxy) from storing user-specific responses.
     """
-    if stale_while_revalidate > 0:
-        cache_control = (
-            f"private, max-age={max_age}, "
-            f"stale-while-revalidate={stale_while_revalidate}"
-        )
-    else:
-        cache_control = f"private, max-age={max_age}"
     response.headers["ETag"] = etag
-    response.headers["Cache-Control"] = cache_control
+    response.headers["Cache-Control"] = _cache_control_value(
+        max_age=max_age, stale_while_revalidate=stale_while_revalidate
+    )
+
+
+def maybe_return_304(
+    request: Request,
+    etag: str | None,
+    *,
+    max_age: int,
+    stale_while_revalidate: int = 0,
+) -> Response | None:
+    """Return a 304 ``Response`` if the request's ``If-None-Match`` matches.
+
+    Returns ``None`` when the caller should serve the 200 body and apply
+    the matching ``ETag`` / ``Cache-Control`` via :func:`apply_etag_headers`.
+    Use this in a read route to collapse the 304 / 200 branch into two
+    short lines::
+
+        if (r := maybe_return_304(request, etag, max_age=60, swr=120)):
+            return r
+        apply_etag_headers(response, etag, max_age=60, swr=120)
+        return body
+
+    The ``etag`` is allowed to be ``None`` (caller did not produce one);
+    in that case we always fall through to the 200 path.
+    """
+    if etag is None or not if_none_match_matches(request, etag):
+        return None
+    return Response(
+        status_code=304,
+        headers={
+            "ETag": etag,
+            "Cache-Control": _cache_control_value(
+                max_age=max_age, stale_while_revalidate=stale_while_revalidate
+            ),
+        },
+    )
 
 
 def if_none_match_matches(request: Request, etag: str) -> bool:
@@ -121,12 +169,22 @@ def if_none_match_matches(request: Request, etag: str) -> bool:
         return False
     if header.strip() == "*":
         return True
-    # Compare each candidate; tolerate weak/strong prefix differences.
+    # RFC 7232 §2.3.2 weak comparison: the only difference between
+    # ``W/"a"`` and ``"a"`` is the weak prefix.  Use ``startswith`` on the
+    # prefix and byte-equality on the opaque-tag payload — ``endswith``
+    # is a byte-substring check and would let a prefix ETag match a
+    # different (longer) one (e.g. ``W/"a"`` matching ``W/"abc"``).
+    server_opaque = etag[len(_WEAK_PREFIX):-1] if etag.startswith(_WEAK_PREFIX) else etag[1:-1]
     candidates = [c.strip() for c in header.split(",")]
     for candidate in candidates:
-        if candidate == etag:
-            return True
-        # Tolerate ``W/"..."`` vs ``"..."`` by stripping the weak prefix.
-        if candidate.endswith(etag) or etag.endswith(candidate):
+        if not candidate:
+            continue
+        if candidate.startswith(_WEAK_PREFIX) and candidate.endswith('"'):
+            cand_opaque = candidate[len(_WEAK_PREFIX):-1]
+        elif candidate.startswith('"') and candidate.endswith('"'):
+            cand_opaque = candidate[1:-1]
+        else:
+            continue
+        if cand_opaque == server_opaque:
             return True
     return False

@@ -185,10 +185,9 @@ def select_sections(
             continue
         if not body or not body.strip():
             continue
-        cls = _classify(heading)
-        if cls is None:
-            continue
-        prio, label = cls
+        # _classify never returns None — it falls back to (99, leaf-or-"Body")
+        # for unranked sections. Direct unpack.
+        prio, label = _classify(heading)
         candidates.append((prio, order, label, body.strip()))
 
     candidates.sort(key=lambda x: (x[0], x[1]))
@@ -258,14 +257,21 @@ def prepare_picker_input(
     """
     if not md or not md.strip():
         return ""
-    md = _strip_image_lines(md)
+    # Don't pre-strip here — ``select_sections`` already calls
+    # ``_strip_image_lines`` internally.  An extra pass would double
+    # the O(n) work for every LLM call (paper_card, paper_extract,
+    # summarize, chat-fallback) without changing the output.  The
+    # fallback path below also strips to keep image-base64 out of the
+    # head+tail window the LLM sees.
     picked = select_sections(
         md, budget_chars=budget_chars, per_section_cap=per_section_cap
     )
     if picked:
         return render_numbered(picked)
-    # Fallback: no usable sections → first + last char windows.
-    cleaned = md.strip()
+    # Fallback: no usable sections → first + last char windows.  Strip
+    # image lines here because this path bypasses ``select_sections``
+    # (and therefore the strip it does internally).
+    cleaned = _strip_image_lines(md).strip()
     half = max(budget_chars // 2, 500)
     if len(cleaned) <= budget_chars:
         return cleaned

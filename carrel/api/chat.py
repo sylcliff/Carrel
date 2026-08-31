@@ -103,10 +103,12 @@ def _retrieve_chunks(
     # When the paper has no usable embeddings, we still want the chat LLM
     # to see *some* paper content.  The picker drops references /
     # acknowledgments / supplementary and fills the budget with the
-    # method / results / conclusion blocks (rendered with section
-    # labels) so the answer LLM can ground each fact to a specific
-    # section — same UX as the embedding path, just via a different
-    # retrieval mechanism.
+    # method / results / conclusion blocks (rendered with numbered
+    # section labels like ``## [1] Method``) so the answer LLM can
+    # ground each fact to a specific section — same UX as the embedding
+    # path, just via a different retrieval mechanism.  The ``[N]`` is a
+    # picker index, not a bibliography reference; the header below
+    # tells the LLM so it doesn't cite ``[1]`` as if it were a citation.
     if not paper.md_path:
         raise HTTPException(status_code=409, detail="paper has no parsed markdown yet")
     full = Path(_storage_root()) / paper.md_path
@@ -116,7 +118,13 @@ def _retrieve_chunks(
         full.read_text(encoding="utf-8", errors="replace"),
         budget_chars=_chat_fulltext_chars(),
     )
-    header = f"Title: {paper.title}\nAuthors: {_authors(paper)}"
+    header = (
+        f"Title: {paper.title}\n"
+        f"Authors: {_authors(paper)}\n"
+        "(Sections are labelled ``## [N] Heading`` where ``[N]`` is a "
+        "picker index for cross-referencing — it is NOT a bibliography "
+        "reference. Cite by section heading, not by number.)"
+    )
     return f"{header}\n\n{body}", ["full text (section-picker)"]
 
 

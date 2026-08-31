@@ -14,6 +14,8 @@ from sqlmodel import Session
 
 from carrel.db import get_session_dep
 from carrel.api._invalidation import invalidate_paper_mutated
+from carrel.api._job_io import job_to_out
+from carrel.api._job_progress import make_progress_cb
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.embed import EmbedError, embed_paper
 from carrel.schemas import EmbedRequest, JobOut
@@ -77,29 +79,11 @@ def trigger_embed(
         _run_all(session, job_ids, paper_ids)
         for j in jobs:
             session.refresh(j)
-    return [_to_out(j) for j in jobs]
+    return [job_to_out(j) for j in jobs]
 
 
 def _make_progress_cb(session: Session, job_id: int):
-    def _cb(progress: dict) -> None:
-        job = session.get(Job, job_id)
-        if job is None:
-            return
-        stage = progress.get("stage", "embed")
-        detail = progress.get("detail", "")
-        title = progress.get("paper_title") or ""
-        stats = {**(job.stats or {})}
-        stats["stage"] = stage
-        stats["detail"] = detail
-        if "paper_id" in progress:
-            stats["paper_id"] = progress["paper_id"]
-        if "paper_title" in progress:
-            stats["paper_title"] = progress["paper_title"]
-        job.stats = stats
-        job.message = f"{title} — {detail}" if (title and detail) else (detail or job.message)
-        session.add(job)
-        session.commit()
-    return _cb
+    return make_progress_cb(session, job_id, default_stage="embed")
 
 
 def _run_all(session: Session, job_ids: list[int], paper_ids: list[str]) -> None:
@@ -176,15 +160,3 @@ def _run_all_background(job_ids: list[int], paper_ids: list[str]) -> None:
         for job_id, paper_id in zip(job_ids, paper_ids, strict=True):
             _run_one(session, job_id, paper_id, app_config)
 
-
-def _to_out(r: Job) -> JobOut:
-    return JobOut(
-        id=r.id or 0,
-        kind=r.kind,
-        status=r.status,
-        message=r.message,
-        stats=r.stats,
-        started_at=r.started_at,
-        finished_at=r.finished_at,
-        created_at=r.created_at,
-    )

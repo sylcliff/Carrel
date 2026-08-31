@@ -16,15 +16,22 @@ Modeled on ``carrel.api.schedule`` — same late-import of ``app_config`` and
 from __future__ import annotations
 
 import logging
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from carrel import scheduler as sched_mod
 from carrel.config import CarrelYAML, EnvSettings, load_settings
 from carrel.api._app_cache import cached
+from carrel.api._http_cache import (
+    apply_etag_headers,
+    etag_for_updated_at,
+    maybe_return_304,
+)
 from carrel.api._invalidation import invalidate_settings_changed
 from carrel.config_store import (
     ENV_OVERRIDE_FIELDS,
@@ -132,8 +139,6 @@ def _serialise_section(
     env var is set and not flagged as a secret, we also include the live
     value so the UI can show the source of truth.
     """
-    import os
-
     model = SECTION_MODELS.get(name)
     if model is None:
         return SerialisedSection()
@@ -215,15 +220,48 @@ def _get_settings_body() -> SettingsOut:
 
 
 @router.get("", response_model=SettingsOut)
-def get_settings(response: Response) -> SettingsOut:
+def get_settings(request: Request, response: Response) -> SettingsOut:
     """Current effective config.
 
     Layer 1: settings change rarely and the file's mtime is a stable
     proxy, but env vars can change without a write. Use a short
     max-age and rely on L2 invalidation (Phase 3) for the PATCH path.
+    The ETag is built from the YAML file's mtime and the set of env
+    override var names actually present, so an env-only change (e.g.
+    ``DEEPSEEK_API_KEY`` flipped without a YAML write) flips the
+    ETag too.
     """
-    response.headers["Cache-Control"] = "private, max-age=5, stale-while-revalidate=15"
-    return _get_settings_body()
+    body = _get_settings_body()
+    _, _, path = _get_app_config()
+    etag_src = _file_mtime(path)
+    etag = etag_for_updated_at(etag_src, extra=_present_env_override_names())
+    if (r := maybe_return_304(request, etag, max_age=5, stale_while_revalidate=15)):
+        return r
+    if etag is not None:
+        apply_etag_headers(response, etag, max_age=5, stale_while_revalidate=15)
+    return body
+
+
+def _file_mtime(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except OSError:
+        return None
+
+
+def _present_env_override_names() -> tuple[str, ...]:
+    """Stable, sorted names of env vars listed in ``ENV_OVERRIDE_FIELDS``.
+
+    Mixed into the ETag so an env-only change flips it even when the
+    YAML file is untouched. The body of each env value is already
+    rendered into ``body``; the name alone is enough fingerprint.
+    """
+    names = set()
+    for overrides in ENV_OVERRIDE_FIELDS.values():
+        for env_var in overrides.values():
+            if env_var in os.environ:
+                names.add(env_var)
+    return tuple(sorted(names))
 
 
 @router.patch("", response_model=SettingsOut)

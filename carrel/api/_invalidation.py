@@ -32,6 +32,34 @@ from carrel.api._app_cache import get_cache
 _PAPER_LIST_TAGS = ("papers_list",)
 
 
+# What each ``mutate`` member fans out to. Membership is per-verb so a
+# caller that flips both ``"tags"`` and ``"favorite"`` gets the union of
+# the two fan-outs. ``"deleted"`` is a superset of the bookkeeping-y
+# members; ``"inbox"`` and ``"discarded"`` both flip ``in_library`` —
+# which (a) re-triggers the topic-classification UI and (b) changes the
+# author set the /scholars aggregator sees — so they fan out to
+# ``scholars_list`` as well.
+_MUTATE_TO_TAGS: dict[str, frozenset[str]] = {
+    "tags": frozenset({"tags"}),
+    "inbox": frozenset({"topics", "scholars_list"}),
+    "discarded": frozenset({"topics", "scholars_list"}),
+    "favorite": frozenset({"scholars_list"}),
+    "card": frozenset({"paper:card"}),
+    "deleted": frozenset({"tags", "topics", "scholars_list"}),
+}
+
+
+# Verbs whose effect is visible on the Library list view (row visibility,
+# row content, sort/filter outputs). Notes is included because the
+# docstring flags it as forward-looking. ``status`` / ``markdown`` /
+# ``summary`` / ``embeddings`` / ``chat`` / ``card`` / ``citations`` are
+# explicitly excluded — they only touch per-paper sub-resources, so the
+# list view is unaffected and the fan-out was just wasted churn.
+_LIST_AFFECTING_VERBS = frozenset(
+    {"tags", "inbox", "discarded", "favorite", "deleted", "notes"}
+)
+
+
 def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
     """Invalidate the cache for a single paper mutation.
 
@@ -42,10 +70,11 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
     - ``"notes"`` — note text changed. Fan out to papers list because
       future features may show note snippets.
     - ``"tags"`` — per-paper tag add/remove. Fan out to the global tags
-      list (counts change).
+      list (counts change) and the library list (row chips change).
     - ``"inbox"`` — import/discard flipped ``in_library``. Fan out to
-      topics too because inbox papers don't carry topics but their
-      re-classification now runs.
+      topics (inbox papers don't carry topics but their re-classification
+      now runs) and to scholars_list (the /scholars aggregator keys off
+      ``Paper.authors`` on in-library papers, so a new import adds rows).
     - ``"discarded"`` — soft delete. Same as ``"inbox"``.
     - ``"deleted"`` — hard delete. Superset of all the above.
     - ``"status"``, ``"markdown"``, ``"summary"``, ``"embeddings"``,
@@ -59,32 +88,32 @@ def invalidate_paper_mutated(paper_id: str | None, *, mutate: set[str]) -> None:
     When ``paper_id`` is None or ``"*"``, only the list tags are
     invalidated (no per-id exact drop, because we don't know the id —
     e.g. ``DELETE /tags/{tid}``).
+
+    The per-id drop is a single ``invalidate_tags("paper_id:{id}")`` call:
+    the ``@cached`` decorator auto-tags every per-paper entry with
+    ``f"paper_id:{paper_id}"``, so a single tag match drops *every*
+    sub-resource (paper, markdown, sections, references, tags, card) and
+    every secondary-param variant (sort, offset) for the row. This is
+    self-extending — new per-paper routes participate automatically as
+    long as they put ``paper_id`` in ``key_params``.
     """
     cache = get_cache()
-    # Per-id exact drop (always, when we know the id).
+    # Per-id fan-out: drops every per-paper sub-resource for this id.
     if paper_id and paper_id != "*":
-        cache.invalidate_exact(f"paper:{paper_id}")
-        cache.invalidate_exact(f"paper:{paper_id}:markdown")
-        cache.invalidate_exact(f"paper:{paper_id}:sections")
-        cache.invalidate_exact(f"paper:{paper_id}:citations")
-        cache.invalidate_exact(f"paper:{paper_id}:references")
-        cache.invalidate_exact(f"paper:{paper_id}:tags")
-    # Tag-based fan-out.
-    tags = set(_PAPER_LIST_TAGS)
-    if "tags" in mutate or "deleted" in mutate:
-        tags.add("tags")
-    if "inbox" in mutate or "discarded" in mutate or "deleted" in mutate:
-        tags.add("topics")
-    if "favorite" in mutate or "deleted" in mutate:
-        tags.add("scholars_list")
-    if "card" in mutate:
-        # The per-paper card route tags itself with `paper:card`; fan
-        # out the tag (dropping every card entry) so the next read
-        # rebuilds. Cards are small and rarely read in bulk, so a tag
-        # sweep is cheaper than maintaining a per-id exact key.
-        tags.add("paper:card")
-    if tags:
-        cache.invalidate_tags(*tags)
+        cache.invalidate_tags(f"paper_id:{paper_id}")
+    # Tag-based fan-out: union of the per-verb buckets in _MUTATE_TO_TAGS.
+    # The papers_list tag fires only for verbs whose effect is visible
+    # on the library list view; pipeline-only transitions (status,
+    # markdown, summary, embeddings, chat, card, citations) skip it so
+    # an idle page tab doesn't churn every list-shaped entry. See
+    # _LIST_AFFECTING_VERBS for the full set.
+    extra_tags: set[str] = set()
+    for verb in mutate:
+        extra_tags.update(_MUTATE_TO_TAGS.get(verb, ()))
+    if mutate & _LIST_AFFECTING_VERBS:
+        extra_tags |= set(_PAPER_LIST_TAGS)
+    if extra_tags:
+        cache.invalidate_tags(*extra_tags)
 
 
 def invalidate_bulk_import_done() -> None:
@@ -99,15 +128,18 @@ def invalidate_bulk_import_done() -> None:
 
 
 def invalidate_citations_refreshed(paper_id: str) -> None:
-    """Drop the per-paper citations and references cache entries.
+    """Drop the per-paper cache entries affected by a citations refresh.
 
-    We use exact-key invalidation, not the ``citations`` tag, because the
-    tag would also evict citations entries for *other* papers (which are
-    not stale). The per-id exact drop is the precise signal.
+    The ``@cached`` decorator auto-tags every per-paper entry with
+    ``f"paper_id:{paper_id}"``, so a single ``invalidate_tags`` call drops
+    the references cache, the paper detail, and any other per-paper
+    sub-resource in one go.  The previous implementation tried to be
+    precise with two exact-drops (``paper:{id}:citations`` /
+    ``paper:{id}:references``), but those keys were never produced by the
+    JSON-encoded ``@cached`` key format and the bug shipped silently.
     """
     cache = get_cache()
-    cache.invalidate_exact(f"paper:{paper_id}:citations")
-    cache.invalidate_exact(f"paper:{paper_id}:references")
+    cache.invalidate_tags(f"paper_id:{paper_id}")
 
 
 def invalidate_topics_recomputed() -> None:

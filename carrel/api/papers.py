@@ -38,6 +38,7 @@ from carrel.api._http_cache import (
     etag_for_list,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 
 logger = logging.getLogger(__name__)
@@ -330,9 +331,10 @@ def list_papers(
             count=total,
         )
     if etag is not None:
-        # Library list is short-lived — the same filter combination with
-        # new rows should revalidate fast.
-        apply_etag_headers(response, etag, max_age=15, stale_while_revalidate=30)
+        # Library list: AGENTS.md spec for list endpoints is 30s fresh
+        # with 60s SWR. The wrapper emits a stable ETag for the empty
+        # case too, so a fresh install with no papers still 304s.
+        apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
     return items
 
 
@@ -367,14 +369,8 @@ def get_paper(
     # request will see the new timestamp.
     body = _get_paper_body(paper_id, session)
     etag = etag_for_updated_at(body.updated_at, extra=(body.id,))
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={
-                "ETag": etag,
-                "Cache-Control": "private, max-age=60, stale-while-revalidate=120",
-            },
-        )
+    if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
     return body
@@ -563,11 +559,8 @@ def get_paper_markdown(
     etag = etag_for_updated_at(
         updated_at, extra=(body["id"], body.get("md_path") or "")
     )
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=600, stale-while-revalidate=86400"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=600, stale_while_revalidate=86400)):
+        return r
     if etag is not None:
         apply_etag_headers(
             response, etag, max_age=600, stale_while_revalidate=86400,
@@ -642,11 +635,8 @@ def get_paper_sections(
     etag = etag_for_updated_at(
         updated_at, extra=(body["id"], body.get("md_path") or "")
     )
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=600, stale-while-revalidate=86400"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=600, stale_while_revalidate=86400)):
+        return r
     if etag is not None:
         apply_etag_headers(
             response, etag, max_age=600, stale_while_revalidate=86400,

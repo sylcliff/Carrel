@@ -27,6 +27,8 @@ the first sync are pure local reads.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import logging
 import re
 import threading
@@ -42,6 +44,7 @@ from carrel.api._http_cache import (
     apply_etag_headers,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 from carrel.api.papers import _to_summary
 from carrel.cache import openalex_works as cache
@@ -185,11 +188,8 @@ def list_scholars(
         None if sig_ts is None else _parse_iso(sig_ts),
         extra=("scholars_list", str(sig_count), q or "", str(limit)),
     )
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=30, stale_while_revalidate=60)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
 
@@ -201,9 +201,13 @@ def list_scholars(
     return items[:limit]
 
 
-def _parse_iso(s: str):
-    """Parse an ISO timestamp string into a datetime; tolerate trailing Z."""
-    from datetime import datetime, UTC
+def _parse_iso(s: str) -> datetime:
+    """Parse an ISO timestamp string into a datetime; tolerate trailing Z.
+
+    Module-scope so we don't re-import ``datetime`` on every request.
+    Python 3.11+ accepts the ``Z`` suffix natively, so the swap is only
+    needed for older string forms; kept for safety.
+    """
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     return datetime.fromisoformat(s).astimezone(UTC)
@@ -228,11 +232,8 @@ def get_scholar(
         None if sig_ts is None else _parse_iso(sig_ts),
         extra=("scholar", str(sig_count), key),
     )
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=30, stale_while_revalidate=60)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
 

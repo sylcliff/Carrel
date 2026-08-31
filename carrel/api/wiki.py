@@ -26,6 +26,7 @@ from carrel.api._http_cache import (
     etag_for_list,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 from carrel.config import CarrelYAML
 from carrel.db import get_session_dep
@@ -226,14 +227,8 @@ def list_pages(
         row_ids=[str(r.id) for r in page],
         count=len(rows),
     )
-    if etag is not None and if_none_match_matches(
-        request,
-        etag,
-    ):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=30, stale-while-revalidate=60"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=30, stale_while_revalidate=60)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=30, stale_while_revalidate=60)
 
@@ -271,11 +266,8 @@ def get_page(
     row = _get_page_row(session, page_id)
     body = _get_page_body(page_id, session)
     etag = etag_for_updated_at(row.updated_at, extra=("wiki_page", str(row.id)))
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
     return body
@@ -330,11 +322,8 @@ def get_page_by_kind_slug(
             etag = etag_for_updated_at(
                 row.updated_at, extra=("wiki_page_by_slug", kind, slug)
             )
-            if etag is not None and if_none_match_matches(request, etag):
-                return Response(  # type: ignore[return-value]
-                    status_code=304,
-                    headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
-                )
+            if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+                return r
             if etag is not None:
                 apply_etag_headers(
                     response, etag, max_age=60, stale_while_revalidate=120
@@ -736,6 +725,11 @@ def recompile_page(
                 subject=row.title[:200],
             ):
                 compile_fn(sess, app_config, key)
+            # L2: drop the wiki fan-out so the next read rebuilds. A
+            # recompile can change the page's body, sources, backlinks,
+            # and other pages that link to it — invalidate the whole
+            # ``wiki`` tag, matching what ``compile_wiki`` does.
+            invalidate_wiki_recompiled()
             if j is not None:
                 j.status = JobStatus.done.value
                 j.finished_at = datetime.now(UTC)

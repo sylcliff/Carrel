@@ -21,6 +21,7 @@ from carrel.api._http_cache import (
     apply_etag_headers,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 from carrel.api._invalidation import invalidate_paper_mutated
 from carrel.db import get_session_dep
@@ -75,25 +76,14 @@ def get_paper_card(
         # Race: paper deleted between checks.  404 is the honest answer.
         raise HTTPException(status_code=404, detail="paper not found")
     etag = etag_for_updated_at(paper.paper_card_extracted_at, extra=(paper.id,))
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(
-            status_code=304,
-            headers={
-                "ETag": etag,
-                "Cache-Control": "private, max-age=60, stale-while-revalidate=120",
-            },
-        )
+    if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
     # Pydantic re-validates the JSON dict on the way out; a bad legacy
     # row would surface as a 500 here, which is the right signal to
     # re-extract.
-    body = PaperCardOut.model_validate(card).model_dump_json()
-    return Response(
-        content=body,
-        media_type="application/json",
-        headers={k: v for k, v in response.headers.items()},
-    )
+    return PaperCardOut.model_validate(card)
 
 
 # ---------- POST /papers/{id}/card/extract ----------------------------------

@@ -167,6 +167,34 @@ def test_cached_decorator_invalidation_fan_out():
     assert counter["calls"] == 4  # both recomputed
 
 
+def test_cached_decorator_auto_attaches_per_id_tag():
+    """``@cached`` auto-tags entries with ``f"{name}:{value}"`` for id-like
+    key_params so per-id invalidation is a single ``invalidate_tags`` call
+    that catches every sub-resource (and every secondary-param variant)
+    for a row — no exact-key knowledge required.
+    """
+    counter = {"calls": 0}
+
+    @cached("paper_id_test", key_params=("paper_id", "sort"),
+            tags=("papers_list",))
+    def body(paper_id: str, sort: str) -> str:
+        counter["calls"] += 1
+        return f"{paper_id}:{sort}"
+
+    body("W1", "date")
+    body("W1", "year")  # different secondary param — separate entry
+    body("W2", "date")
+    assert counter["calls"] == 3
+
+    # Per-id drop should clear both W1 entries (any sort variant) but
+    # leave W2's entry intact.
+    get_cache().invalidate_tags("paper_id:W1")
+    body("W1", "date")
+    body("W1", "year")
+    body("W2", "date")
+    assert counter["calls"] == 5  # W1 entries recomputed; W2 cached
+
+
 # ---------------------------------------------------------------------------
 # ETag helpers
 # ---------------------------------------------------------------------------
@@ -238,6 +266,44 @@ def test_if_none_match_matches_star():
     assert if_none_match_matches(req, 'W/"abc"') is True
 
 
+def test_if_none_match_does_not_substring_match():
+    """A prefix ETag must not match a different (longer) ETag.
+
+    The previous implementation used ``endswith`` for the
+    weak/strong-prefix tolerance, which is a byte-level substring check
+    and lets ``W/"a"`` match ``W/"abc"`` — a spurious 304 for a
+    different resource state.  RFC 7232 §2.3.2 requires exact equality
+    on the opaque-tag payload after stripping the ``W/`` prefix.
+    """
+    from starlette.requests import Request
+
+    req = Request(
+        scope={
+            "type": "http",
+            "headers": [(b"if-none-match", b'W/"a"')],
+        }
+    )
+    # ``W/"a"`` is a PREFIX of the server ETag ``W/"abc"`` — must not match.
+    assert if_none_match_matches(req, 'W/"abc"') is False
+    # Exact match still works.
+    req_exact = Request(
+        scope={
+            "type": "http",
+            "headers": [(b"if-none-match", b'W/"abc"')],
+        }
+    )
+    assert if_none_match_matches(req_exact, 'W/"abc"') is True
+    # Strong/weak tolerance: ``"abc"`` and ``W/"abc"`` should be equal
+    # under weak comparison.
+    req_strong = Request(
+        scope={
+            "type": "http",
+            "headers": [(b"if-none-match", b'"abc"')],
+        }
+    )
+    assert if_none_match_matches(req_strong, 'W/"abc"') is True
+
+
 def test_if_none_match_matches_comma_list():
     from starlette.requests import Request
 
@@ -264,9 +330,9 @@ def test_if_none_match_missing():
 
 def test_invalidate_paper_mutated_exact_and_fanout():
     cache = get_cache()
-    cache.set("paper:W123", "detail", tags=("paper",))
-    cache.set("paper:W123:markdown", "md", tags=("paper",))
-    cache.set("paper:W123:citations", "cits", tags=("paper", "citations"))
+    cache.set("paper:W123", "detail", tags=("paper", "paper_id:W123"))
+    cache.set("paper:W123:markdown", "md", tags=("paper", "paper_id:W123"))
+    cache.set("paper:W123:citations", "cits", tags=("paper", "citations", "paper_id:W123"))
     cache.set("paper_list:foo", "list", tags=("papers_list",))
     invalidate_paper_mutated("W123", mutate={"favorite"})
     assert cache.get("paper:W123") is None
@@ -282,6 +348,36 @@ def test_invalidate_paper_mutated_tag_only():
     assert cache.get("paper_list:a") is None
 
 
+def test_invalidate_paper_mutated_inbox_drops_scholars_list():
+    """Importing a paper (inbox flip) changes the /scholars aggregation.
+
+    Regression for: POST /import did not call any invalidation, so the
+    scholars_list L2 cache kept serving an author set that didn't include
+    the new paper's authors. The fix puts ``scholars_list`` in the
+    ``"inbox"`` fan-out so a single invalidate_paper_mutated(id,
+    mutate={"inbox"}) drops every scholars_list-tagged entry.
+    """
+    cache = get_cache()
+    cache.set("scholar_list", ["old"], tags=("scholars_list",))
+    cache.set("scholar:A1", "x", tags=("scholars_list", "paper_id:W1"))
+    cache.set("paper_list:a", "y", tags=("papers_list",))
+    cache.set("topics:list", "t", tags=("topics",))
+    invalidate_paper_mutated("W1", mutate={"inbox"})
+    assert cache.get("scholar_list") is None
+    assert cache.get("scholar:A1") is None
+    assert cache.get("paper_list:a") is None  # inbox is list-affecting
+    assert cache.get("topics:list") is None    # inbox fans to topics
+
+
+def test_invalidate_paper_mutated_discarded_also_drops_scholars_list():
+    """Discard is the inverse of import — also flips in_library, so the
+    aggregator loses an author record. Same fan-out as ``"inbox"``."""
+    cache = get_cache()
+    cache.set("scholar_list", ["old"], tags=("scholars_list",))
+    invalidate_paper_mutated("W1", mutate={"discarded"})
+    assert cache.get("scholar_list") is None
+
+
 def test_invalidate_bulk_import_done_clears_list_tags():
     cache = get_cache()
     cache.set("paper_list:a", "x", tags=("papers_list",))
@@ -295,9 +391,9 @@ def test_invalidate_bulk_import_done_clears_list_tags():
 
 def test_invalidate_citations_refreshed_drops_per_id():
     cache = get_cache()
-    cache.set("paper:W1:citations", "c", tags=("paper", "citations"))
-    cache.set("paper:W1:references", "r", tags=("paper", "citations"))
-    cache.set("paper:W2:citations", "c2", tags=("paper", "citations"))
+    cache.set("paper:W1:citations", "c", tags=("paper", "citations", "paper_id:W1"))
+    cache.set("paper:W1:references", "r", tags=("paper", "citations", "paper_id:W1"))
+    cache.set("paper:W2:citations", "c2", tags=("paper", "citations", "paper_id:W2"))
     invalidate_citations_refreshed("W1")
     assert cache.get("paper:W1:citations") is None
     assert cache.get("paper:W1:references") is None
@@ -409,10 +505,10 @@ def test_l2_get_paper_body_memoizes():
 def test_l2_paper_mutation_drops_per_id_and_list():
     """``invalidate_paper_mutated`` drops both the per-id entry and the list fan-out."""
     cache = get_cache()
-    cache.set("paper:W1", "d", tags=("paper", "papers_list"))
-    cache.set("paper:W1:markdown", "m", tags=("paper",))
+    cache.set("paper:W1", "d", tags=("paper", "papers_list", "paper_id:W1"))
+    cache.set("paper:W1:markdown", "m", tags=("paper", "paper_id:W1"))
     cache.set("paper_list:q=&sort=added", "list", tags=("papers_list", "tags"))
-    cache.set("paper:W2", "d2", tags=("paper",))  # different id, intact
+    cache.set("paper:W2", "d2", tags=("paper", "paper_id:W2"))  # different id, intact
 
     invalidate_paper_mutated("W1", mutate={"favorite"})
 
@@ -425,9 +521,9 @@ def test_l2_paper_mutation_drops_per_id_and_list():
 def test_l2_citations_refresh_drops_per_id_only():
     """``invalidate_citations_refreshed`` is per-id; other papers are kept."""
     cache = get_cache()
-    cache.set("paper:W1:citations", "c", tags=("paper", "citations"))
-    cache.set("paper:W1:references", "r", tags=("paper", "citations"))
-    cache.set("paper:W2:citations", "c2", tags=("paper", "citations"))
+    cache.set("paper:W1:citations", "c", tags=("paper", "citations", "paper_id:W1"))
+    cache.set("paper:W1:references", "r", tags=("paper", "citations", "paper_id:W1"))
+    cache.set("paper:W2:citations", "c2", tags=("paper", "citations", "paper_id:W2"))
 
     invalidate_citations_refreshed("W1")
 
@@ -571,3 +667,29 @@ def test_l2_decorator_key_params_isolates_keys():
     assert f(1, 3) == 4
     # Three distinct keys → three underlying calls.
     assert counter["calls"] == 3
+
+
+def test_l2_decorator_memoizes_none_returns():
+    """A function that legitimately returns ``None`` must be cached too.
+
+    Previous behavior used ``cached_value is not None`` to detect a hit,
+    so every route whose contract is "``None`` means not-found /
+    not-yet-extracted" (e.g. ``_get_card_body`` before extraction) hit
+    the DB on every request and the LRU was polluted by a stored
+    ``None`` the wrapper refused to use.
+    """
+    counter = {"calls": 0}
+
+    @cached("none_test", key_params=("x",), tags=("test",))
+    def f(x: str) -> str | None:
+        counter["calls"] += 1
+        return None
+
+    assert f("a") is None
+    assert f("a") is None
+    # Second call must be a cache hit, not a re-query.
+    assert counter["calls"] == 1
+    # And invalidation must drop the stored None, forcing a re-query.
+    get_cache().invalidate_tags("test")
+    assert f("a") is None
+    assert counter["calls"] == 2

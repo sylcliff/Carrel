@@ -1,7 +1,8 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, FileText, RefreshCw, Sparkles } from "lucide-react";
 import { extractPaperCard, getPaperCard, type PaperCard, type ResultClaim } from "@/api/client";
-import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
+import { useApiMutation } from "@/lib/useApiQuery";
 import { queryKeys } from "@/lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,17 +32,16 @@ const PAPER_TYPE_LABEL: Record<string, string> = {
 export default function PaperCardView({ paperId, hasMarkdown }: Props) {
   const [open, setOpen] = useState(true);
 
-  // useApiQueryWithFn lets us call getPaperCard, which translates a 204
-  // into `null` (the empty state) instead of throwing. The plain
-  // useApiQuery would surface the 204 as an error since requestCached
-  // can't represent "no body" for an optional resource.
-  const cardQuery = useApiQueryWithFn<PaperCard | null>({
-    key: queryKeys.paperCard(paperId),
+  // getPaperCard translates a 204 into `null` (the empty state) so we
+  // can use the plain useQuery without needing a custom 204-handling
+  // hook. The card is LLM-generated and the only write path is the
+  // explicit 'Generate / Re-generate' button (line below) which
+  // invalidates this key — so staleTime: Infinity is correct: focus
+  // events and tab switches won't re-fire the LLM-extracted endpoint.
+  const cardQuery = useQuery<PaperCard | null>({
+    queryKey: queryKeys.paperCard(paperId),
     queryFn: () => getPaperCard(paperId),
-    // The card is LLM-generated and rarely re-fetched within a session;
-    // a long staleTime keeps background re-fetches from re-issuing the
-    // request, while the explicit invalidate on extract still kicks in.
-    staleTime: 60_000,
+    staleTime: Infinity,
   });
 
   const extractMutation = useApiMutation<{ force: boolean }, PaperCard>({

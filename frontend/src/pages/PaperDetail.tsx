@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { useParams, Link } from "react-router-dom";
 import { ChevronDown, ChevronRight, Star, X } from "lucide-react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import MarkdownReader from "@/components/MarkdownReader";
@@ -10,9 +11,8 @@ import ReferencesCard from "@/components/ReferencesCard";
 import NotesCard from "@/components/NotesCard";
 import PaperCardView from "@/components/PaperCard";
 import { topicColorClass } from "@/lib/topicColor";
-import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
+import { useApiMutation } from "@/lib/useApiQuery";
 import { queryKeys } from "@/lib/queryKeys";
-import { useQueryClient } from "@tanstack/react-query";
 import {
   addPaperTag,
   checkPublication,
@@ -66,19 +66,19 @@ export default function PaperDetail({ onProcessed }: Props) {
 
   // --- React Query: per-paper data (canonical) ----------------------------
   // invalidateQueries(["paper", id]) cascades to every nested variant.
-  const paperQuery = useApiQueryWithFn<PaperDetailT>({
-    key: id ? queryKeys.paper(id) : ["paper", "_missing_"],
+  const paperQuery = useQuery<PaperDetailT>({
+    queryKey: id ? queryKeys.paper(id) : queryKeys.missingPaper(),
     queryFn: () => getPaper(id!),
     enabled: Boolean(id),
   });
   const p = paperQuery.data ?? null;
 
-  const markdownQuery = useApiQueryWithFn<{
+  const markdownQuery = useQuery<{
     id: string;
     body: string | null;
     md_path: string | null;
   }>({
-    key: id ? queryKeys.paperMarkdown(id) : ["paper", "_missing_", "markdown"],
+    queryKey: id ? queryKeys.paperMarkdown(id) : queryKeys.missingPaperMarkdown(),
     queryFn: () => getPaperMarkdown(id!),
     staleTime: Infinity,
     enabled: Boolean(id) && Boolean(p?.md_path),
@@ -89,16 +89,16 @@ export default function PaperDetail({ onProcessed }: Props) {
   // card as a stack of one MarkdownReader per heading (in document
   // order). Backend reuses the same ETag/L2 contract as /markdown, so
   // staleTime: Infinity matches the flat fetch.
-  const sectionsQuery = useApiQueryWithFn<PaperSectionsResponse>({
-    key: id ? queryKeys.paperSections(id) : ["paper", "_missing_", "sections"],
+  const sectionsQuery = useQuery<PaperSectionsResponse>({
+    queryKey: id ? queryKeys.paperSections(id) : queryKeys.missingPaperSections(),
     queryFn: () => getPaperSections(id!),
     staleTime: Infinity,
     enabled: Boolean(id) && Boolean(p?.md_path),
   });
   const sections = sectionsQuery.data?.sections ?? null;
 
-  const tagsQuery = useApiQueryWithFn<Tag[]>({
-    key: id ? queryKeys.paperTags(id) : ["paper", "_missing_", "tags"],
+  const tagsQuery = useQuery<Tag[]>({
+    queryKey: id ? queryKeys.paperTags(id) : queryKeys.missingPaperTags(),
     queryFn: () => listPaperTags(id!).catch(() => [] as Tag[]),
     enabled: Boolean(id),
   });

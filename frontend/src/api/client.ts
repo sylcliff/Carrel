@@ -23,6 +23,7 @@ export class APIError extends Error {
 
 const etagRegistry = new Map<string, string>();
 const bodyCache = new Map<string, unknown>();
+const headersCache = new Map<string, Headers>();
 
 // For tests that need to reset the in-process L3 cache (e.g. after a
 // deliberate 200 that should have been a 304). Not exported on the
@@ -30,6 +31,7 @@ const bodyCache = new Map<string, unknown>();
 export function __resetL3CacheForTests(): void {
   etagRegistry.clear();
   bodyCache.clear();
+  headersCache.clear();
 }
 
 function cacheKey(path: string): string {
@@ -38,6 +40,69 @@ function cacheKey(path: string): string {
   // verbatim — duplicates collapse, which is what we want.
   return `${API_BASE}${path}`;
 }
+
+// ETag dance shared by every cached request helper. Reads the previous
+// ETag from the registry, sends If-None-Match, then routes the response:
+//
+//   304 -> "revalidate": caller decides whether to short-circuit (with the
+//          prior body / headers) or surface an error
+//   200 -> "fresh": parsed body + headers + new ETag, all updated
+//   204 -> "no-content": registries cleared, body is undefined
+//   4xx/5xx -> "error": registries cleared, error message bubbled up
+//
+// Each public helper (``requestCached``, ``requestWithHeadersCached``,
+// ``getPaperCard``) applies its own 304-without-prior-body policy on top
+// of the result returned here.
+type CachedFetchResult = {
+  status: "revalidate" | "fresh" | "no-content" | "error";
+  statusCode: number;
+  body?: unknown;
+  headers?: Headers;
+};
+
+async function cachedFetch(
+  path: string,
+  init?: RequestInit,
+): Promise<CachedFetchResult> {
+  const key = cacheKey(path);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((init?.headers as Record<string, string> | undefined) ?? {}),
+  };
+  const etag = etagRegistry.get(key);
+  if (etag !== undefined) headers["If-None-Match"] = etag;
+
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+
+  if (res.status === 304) {
+    return { status: "revalidate", statusCode: 304 };
+  }
+
+  if (!res.ok) {
+    // Drop any stale body so a successful refresh starts from a clean slate.
+    bodyCache.delete(key);
+    etagRegistry.delete(key);
+    headersCache.delete(key);
+    const text = await res.text().catch(() => res.statusText);
+    return { status: "error", statusCode: res.status, body: text || res.statusText };
+  }
+
+  if (res.status === 204) {
+    bodyCache.set(key, undefined as unknown);
+    etagRegistry.delete(key);
+    headersCache.set(key, res.headers);
+    return { status: "no-content", statusCode: 204, headers: res.headers };
+  }
+
+  const body = (await res.json()) as unknown;
+  bodyCache.set(key, body);
+  const newEtag = res.headers.get("etag");
+  if (newEtag !== null) etagRegistry.set(key, newEtag);
+  else etagRegistry.delete(key);
+  headersCache.set(key, res.headers);
+  return { status: "fresh", statusCode: 200, body, headers: res.headers };
+}
+
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -75,94 +140,50 @@ async function requestWithHeaders<T>(
 // arrive with no prior body (cold start) are surfaced as an error — the
 // server's ETag is meaningless if we have nothing to compare to.
 export async function requestCached<T>(path: string, init?: RequestInit): Promise<T> {
-  const key = cacheKey(path);
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
-  };
-  const etag = etagRegistry.get(key);
-  if (etag !== undefined) headers["If-None-Match"] = etag;
-
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
-
-  if (res.status === 304) {
-    const cached = bodyCache.get(key) as T | undefined;
-    if (cached === undefined) {
-      // Server claims nothing changed but we have no body — treat as a
-      // hard miss so the next call refreshes the registries.
-      throw new APIError(500, "304 without prior body in client cache");
+  const result = await cachedFetch(path, init);
+  switch (result.status) {
+    case "revalidate": {
+      const cached = bodyCache.get(cacheKey(path)) as T | undefined;
+      if (cached === undefined) {
+        throw new APIError(500, "304 without prior body in client cache");
+      }
+      return cached;
     }
-    return cached;
+    case "no-content":
+      return undefined as T;
+    case "fresh":
+      return result.body as T;
+    case "error":
+      throw new APIError(result.statusCode, String(result.body ?? "request failed"));
   }
-
-  if (!res.ok) {
-    // Drop any stale body so a successful refresh starts from a clean slate.
-    bodyCache.delete(key);
-    etagRegistry.delete(key);
-    const text = await res.text().catch(() => res.statusText);
-    throw new APIError(res.status, text || res.statusText);
-  }
-  if (res.status === 204) {
-    bodyCache.set(key, undefined as unknown as T);
-    etagRegistry.delete(key);
-    return undefined as T;
-  }
-
-  const body = (await res.json()) as T;
-  bodyCache.set(key, body);
-  const newEtag = res.headers.get("etag");
-  if (newEtag !== null) etagRegistry.set(key, newEtag);
-  else etagRegistry.delete(key);
-  return body;
 }
 
 // ETag-aware variant of requestWithHeaders. Keeps a parallel
 // headersCache so a 304 can still surface X-Total-Count. 304 with no
 // prior entry is surfaced as an error (the same way requestCached handles
 // it) so React Query re-fetches the headers the next round.
-const headersCache = new Map<string, Headers>();
-
 async function requestWithHeadersCached<T>(
   path: string,
   init?: RequestInit,
 ): Promise<{ data: T; headers: Headers }> {
-  const key = cacheKey(path);
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    ...((init?.headers as Record<string, string> | undefined) ?? {}),
-  };
-  const etag = etagRegistry.get(key);
-  if (etag !== undefined) headers["If-None-Match"] = etag;
-
-  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
-
-  if (res.status === 304) {
-    const cachedBody = bodyCache.get(key) as T | undefined;
-    const cachedHeaders = headersCache.get(key);
-    if (cachedBody === undefined || cachedHeaders === undefined) {
-      throw new APIError(500, "304 without prior body/headers in client cache");
+  const result = await cachedFetch(path, init);
+  switch (result.status) {
+    case "revalidate": {
+      const key = cacheKey(path);
+      const cachedBody = bodyCache.get(key) as T | undefined;
+      const cachedHeaders = headersCache.get(key);
+      if (cachedBody === undefined || cachedHeaders === undefined) {
+        throw new APIError(500, "304 without prior body/headers in client cache");
+      }
+      return { data: cachedBody, headers: cachedHeaders };
     }
-    return { data: cachedBody, headers: cachedHeaders };
+    case "no-content":
+      return { data: undefined as T, headers: result.headers! };
+    case "fresh":
+      return { data: result.body as T, headers: result.headers! };
+    case "error":
+      throw new APIError(result.statusCode, String(result.body ?? "request failed"));
   }
-
-  if (!res.ok) {
-    bodyCache.delete(key);
-    etagRegistry.delete(key);
-    headersCache.delete(key);
-    const text = await res.text().catch(() => res.statusText);
-    throw new APIError(res.status, text || res.statusText);
-  }
-  if (res.status === 204) {
-    return { data: undefined as T, headers: res.headers };
-  }
-
-  const body = (await res.json()) as T;
-  bodyCache.set(key, body);
-  const newEtag = res.headers.get("etag");
-  if (newEtag !== null) etagRegistry.set(key, newEtag);
-  else etagRegistry.delete(key);
-  headersCache.set(key, res.headers);
-  return { data: body, headers: res.headers };
 }
 
 // ---- Health ----
@@ -453,7 +474,10 @@ export interface CitationList {
   cached_count: number;
 }
 
-export const listPapers = (params?: {
+// Shared shape for the /papers list endpoint.  Three helpers (uncached,
+// paged+uncached, paged+cached) build the same query string from this —
+// keep the type in one place so adding a filter is a one-line change.
+export interface PapersQueryParams {
   limit?: number;
   offset?: number;
   status?: string;
@@ -464,7 +488,9 @@ export const listPapers = (params?: {
   topic?: string[];
   q?: string;
   sort?: string;
-}): Promise<PaperSummary[]> => {
+}
+
+function buildPapersQuery(params?: PapersQueryParams): string {
   const q = new URLSearchParams();
   if (params?.limit) q.set("limit", String(params.limit));
   if (params?.offset) q.set("offset", String(params.offset));
@@ -477,80 +503,41 @@ export const listPapers = (params?: {
   if (params?.tag) for (const t of params.tag) q.append("tag", t);
   if (params?.topic) for (const t of params.topic) q.append("topic", t);
   const qs = q.toString();
-  return request<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`);
-};
+  return qs ? `?${qs}` : "";
+}
+
+// Strip the "X-Total-Count" header into a numeric total, falling back to
+// the rows we just got when the header is absent. Used by the two paged
+// variants below.
+function totalFromHeaders(data: unknown[], headers: Headers): number {
+  const headerVal = headers.get("X-Total-Count");
+  if (!headerVal) return data.length;
+  const total = Number(headerVal);
+  return Number.isFinite(total) ? total : data.length;
+}
+
+export const listPapers = (params?: PapersQueryParams): Promise<PaperSummary[]> =>
+  request<PaperSummary[]>(`/papers${buildPapersQuery(params)}`);
 
 // Paginated variant: returns the page rows plus the server's X-Total-Count
 // header so the UI can show "Showing N of M" and a Load-More button without a
 // second round-trip.
-export const listPapersPaged = (params?: {
-  limit?: number;
-  offset?: number;
-  status?: string;
-  venue?: string;
-  in_library?: boolean;
-  favorite?: boolean;
-  tag?: string[];
-  topic?: string[];
-  q?: string;
-  sort?: string;
-}): Promise<{ items: PaperSummary[]; total: number }> => {
-  const q = new URLSearchParams();
-  if (params?.limit) q.set("limit", String(params.limit));
-  if (params?.offset) q.set("offset", String(params.offset));
-  if (params?.status) q.set("status", params.status);
-  if (params?.venue) q.set("venue", params.venue);
-  if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
-  if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
-  if (params?.q) q.set("q", params.q);
-  if (params?.sort) q.set("sort", params.sort);
-  if (params?.tag) for (const t of params.tag) q.append("tag", t);
-  if (params?.topic) for (const t of params.topic) q.append("topic", t);
-  const qs = q.toString();
-  return requestWithHeaders<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`).then(
-    ({ data, headers }) => {
-      const headerVal = headers.get("X-Total-Count");
-      const total = headerVal ? Number(headerVal) : data.length;
-      return { items: data, total: Number.isFinite(total) ? total : data.length };
-    },
+export const listPapersPaged = (
+  params?: PapersQueryParams,
+): Promise<{ items: PaperSummary[]; total: number }> =>
+  requestWithHeaders<PaperSummary[]>(`/papers${buildPapersQuery(params)}`).then(
+    ({ data, headers }) => ({ items: data, total: totalFromHeaders(data, headers) }),
   );
-};
 
 // ETag-aware variant for the React-Query-migrated Library page. 304s
 // short-circuit through requestWithHeadersCached; a fresh 200 refreshes
 // both the body and the header registries.
-export const listPapersPagedCached = (params?: {
-  limit?: number;
-  offset?: number;
-  status?: string;
-  venue?: string;
-  in_library?: boolean;
-  favorite?: boolean;
-  tag?: string[];
-  topic?: string[];
-  q?: string;
-  sort?: string;
-}): Promise<{ items: PaperSummary[]; total: number }> => {
-  const q = new URLSearchParams();
-  if (params?.limit) q.set("limit", String(params.limit));
-  if (params?.offset) q.set("offset", String(params.offset));
-  if (params?.status) q.set("status", params.status);
-  if (params?.venue) q.set("venue", params.venue);
-  if (params?.in_library !== undefined) q.set("in_library", String(params.in_library));
-  if (params?.favorite !== undefined) q.set("favorite", String(params.favorite));
-  if (params?.q) q.set("q", params.q);
-  if (params?.sort) q.set("sort", params.sort);
-  if (params?.tag) for (const t of params.tag) q.append("tag", t);
-  if (params?.topic) for (const t of params.topic) q.append("topic", t);
-  const qs = q.toString();
-  return requestWithHeadersCached<PaperSummary[]>(`/papers${qs ? `?${qs}` : ""}`).then(
-    ({ data, headers }) => {
-      const headerVal = headers.get("X-Total-Count");
-      const total = headerVal ? Number(headerVal) : data.length;
-      return { items: data, total: Number.isFinite(total) ? total : data.length };
-    },
+export const listPapersPagedCached = (
+  params?: PapersQueryParams,
+): Promise<{ items: PaperSummary[]; total: number }> =>
+  requestWithHeadersCached<PaperSummary[]>(`/papers${buildPapersQuery(params)}`).then(
+    ({ data, headers }) => ({ items: data, total: totalFromHeaders(data, headers) }),
   );
-};
 
 export const getPaper = (id: string) => request<PaperDetail>(`/papers/${encodeURIComponent(id)}`);
 
@@ -711,37 +698,33 @@ export interface PaperCard {
 // ETag-aware fetch that distinguishes "no card yet" (204) from "card
 // present" (200). Returns null for 204 so the UI can render the empty
 // state without a separate "is this an error?" branch.
-export const getPaperCard = async (id: string): Promise<PaperCard | null> => {
-  const key = cacheKey(`/papers/${encodeURIComponent(id)}/card`);
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  const etag = etagRegistry.get(key);
-  if (etag !== undefined) headers["If-None-Match"] = etag;
-
-  const res = await fetch(`${API_BASE}/papers/${encodeURIComponent(id)}/card`, {
-    headers,
-  });
-  if (res.status === 304) {
-    const cached = bodyCache.get(key) as PaperCard | null | undefined;
-    return cached ?? null;
+//
+// Differs from ``requestCached`` in two ways:
+//   * 204 caches `null` (not `undefined`) so a 304 short-circuit returns
+//     `null` rather than failing the cold-cache check.
+//   * 304 with no prior body is treated as "absent" (return null) rather
+//     than as an error, so a stale tab on a freshly-loaded paper doesn't
+//     surface a 500 to the user.
+export async function getPaperCard(id: string): Promise<PaperCard | null> {
+  const path = `/papers/${encodeURIComponent(id)}/card`;
+  const result = await cachedFetch(path);
+  switch (result.status) {
+    case "revalidate": {
+      const cached = bodyCache.get(cacheKey(path)) as PaperCard | null | undefined;
+      return cached ?? null;
+    }
+    case "no-content": {
+      // Re-cache as `null` so a subsequent 304 returns the right sentinel
+      // rather than tripping the cold-cache check.
+      bodyCache.set(cacheKey(path), null);
+      return null;
+    }
+    case "fresh":
+      return result.body as PaperCard | null;
+    case "error":
+      throw new APIError(result.statusCode, String(result.body ?? "request failed"));
   }
-  if (res.status === 204) {
-    bodyCache.set(key, null);
-    etagRegistry.delete(key);
-    return null;
-  }
-  if (!res.ok) {
-    bodyCache.delete(key);
-    etagRegistry.delete(key);
-    const text = await res.text().catch(() => res.statusText);
-    throw new APIError(res.status, text || res.statusText);
-  }
-  const body = (await res.json()) as PaperCard;
-  bodyCache.set(key, body);
-  const newEtag = res.headers.get("etag");
-  if (newEtag !== null) etagRegistry.set(key, newEtag);
-  else etagRegistry.delete(key);
-  return body;
-};
+}
 
 export const extractPaperCard = (id: string, force = false) =>
   request<PaperCard>(

@@ -26,6 +26,11 @@ Design mirrors :mod:`carrel.pipeline.summarize` and :mod:`carrel.pipeline.topics
   * **Non-fatal** — failures raise :class:`PaperExtractError` and are
     caught per paper by the batch driver; the paper's ``status`` is never
     touched and the existing extraction rows (if any) are preserved.
+
+The shared LLM-call orchestration (paper lookup, md_path check,
+staleness gate, body prep, LLM call, LLMError catch, progress + usage
+recording) lives in :mod:`carrel.pipeline._llm_extract` so a bug fix
+or budget change only lands in one place.
 """
 from __future__ import annotations
 
@@ -33,15 +38,16 @@ import logging
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from sqlmodel import Session, func, select
 
-from carrel import llm, prompts_runtime, usage
+from carrel import llm  # re-exported for tests that monkey-patch pipe.llm
+from carrel import prompts_runtime
 from carrel.config import CarrelYAML
 from carrel.models import Paper, PaperConcept, PaperQuestion, PaperStatus
-from carrel.pipeline._section_picker import prepare_picker_input
+from carrel.pipeline._llm_extract import drive_paper_llm_extraction
+from carrel.pipeline._paper_meta import USER_PROMPT_TEMPLATE, authors_string, venue_date_string
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +61,6 @@ ProgressCallback = Callable[[dict], None]
 # ``deep=True`` widens the budget so the picker keeps more sections;
 # the default is whatever ``cfg.llm.max_input_chars`` is set to.
 _DEEP_BUDGET_MULTIPLIER = 2
-# Hard cap per single section so a monster Results block can't eat the
-# whole budget.  Matches paper_card's per-section cap.
-_PER_SECTION_CAP = 4_000
 # Don't waste an LLM call on near-empty bodies.
 _MIN_BODY_CHARS = 200
 
@@ -124,55 +127,8 @@ _SYSTEM_PROMPT = (
 )
 
 
-_USER_TEMPLATE = (
-    "Title: {title}\n"
-    "Authors: {authors}\n"
-    "Venue/date: {venue_date}\n\n"
-    "Abstract:\n{abstract}\n\n"
-    "Selected paper sections (parsed from PDF; may contain OCR noise; "
-    "references/acknowledgments/supplementary dropped):\n\n"
-    "{numbered_sections}\n\n"
-    "Return the JSON object now."
-)
-
-
 # Valid concept categories (used to validate LLM output).
 CONCEPT_CATEGORIES = frozenset({"METHOD", "THEORY", "DATASET", "DOMAIN", "PHENOMENON"})
-
-
-# ---------------------------------------------------------------------------
-# Body preparation
-# ---------------------------------------------------------------------------
-
-
-def _prepare_body(md: str, *, max_chars: int) -> str:
-    """Slice the paper into a numbered, priority-budgeted block for the LLM.
-
-    Delegates to :func:`carrel.pipeline._section_picker.prepare_picker_input`,
-    which drops references / acknowledgments / supplementary noise and
-    fills the budget with method → results → conclusion → intro.
-    """
-    if not md or not md.strip():
-        return ""
-    return prepare_picker_input(
-        md,
-        budget_chars=max_chars,
-        per_section_cap=_PER_SECTION_CAP,
-    )
-
-
-def _authors_string(paper: Paper) -> str:
-    if not paper.authors:
-        return ""
-    names = [a.get("name", "") for a in paper.authors if isinstance(a, dict) and a.get("name")]
-    return ", ".join(names)
-
-
-def _venue_date_string(paper: Paper) -> str:
-    bits = [paper.venue or ""]
-    if paper.publication_date:
-        bits.append(str(paper.publication_date))
-    return " · ".join(b for b in bits if b)
 
 
 # ---------------------------------------------------------------------------
@@ -384,9 +340,22 @@ def extract_paper(
     Raises :class:`PaperExtractError` on missing markdown, no LLM key, or
     a malformed response.  Existing rows are preserved on failure.
     """
-    paper = session.get(Paper, paper_id)
-    if paper is None:
-        raise PaperExtractError(f"paper not found: {paper_id}")
+    budget = cfg.llm.max_input_chars * (_DEEP_BUDGET_MULTIPLIER if deep else 1)
+
+    def _build_messages(paper: Paper, body: str) -> list[dict]:
+        return [
+            {"role": "system", "content": prompts_runtime.get_system("extract", _SYSTEM_PROMPT)},
+            {
+                "role": "user",
+                "content": prompts_runtime.get_user_template("extract", USER_PROMPT_TEMPLATE).format(
+                    title=paper.title,
+                    authors=authors_string(paper) or "unknown",
+                    venue_date=venue_date_string(paper) or "unknown",
+                    abstract=paper.abstract or "",
+                    numbered_sections=body,
+                ),
+            },
+        ]
 
     def _emit(**progress: Any) -> None:
         if on_progress is not None:
@@ -397,65 +366,21 @@ def extract_paper(
                 **progress,
             })
 
-    if not paper.md_path:
-        raise PaperExtractError("paper has no md_path; parse it first")
-    md_path = Path(cfg.storage.root) / paper.md_path
-    if not md_path.exists():
-        raise PaperExtractError(f"parsed markdown missing on disk: {md_path}")
-
-    if not force and not _is_stale(session, paper):
-        _emit(detail="Already extracted")
-        return paper
-
-    if not (
-        llm.has_key_for(cfg.llm.summarize_model)
-        or llm.has_key_for(cfg.llm.fallback_model)
-    ):
-        raise PaperExtractError(
-            "no LLM API key configured (set DEEPSEEK_API_KEY or VOLCANO_API_KEY)"
-        )
-
-    md = md_path.read_text(encoding="utf-8", errors="replace")
-    if len(md.strip()) < _MIN_BODY_CHARS:
-        # Don't waste an LLM call on near-empty bodies.  Treat as a no-op
-        # so the batch driver can move on.  The paper is still marked
-        # "up to date" because the next extract would produce the same
-        # emptiness, and a future re-parse will flip it stale again.
-        _emit(detail="Body too short; skipping")
-        return paper
-
-    budget = cfg.llm.max_input_chars * (
-        _DEEP_BUDGET_MULTIPLIER if deep else 1
+    paper, data, body = drive_paper_llm_extraction(
+        session, cfg, paper_id,
+        feature="extract",
+        progress_stage="paper_extract",
+        error_class=PaperExtractError,
+        is_stale=_is_stale,
+        build_messages=_build_messages,
+        budget_chars=budget,
+        force=force,
+        min_body_chars=_MIN_BODY_CHARS,
+        too_short_returns=True,
+        on_progress=on_progress,
     )
-    body = _prepare_body(md, max_chars=budget)
-
-    _emit(detail=f"Extracting concepts + questions (deep={deep}, budget={budget})…")
-    try:
-        data = llm.chat_json(
-            [
-                {"role": "system", "content": prompts_runtime.get_system("extract", _SYSTEM_PROMPT)},
-                {
-                    "role": "user",
-                    "content": prompts_runtime.get_user_template("extract", _USER_TEMPLATE).format(
-                        title=paper.title,
-                        authors=_authors_string(paper) or "unknown",
-                        venue_date=_venue_date_string(paper) or "unknown",
-                        abstract=paper.abstract or "",
-                        numbered_sections=body,
-                    ),
-                },
-            ],
-            model=cfg.llm.summarize_model,
-            fallback_model=cfg.llm.fallback_model,
-            temperature=cfg.llm.temperature,
-            timeout=cfg.llm.request_timeout_seconds,
-            feature="extract",
-            on_usage=usage.make_usage_callback(
-                session, feature="extract", paper_id=paper.id,
-            ),
-        )
-    except llm.LLMError as e:
-        raise PaperExtractError(str(e)) from e
+    if data is None:
+        return paper  # not stale, or body too short — driver already signalled it
 
     concepts = _verify_quotes(_coerce_items(data.get("concepts"), "concept"), body)
     questions = _verify_quotes(_coerce_items(data.get("questions"), "question"), body)
@@ -463,9 +388,7 @@ def extract_paper(
     if not concepts and not questions:
         # We still want to record the attempt so we don't re-burn tokens on
         # the same useless input.  Wipe the rows to record "we tried".
-        c_written, q_written = _write_rows(
-            session, paper_id=paper.id, concepts=[], questions=[]
-        )
+        _write_rows(session, paper_id=paper.id, concepts=[], questions=[])
         _emit(detail="No grounded items found")
         return paper
 

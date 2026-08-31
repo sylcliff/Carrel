@@ -47,6 +47,17 @@ export const queryKeys = {
   paperTags: (id: string) => ["paper", id, "tags"] as const,
   paperCard: (id: string) => ["paper", id, "card"] as const,
 
+  // Disabled-placeholder keys for routes that hold a route-param id which
+  // may be undefined on first render. Pair with ``enabled: Boolean(id)``
+  // so the query never fires against the placeholder; the placeholder
+  // still has to be a real key (React Query requires it) and should
+  // never collide with a real per-paper key. The literal string
+  // ``"_"`` is reserved: no real paper id starts with it.
+  missingPaper: () => ["paper", "_"] as const,
+  missingPaperMarkdown: () => ["paper", "_", "markdown"] as const,
+  missingPaperSections: () => ["paper", "_", "sections"] as const,
+  missingPaperTags: () => ["paper", "_", "tags"] as const,
+
   // Aggregations — these rarely change; their mutations invalidate
   // explicitly so we can pin staleTime: Infinity on the consumer.
   topics: () => ["topics"] as const,

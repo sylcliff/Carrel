@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, Star } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ import {
 } from "@/api/client";
 import { useDebouncedCallback } from "@/lib/useDebouncedCallback";
 import { topicColorClass } from "@/lib/topicColor";
-import { useApiMutation, useApiQueryWithFn } from "@/lib/useApiQuery";
+import { useApiMutation } from "@/lib/useApiQuery";
 import { queryKeys, type PaperFilters } from "@/lib/queryKeys";
 
 type SortKey =
@@ -35,6 +36,7 @@ export default function Library() {
   const [appended, setAppended] = useState<PaperSummary[]>([]);
   const [total, setTotal] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -74,8 +76,8 @@ export default function Library() {
   // Tag dropdown contents. Tag mutations happen on PaperDetail and the
   // global list is read-only here, so staleTime: Infinity is correct —
   // the only writes (add/remove on a paper) invalidate [tags] explicitly.
-  const tagsQuery = useApiQueryWithFn<TagWithCount[]>({
-    key: queryKeys.tags(),
+  const tagsQuery = useQuery<TagWithCount[]>({
+    queryKey: queryKeys.tags(),
     queryFn: () => listTags(),
     staleTime: Infinity,
   });
@@ -98,23 +100,30 @@ export default function Library() {
     [debouncedQ, favOnly, selectedTags, selectedTopics, sort],
   );
 
-  const pageOne = useApiQueryWithFn<{ items: PaperSummary[]; total: number }>({
-    key: queryKeys.papersList(filters),
+  const pageOne = useQuery<{ items: PaperSummary[]; total: number }>({
+    queryKey: queryKeys.papersList(filters),
     queryFn: async () => {
       const { items, total: t } = await listPapersPagedCached(filters);
-      setTotal(t);
-      // Filter changes reset the appended list; page-1 is fully owned by
-      // the query, so the local buffer is for Load-More pages only.
-      setAppended([]);
       return { items, total: t };
     },
   });
 
-  // Whenever the filters key changes, drop the appended buffer so Load
-  // More can't carry old rows into a new filter context.
+  // Filter changes reset the appended list; page-1 is fully owned by the
+  // query, so the local buffer is for Load-More pages only. Resetting
+  // here (not in queryFn) means a refetch with the same filters — e.g.
+  // after a mutation invalidates the key — does not wipe the buffer.
+  // Also clear any load-more error from the previous filter set, so the
+  // red banner doesn't outlive the request that produced it.
   useEffect(() => {
     setAppended([]);
+    setLoadMoreError(null);
   }, [filters]);
+
+  // Keep `total` mirrored from the query result so the rest of the
+  // component can keep reading it from one place.
+  useEffect(() => {
+    setTotal(pageOne.data?.total ?? 0);
+  }, [pageOne.data?.total]);
 
   const papers = useMemo<PaperSummary[]>(
     () => [...(pageOne.data?.items ?? []), ...appended],
@@ -150,7 +159,7 @@ export default function Library() {
     ? String(pageOne.error)
     : deleteMutation.error
       ? `Failed to delete: ${String(deleteMutation.error)}`
-      : null;
+      : loadMoreError;
 
   function toggleTag(name: string, on: boolean) {
     setSelectedTags((prev) =>
@@ -180,6 +189,7 @@ export default function Library() {
     const nextOffset = papers.length;
     if (nextOffset >= total) return;
     setLoadingMore(true);
+    setLoadMoreError(null);
     try {
       const { items } = await listPapersPaged({
         limit: PAGE_SIZE,
@@ -191,6 +201,8 @@ export default function Library() {
         sort,
       });
       setAppended((prev) => [...prev, ...items]);
+    } catch (e) {
+      setLoadMoreError(`Failed to load more: ${String(e)}`);
     } finally {
       setLoadingMore(false);
     }

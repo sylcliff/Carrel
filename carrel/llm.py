@@ -48,6 +48,18 @@ def has_key_for(model: str) -> bool:
     return embeddings._key_for(model) is not None
 
 
+def has_summarize_key(cfg: "Any") -> bool:
+    """True if the primary or fallback summarize model has a key.
+
+    Three pipelines (summarize / paper_extract / paper_card) all gate
+    their LLM call on the same two-model check before issuing a
+    request. This helper keeps the "either model works" test in one
+    place so a new provider or an env-var rename doesn't have to
+    touch every pipeline.
+    """
+    return has_key_for(cfg.llm.summarize_model) or has_key_for(cfg.llm.fallback_model)
+
+
 def chat_json(
     messages: Sequence[dict[str, str]],
     *,

@@ -12,7 +12,7 @@ import logging
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import func
+from sqlalchemy import delete, func
 from sqlmodel import Session, select
 
 from carrel.db import get_session_dep
@@ -22,6 +22,7 @@ from carrel.api._http_cache import (
     apply_etag_headers,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 from carrel.models import Paper, PaperTag, Tag
 from carrel.schemas import (
@@ -152,11 +153,8 @@ def list_paper_tags(
         raise HTTPException(status_code=404, detail="paper not found")
     tags = _list_paper_tags_body(paper_id, session)
     etag = etag_for_updated_at(p.updated_at, extra=(p.id,))
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
     return tags
@@ -234,9 +232,8 @@ def delete_tag(
     if tag is None:
         raise HTTPException(status_code=404, detail="tag not found")
     # Collect the affected paper ids BEFORE we delete the links so the
-    # per-paper detail entries can be invalidated. The query is a scalar
-    # column select; on SQLModel+SQLite the result rows are 1-tuples, on
-    # Postgres they may come back as scalars. Coerce both to a flat list.
+    # per-paper detail entries can be invalidated. One query; the
+    # 1-tuple-or-scalar coercion handles both SQLite and Postgres.
     affected_paper_ids = [
         pid
         for pid in (
@@ -246,18 +243,22 @@ def delete_tag(
             ).all()
         )
     ]
-    links = session.exec(select(PaperTag).where(PaperTag.tag_id == tag_id)).all()
-    detached = len(links)
-    for link in links:
-        session.delete(link)
+    # Single DELETE statement instead of N row-by-row session.delete()s.
+    # SQLAlchemy's `delete(PaperTag).where(...)` issues one round-trip
+    # for all links tagged with this id.
+    result = session.exec(
+        delete(PaperTag).where(PaperTag.tag_id == tag_id)
+    )
+    detached = result.rowcount or 0
     session.delete(tag)
     session.commit()
-    # L2: drop the global tag aggregation and per-paper tag lists for
-    # every paper that was carrying the tag. The per-id drop is precise
-    # because we collected the ids above.
+    # L2: drop the global tag aggregation and every per-paper sub-resource
+    # for the affected papers. The per-id drop is a single tag match per
+    # paper (``paper_id:{pid}`` is auto-attached by the ``@cached``
+    # decorator), which catches paper, markdown, sections, references,
+    # tags, card — all in one fan-out.
     cache = get_cache()
     cache.invalidate_tags("tags", "papers_list")
-    for pid in affected_paper_ids:
-        cache.invalidate_exact(f"paper:{pid}:tags")
-        cache.invalidate_exact(f"paper:{pid}")
+    if affected_paper_ids:
+        cache.invalidate_tags(*(f"paper_id:{pid}" for pid in affected_paper_ids))
     return {"id": tag_id, "deleted": True, "detached": detached}

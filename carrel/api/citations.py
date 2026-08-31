@@ -20,11 +20,13 @@ from sqlmodel import Session, or_, select
 from carrel.db import get_session_dep
 from carrel.api._app_cache import cached
 from carrel.api._invalidation import invalidate_citations_refreshed, invalidate_paper_mutated
+from carrel.api._job_io import job_to_out
 from carrel.api._http_cache import (
     apply_etag_headers,
     etag_for_list,
     etag_for_updated_at,
     if_none_match_matches,
+    maybe_return_304,
 )
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.citations import enrich_paper
@@ -45,19 +47,6 @@ from carrel.agent_recorder import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/papers", tags=["citations"])
-
-
-def _to_out(job: Job) -> JobOut:
-    return JobOut(
-        id=job.id or 0,
-        kind=job.kind,
-        status=job.status,
-        message=job.message,
-        stats=job.stats,
-        started_at=job.started_at,
-        finished_at=job.finished_at,
-        created_at=job.created_at,
-    )
 
 
 def _resolve_library(
@@ -301,11 +290,8 @@ def list_references(
     """
     body, etag_src = _list_references_body(paper_id, sort, session)
     etag = etag_for_updated_at(etag_src, extra=(paper_id, sort or ""))
-    if etag is not None and if_none_match_matches(request, etag):
-        return Response(  # type: ignore[return-value]
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, max-age=60, stale-while-revalidate=120"},
-        )
+    if (r := maybe_return_304(request, etag, max_age=60, stale_while_revalidate=120)):
+        return r
     if etag is not None:
         apply_etag_headers(response, etag, max_age=60, stale_while_revalidate=120)
     return body
@@ -410,7 +396,7 @@ def refresh_citations(
         _run(session, job.id, paper.id)
         session.refresh(job)
 
-    return _to_out(job)
+    return job_to_out(job)
 
 
 def _make_progress_cb(session: Session, job_id: int):
@@ -473,8 +459,13 @@ def _run(session: Session, job_id: int, paper_id: str) -> None:
         rec.finish(summary={"paper_id": paper_id})
         # L2: drop the per-paper citations/references entries; bump the
         # per-paper detail so the citations panel shows the new ETag.
+        # ``invalidate_citations_refreshed`` already fans out the
+        # ``paper_id:{id}`` tag, so the per-id cache (paper detail,
+        # markdown, sections, references, tags, card) is gone after
+        # this single call. The library list is unaffected (citations
+        # are not in ``_LIST_AFFECTING_VERBS``), so no second call is
+        # needed.
         invalidate_citations_refreshed(paper_id)
-        invalidate_paper_mutated(paper_id, mutate={"citations"})
     except Exception as e:  # noqa: BLE001
         logger.exception("citations job %d failed", job_id)
         rec.finish(status="failed", error=f"{type(e).__name__}: {e}")

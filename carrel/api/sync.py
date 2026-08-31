@@ -19,6 +19,7 @@ from carrel.agent_recorder import (
     set_current_recorder,
 )
 from carrel.db import get_session_dep
+from carrel.api._job_io import job_to_out
 from carrel.models import Job, JobKind, JobStatus
 from carrel.pipeline.runner import run_sync
 from carrel.schemas import JobOut, SyncRequest
@@ -63,7 +64,7 @@ def trigger_sync(
 
     # re-read job for fresh state
     session.refresh(job)
-    return _to_out(job)
+    return job_to_out(job)
 
 
 def _run_inline(session: Session, job_id: int, lookback_hours: int) -> None:
@@ -140,7 +141,7 @@ def list_jobs(
     if status:
         stmt = stmt.where(Job.status == status)
     rows = session.exec(stmt).all()
-    return [_to_out(r) for r in rows]
+    return [job_to_out(r) for r in rows]
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
@@ -148,17 +149,4 @@ def get_job(job_id: int, session: Session = Depends(get_session_dep)) -> JobOut:
     row = session.get(Job, job_id)
     if row is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return _to_out(row)
-
-
-def _to_out(r: Job) -> JobOut:
-    return JobOut(
-        id=r.id or 0,
-        kind=r.kind,
-        status=r.status,
-        message=r.message,
-        stats=r.stats,
-        started_at=r.started_at,
-        finished_at=r.finished_at,
-        created_at=r.created_at,
-    )
+    return job_to_out(row)

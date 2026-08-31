@@ -1,10 +1,8 @@
 // Layer 3 — typed React Query wrappers for the Carrel API.
 //
-// useApiQuery is a thin wrapper around useQuery that:
-//   1. Builds the query string from a params object (mirrors the
-//      client.ts builder style — keep them in sync if you add params).
-//   2. Calls requestCached<T> so 304s short-circuit to the prior body.
-//   3. Lets callers override staleTime per-query (e.g. markdown → Infinity).
+// For plain "query → fetch" reads, use `useQuery` directly with a
+// `requestCached` / `requestWithHeadersCached` queryFn — those helpers
+// already implement the ETag 304 short-circuit.
 //
 // useApiMutation wraps useMutation with the optimistic update contract:
 //   1. Snapshots the previous value at the key.
@@ -16,83 +14,10 @@
 
 import {
   useMutation,
-  useQuery,
   useQueryClient,
   type QueryKey,
   type UseMutationOptions,
 } from "@tanstack/react-query";
-import { requestCached } from "@/api/client";
-
-export interface UseApiQueryParams {
-  key: QueryKey;
-  path: string;
-  params?: Record<string, unknown>;
-  staleTime?: number;
-  enabled?: boolean;
-  // Forwarded to useQuery; default `network` is what we want.
-  refetchOnWindowFocus?: boolean;
-}
-
-function buildQueryString(params?: Record<string, unknown>): string {
-  if (!params) return "";
-  const q = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v === undefined || v === null) continue;
-    if (Array.isArray(v)) {
-      for (const item of v) q.append(k, String(item));
-    } else if (typeof v === "boolean") {
-      q.set(k, String(v));
-    } else {
-      q.set(k, String(v));
-    }
-  }
-  const qs = q.toString();
-  return qs ? `?${qs}` : "";
-}
-
-export function useApiQuery<T>({
-  key,
-  path,
-  params,
-  staleTime,
-  enabled,
-  refetchOnWindowFocus,
-}: UseApiQueryParams) {
-  const qs = buildQueryString(params);
-  const fullPath = `${path}${qs}`;
-  return useQuery<T>({
-    queryKey: key,
-    queryFn: () => requestCached<T>(fullPath),
-    staleTime,
-    enabled,
-    refetchOnWindowFocus,
-  });
-}
-
-// Convenience for the case where a query needs an entirely custom queryFn
-// (e.g. multipart responses). Still routed through requestCached so ETag
-// behaviour is identical.
-export function useApiQueryWithFn<T>({
-  key,
-  queryFn,
-  staleTime,
-  enabled,
-  refetchOnWindowFocus,
-}: {
-  key: QueryKey;
-  queryFn: () => Promise<T>;
-  staleTime?: number;
-  enabled?: boolean;
-  refetchOnWindowFocus?: boolean;
-}) {
-  return useQuery<T>({
-    queryKey: key,
-    queryFn,
-    staleTime,
-    enabled,
-    refetchOnWindowFocus,
-  });
-}
 
 // ---- useApiMutation ---------------------------------------------------------
 

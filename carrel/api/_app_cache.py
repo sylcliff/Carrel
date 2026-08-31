@@ -33,6 +33,7 @@ the second ``set()`` overwrites the first.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 from collections import OrderedDict
@@ -72,8 +73,14 @@ class AppCache:
         self.maxsize = maxsize
         # LRU: most-recently-used at the back.
         self._data: "OrderedDict[str, Any]" = OrderedDict()
-        # Reverse index: tag -> set of keys that declared this tag.
+        # Forward index: tag -> set of keys that declared this tag.
+        # Used for invalidate_tags fan-out.
         self._tag_index: dict[str, set[str]] = {}
+        # Reverse index: key -> frozenset of tags that key declared.
+        # Kept in a side dict (not in _data) so the OrderedDict doesn't
+        # carry parallel "metadata" slots that get out of order with the
+        # LRU move-to-end.
+        self._key_tags: dict[str, frozenset[str]] = {}
         self._lock = threading.RLock()
         # Stats for /health?debug=1.
         self.hits = 0
@@ -94,53 +101,38 @@ class AppCache:
             self._data.move_to_end(key)
             return self._data[key]
 
+    def has(self, key: str) -> bool:
+        """True if ``key`` is currently in the cache (even if its stored
+        value is ``None``). Lets the :func:`cached` decorator distinguish a
+        miss from a cached ``None`` — a legit return for routes that report
+        "not extracted yet" or "not in library"."""
+        with self._lock:
+            return key in self._data
+
     def set(self, key: str, value: Any, *, tags: Iterable[str] = ()) -> None:
         with self._lock:
-            existing = key in self._data
-            old_tags: set[str] = set()
-            if existing:
-                # Drop the old tag-index entries first so the new set
-                # doesn't carry forward tags the caller removed.
-                old_tags = self._tag_index.pop(f"__tags__:{key}", set())
-                self._data.move_to_end(key)
-                self._data[key] = value
-            else:
-                self._data[key] = value
-            for t in old_tags:
-                bucket = self._tag_index.get(t)
-                if bucket is not None:
-                    bucket.discard(key)
-                    if not bucket:
-                        self._tag_index.pop(t, None)
-            for t in tags:
-                self._tag_index.setdefault(t, set()).add(key)
-            # Stash the tag list on a parallel index entry so overwrite can
-            # clean up later. We use the ``__tags__:`` prefix to keep these
-            # out of the tag-fan-out path.
-            self._tag_index[f"__tags__:{key}"] = set(tags)
+            old_tags = self._key_tags.pop(key, frozenset())
+            self._data[key] = value
+            self._data.move_to_end(key)
+            self._unindex_tags(key, old_tags)
+            new_tags = frozenset(tags)
+            if new_tags:
+                self._key_tags[key] = new_tags
+                for t in new_tags:
+                    self._tag_index.setdefault(t, set()).add(key)
             self._evict_if_needed()
 
     def invalidate_exact(self, key: str) -> bool:
         """Drop a single entry by full key. Returns True if anything was removed."""
         with self._lock:
-            removed = self._data.pop(key, None) is not None
-            tags = self._tag_index.pop(f"__tags__:{key}", set())
-            for t in tags:
-                bucket = self._tag_index.get(t)
-                if bucket is not None:
-                    bucket.discard(key)
-                    if not bucket:
-                        self._tag_index.pop(t, None)
-            if removed:
-                self.invalidations += 1
-            return removed
+            return self._evict_under_lock(key)
 
     def invalidate_prefix(self, prefix: str) -> int:
         """Drop every entry whose key starts with ``prefix``."""
         with self._lock:
             keys = [k for k in self._data if k.startswith(prefix)]
             for k in keys:
-                self.invalidate_exact(k)
+                self._evict_under_lock(k)
             return len(keys)
 
     def invalidate_tags(self, *tags: str) -> int:
@@ -162,20 +154,36 @@ class AppCache:
                 if bucket:
                     targets.update(bucket)
             for k in targets:
-                self.invalidate_exact(k)
+                self._evict_under_lock(k)
             return len(targets)
+
+    def invalidate_many(self, keys: Iterable[str]) -> int:
+        """Drop a batch of exact keys in a single lock acquisition.
+
+        Useful when a single write path has to invalidate N per-id
+        entries (e.g. dropping a tag attached to N papers). Each key
+        is processed via :meth:`_evict_under_lock`, but the lock is
+        taken once, not N times.
+        """
+        with self._lock:
+            removed = 0
+            for k in keys:
+                if self._evict_under_lock(k):
+                    removed += 1
+            return removed
 
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
             self._tag_index.clear()
+            self._key_tags.clear()
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {
                 "size": len(self._data),
                 "maxsize": self.maxsize,
-                "tags": len([t for t in self._tag_index if not t.startswith("__")]),
+                "tags": len(self._tag_index),
                 "hits": self.hits,
                 "misses": self.misses,
                 "invalidations": self.invalidations,
@@ -184,17 +192,29 @@ class AppCache:
 
     # -- internals -------------------------------------------------------
 
+    def _unindex_tags(self, key: str, tags: Iterable[str]) -> None:
+        """Remove ``key`` from every tag bucket listed in ``tags``."""
+        for t in tags:
+            bucket = self._tag_index.get(t)
+            if bucket is None:
+                continue
+            bucket.discard(key)
+            if not bucket:
+                self._tag_index.pop(t, None)
+
+    def _evict_under_lock(self, key: str) -> bool:
+        """Pop ``key`` and its tag-index entries; caller holds the lock."""
+        if self._data.pop(key, None) is None:
+            return False
+        self._unindex_tags(key, self._key_tags.pop(key, ()))
+        self.invalidations += 1
+        return True
+
     def _evict_if_needed(self) -> None:
-        """Pop the LRU entry if we're over capacity."""
+        """Pop LRU entries if we're over capacity."""
         while len(self._data) > self.maxsize:
             old_key, _ = self._data.popitem(last=False)
-            tags = self._tag_index.pop(f"__tags__:{old_key}", set())
-            for t in tags:
-                bucket = self._tag_index.get(t)
-                if bucket is not None:
-                    bucket.discard(old_key)
-                    if not bucket:
-                        self._tag_index.pop(t, None)
+            self._unindex_tags(old_key, self._key_tags.pop(old_key, ()))
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +251,18 @@ def _stable_key(
     return f"{route}:{json.dumps(payload, separators=(',', ':'), default=str)}"
 
 
+# Key-param names that uniquely identify a row. When a ``@cached`` route
+# declares one of these in ``key_params``, the decorator auto-attaches a
+# per-id tag of the form ``"{name}:{value}"`` so per-id invalidation can
+# be a single ``invalidate_tags`` call — no exact-key knowledge required,
+# no risk of drift between the invalidation helper and the cache key
+# format, and any future per-row sub-resource (paper_card, paper_chat, …)
+# participates automatically as long as it puts the id in key_params.
+_ID_LIKE_PARAMS = frozenset(
+    {"paper_id", "page_id", "tag_id", "scholar_aid", "aid", "topic_id"}
+)
+
+
 def cached(
     route: str,
     *,
@@ -254,17 +286,20 @@ def cached(
     can't await on their behalf.
     """
     def decorator(func: Callable) -> Callable:
+        # Bind the signature once at decoration time so the hot path
+        # only does a cheap bind_partial per request, not a full
+        # inspect.signature scan.
+        sig = inspect.signature(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             cache = get_cache()
-            # Map positional + keyword args into a flat dict.
-            import inspect
-            sig = inspect.signature(func)
             bound = sig.bind_partial(*args, **kwargs)
-            bound.apply_defaults()
             params = {name: bound.arguments.get(name) for name in key_params}
             key = _stable_key(route, params, offset_invariant=offset_invariant)
-            cached_value = cache.get(key)
-            if cached_value is not None:
+            # ``has`` (not ``get() is not None``) so a legit ``None`` return
+            # is memoized: ``_get_paper_body`` for an id with no row returns
+            # ``None`` and should be cached until the row is inserted.
+            if cache.has(key):
+                cached_value = cache.get(key)
                 # Operator-facing hit signal. Read by the /health?debug=1
                 # smoke check and by ad-hoc curl probes during incident
                 # debugging. Cheap to set on every request.
@@ -272,7 +307,17 @@ def cached(
                 return cached_value
             value = func(*args, **kwargs)
             cache.last_status = "MISS"
-            cache.set(key, value, tags=tags)
+            # Per-id fan-out tags: one ``f"{name}:{value}"`` per id-like
+            # key_param. Lets the invalidation helper drop a single
+            # row's caches across all sub-resources with one
+            # ``invalidate_tags`` call. Only string-typed values are
+            # tagged (lists / dicts / None would explode the tag set).
+            per_id_tags = tuple(
+                f"{name}:{val}"
+                for name, val in params.items()
+                if name in _ID_LIKE_PARAMS and isinstance(val, str)
+            )
+            cache.set(key, value, tags=tuple(tags) + per_id_tags)
             return value
         # Preserve a reference to the original for tests that want to call
         # through directly (bypassing the cache).

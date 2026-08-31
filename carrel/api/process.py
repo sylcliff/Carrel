@@ -19,6 +19,7 @@ from sqlmodel import Session
 
 from carrel.db import get_session_dep
 from carrel.api._invalidation import invalidate_paper_mutated
+from carrel.api._job_io import job_to_out
 from carrel.models import Job, JobKind, JobStatus, Paper
 from carrel.pipeline.process import (
     ProcessError,
@@ -81,7 +82,7 @@ def trigger_process(
         for j in jobs:
             session.refresh(j)
 
-    return [_to_out(j) for j in jobs]
+    return [job_to_out(j) for j in jobs]
 
 
 def _make_progress_cb(session: Session, job_id: int):
@@ -175,14 +176,3 @@ def _run_all_background(job_ids: list[int], paper_ids: list[str]) -> None:
             _run_one(session, job_id, paper_id, app_config)
 
 
-def _to_out(r: Job) -> JobOut:
-    return JobOut(
-        id=r.id or 0,
-        kind=r.kind,
-        status=r.status,
-        message=r.message,
-        stats=r.stats,
-        started_at=r.started_at,
-        finished_at=r.finished_at,
-        created_at=r.created_at,
-    )
